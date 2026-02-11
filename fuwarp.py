@@ -631,6 +631,12 @@ class FuwarpPython:
             cacerts = os.path.join(java_home, 'jre/lib/security/cacerts')
         return cacerts if os.path.exists(cacerts) else ''
 
+    def java_version_label(self, java_home):
+        """Derive a human-readable label from a Java home path, e.g. 'temurin-21'."""
+        if 'Contents/Home' in java_home:
+            return os.path.basename(os.path.dirname(os.path.dirname(java_home))).replace('.jdk', '')
+        return os.path.basename(java_home)
+
     def find_all_java_homes(self):
         """Find all Java installations on the system.
 
@@ -697,11 +703,11 @@ class FuwarpPython:
             except Exception as e:
                 self.print_debug(f"Error listing Java installations: {e}")
 
-            # Scan common Linux directories
+            # Scan common Linux directories, resolving symlinks to avoid duplicates
             if os.path.isdir('/usr/lib/jvm'):
                 try:
                     for entry in os.listdir('/usr/lib/jvm'):
-                        java_home = os.path.join('/usr/lib/jvm', entry)
+                        java_home = os.path.realpath(os.path.join('/usr/lib/jvm', entry))
                         if os.path.isdir(java_home):
                             java_homes.add(java_home)
                 except (OSError, PermissionError):
@@ -2103,11 +2109,7 @@ class FuwarpPython:
 
         # Process each Java installation
         for java_home in java_homes:
-            # Extract version name for display
-            if 'Contents/Home' in java_home:
-                version_name = os.path.basename(os.path.dirname(os.path.dirname(java_home))).replace('.jdk', '')
-            else:
-                version_name = os.path.basename(java_home)
+            version_name = self.java_version_label(java_home)
 
             cacerts = self.find_java_cacerts(java_home)
             if not cacerts:
@@ -2156,12 +2158,7 @@ class FuwarpPython:
         self.print_info(f"Found {len(java_homes)} jenv-managed Java installation(s)")
 
         for java_home in java_homes:
-            # Extract version from path for display
-            version_name = os.path.basename(java_home)
-            if 'Contents/Home' in java_home:
-                # macOS .jdk format: /Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home
-                version_name = os.path.basename(os.path.dirname(os.path.dirname(java_home)))
-                version_name = version_name.replace('.jdk', '')
+            version_name = self.java_version_label(java_home)
 
             cacerts = os.path.join(java_home, "lib/security/cacerts")
             if not os.path.exists(cacerts):
@@ -3112,11 +3109,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
 
         # Check each installation
         for java_home in java_homes:
-            # Extract version name for display
-            if 'Contents/Home' in java_home:
-                version_name = os.path.basename(os.path.dirname(os.path.dirname(java_home))).replace('.jdk', '')
-            else:
-                version_name = os.path.basename(java_home)
+            version_name = self.java_version_label(java_home)
 
             cacerts = self.find_java_cacerts(java_home)
             if not cacerts:
@@ -3157,11 +3150,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         self.print_info(f"  Checking {len(java_homes)} jenv-managed Java installation(s):")
 
         for java_home in java_homes:
-            # Extract version from path for display
-            version_name = os.path.basename(java_home)
-            if 'Contents/Home' in java_home:
-                version_name = os.path.basename(os.path.dirname(os.path.dirname(java_home)))
-                version_name = version_name.replace('.jdk', '')
+            version_name = self.java_version_label(java_home)
 
             cacerts = os.path.join(java_home, "lib/security/cacerts")
             if not os.path.exists(cacerts):

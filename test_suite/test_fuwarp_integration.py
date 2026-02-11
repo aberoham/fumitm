@@ -4,6 +4,7 @@ Integration tests for fuwarp.py
 These tests verify the core workflows and functionality of the fuwarp script
 by mocking external dependencies and testing realistic scenarios.
 """
+import os
 import sys
 import urllib.error
 from unittest.mock import patch, MagicMock, call, mock_open
@@ -158,6 +159,7 @@ class TestJavaMultiInstallation(FuwarpTestCase):
 /Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home"""
 
         with patch('platform.system', return_value='Darwin'), \
+             patch.dict(os.environ, {'JAVA_HOME': ''}, clear=False), \
              patch('os.path.exists') as mock_exists, \
              patch('os.path.isdir', return_value=True), \
              patch('os.listdir', return_value=[]), \
@@ -190,6 +192,7 @@ class TestJavaMultiInstallation(FuwarpTestCase):
     def test_find_all_java_homes_macos_directory_scan(self):
         """Test finding Java installations via directory scan on macOS."""
         with patch('platform.system', return_value='Darwin'), \
+             patch.dict(os.environ, {'JAVA_HOME': ''}, clear=False), \
              patch('os.path.exists', return_value=True), \
              patch('os.path.isdir', return_value=True), \
              patch('os.listdir') as mock_listdir, \
@@ -222,6 +225,7 @@ class TestJavaMultiInstallation(FuwarpTestCase):
 /usr/lib/jvm/java-11-openjdk-amd64/bin/java"""
 
         with patch('platform.system', return_value='Linux'), \
+             patch.dict(os.environ, {'JAVA_HOME': ''}, clear=False), \
              patch('os.path.exists', return_value=True), \
              patch('os.path.isdir', return_value=True), \
              patch('subprocess.run') as mock_run:
