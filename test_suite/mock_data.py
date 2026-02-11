@@ -149,6 +149,16 @@ TOOL_PATHS = {
     'openssl': '/usr/bin/openssl',
 }
 
+# Netskope certificate paths
+NETSKOPE_CERT_PATHS_MACOS = [
+    '/Library/Application Support/Netskope/STAgent/data/nscacert_combined.pem',
+    '/Library/Application Support/Netskope/STAgent/data/nscacert.pem',
+]
+NETSKOPE_CERT_PATHS_LINUX = ['/opt/netskope/stagent/data/nscacert.pem']
+
+# Netskope mock certificate (reuses the same cert format for testing)
+MOCK_NETSKOPE_CERTIFICATE = MOCK_CERTIFICATE
+
 # Shell detection outputs
 SHELL_PS_BASH = "/bin/bash"
 SHELL_PS_ZSH = "/bin/zsh"

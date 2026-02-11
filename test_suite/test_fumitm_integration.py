@@ -344,7 +344,8 @@ class TestCLIAndWorkflow(FumitmTestCase):
             
             mock_class.assert_called_with(
                 mode='install', debug=False, selected_tools=[],
-                cert_file=None, manual_cert=False, skip_verify=False
+                cert_file=None, manual_cert=False, skip_verify=False,
+                provider=None
             )
     
     @patch('fumitm.sys.argv', ['fumitm.py', '--tools', 'node,python'])
@@ -362,7 +363,8 @@ class TestCLIAndWorkflow(FumitmTestCase):
                 mode='status',
                 debug=False,
                 selected_tools=['node', 'python'],
-                cert_file=None, manual_cert=False, skip_verify=False
+                cert_file=None, manual_cert=False, skip_verify=False,
+                provider=None
             )
     
     def test_complete_status_workflow(self):
@@ -1009,6 +1011,10 @@ class TestCodeQuality:
         # Pattern: line starts with UPPER_CASE_NAME = (not inside class/function)
         global_pattern = re.compile(r'^([A-Z][A-Z0-9_]*)\s*=', re.MULTILINE)
 
+        # CERT_PATH is kept as a public constant for backward compatibility
+        # but is no longer used internally (replaced by self.cert_path).
+        known_unused = {'CERT_PATH'}
+
         globals_found = set()
         for match in global_pattern.finditer(source):
             name = match.group(1)
@@ -1020,6 +1026,8 @@ class TestCodeQuality:
         # Check each global is used somewhere else in the code
         unused_globals = []
         for name in globals_found:
+            if name in known_unused:
+                continue
             # Count occurrences - should be more than 1 if used after definition
             pattern = re.compile(r'\b' + re.escape(name) + r'\b')
             matches = pattern.findall(source)
@@ -1654,8 +1662,13 @@ class TestUpdateCheckCalVer(FumitmTestCase):
         # Mock remote file with a version far in the future
         remote_content = b'__version__ = "2099.12.31"\n# rest of file...'
 
+        # Simulate a non-dev environment (main branch, clean tree) so the
+        # update warning is not suppressed by the working-copy check.
+        non_dev_version_info = {**fumitm.VERSION_INFO, 'branch': 'main', 'dirty': False}
+
         with patch('urllib.request.urlopen') as mock_urlopen, \
-             patch.object(fumitm, '__version__', '2025.1.1'):
+             patch.object(fumitm, '__version__', '2025.1.1'), \
+             patch.object(fumitm, 'VERSION_INFO', non_dev_version_info):
             mock_response = MagicMock()
             mock_response.read.return_value = remote_content
             mock_response.__enter__ = MagicMock(return_value=mock_response)

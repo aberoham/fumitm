@@ -19,7 +19,7 @@ from pathlib import Path
 from datetime import datetime
 
 # Version and metadata
-__description__ = "Cloudflare WARP Certificate Fixer Upper for macOS and Linux"
+__description__ = "MITM Proxy Certificate Fixer Upper for macOS and Linux"
 __author__ = "Ingersoll & Claude"
 __version__ = "2026.2.11"  # CalVer: YYYY.MM.DD (auto-updated on release)
 
@@ -153,8 +153,37 @@ CERT_PATH = os.path.expanduser("~/.cloudflare-ca.pem")
 SMALL_BUNDLE_MAX_CERTS = 2
 SMALL_BUNDLE_MAX_SIZE_BYTES = 50 * 1024  # 50KB
 
+# Provider configurations: each MITM proxy that fumitm supports. The tool setup
+# logic is identical across providers — only certificate sources, paths, and
+# display names differ.
+PROVIDERS = {
+    'warp': {
+        'name': 'Cloudflare WARP',
+        'short_name': 'WARP',
+        'cert_path': '~/.cloudflare-ca.pem',
+        'bundle_dir': '~/.cloudflare-warp',
+        'keytool_alias': 'cloudflare-zerotrust',
+        'container_cert_name': 'cloudflare-warp',
+    },
+    'netskope': {
+        'name': 'Netskope',
+        'short_name': 'Netskope',
+        'cert_path': '~/.netskope-ca.pem',
+        'bundle_dir': '~/.netskope',
+        'keytool_alias': 'netskope-zerotrust',
+        'container_cert_name': 'netskope',
+        'cert_sources': {
+            'Darwin': [
+                '/Library/Application Support/Netskope/STAgent/data/nscacert_combined.pem',
+                '/Library/Application Support/Netskope/STAgent/data/nscacert.pem',
+            ],
+            'Linux': ['/opt/netskope/stagent/data/nscacert.pem'],
+        },
+    },
+}
+
 class FumitmPython:
-    def __init__(self, mode='status', debug=False, selected_tools=None, cert_file=None, manual_cert=False, skip_verify=False):
+    def __init__(self, mode='status', debug=False, selected_tools=None, cert_file=None, manual_cert=False, skip_verify=False, provider=None):
         self.mode = mode
         self.debug = debug
         self.shell_modified = False
@@ -163,7 +192,13 @@ class FumitmPython:
         self.cert_file = cert_file
         self.manual_cert = manual_cert
         self.skip_verify = skip_verify
-        
+
+        # Resolve which MITM proxy provider to use. When provider is None,
+        # auto-detection checks WARP first, then Netskope.
+        self.provider = self._resolve_provider(provider)
+        self.cert_path = os.path.expanduser(self.provider['cert_path'])
+        self.bundle_dir = os.path.expanduser(self.provider['bundle_dir'])
+
         # Define tool registry with tags and descriptions
         self.tools_registry = {
             'node': {
@@ -270,6 +305,72 @@ class FumitmPython:
         if platform.system() != 'Darwin':
             self.print_warn("This script is designed for macOS. Most features will not work correctly.")
 
+    def _resolve_provider(self, requested):
+        """Determine which MITM proxy provider to use.
+
+        When no provider is explicitly requested, auto-detection checks WARP
+        first (via warp-cli), then Netskope (via known cert file paths or
+        STAgent process). If both are detected, WARP is preferred and an info
+        message about Netskope availability is printed.
+        """
+        if requested:
+            if requested not in PROVIDERS:
+                self.print_error(f"Unknown provider '{requested}'. Available: {', '.join(PROVIDERS)}")
+                sys.exit(1)
+            return PROVIDERS[requested]
+
+        warp_detected = self._detect_warp()
+        netskope_detected = self._detect_netskope()
+
+        if warp_detected and netskope_detected:
+            self.print_info("Both Cloudflare WARP and Netskope detected; defaulting to WARP")
+            self.print_info("Use --provider netskope to use Netskope instead")
+            return PROVIDERS['warp']
+        if warp_detected:
+            return PROVIDERS['warp']
+        if netskope_detected:
+            return PROVIDERS['netskope']
+
+        # Neither detected — fall back to WARP so existing error messages about
+        # missing warp-cli still make sense.
+        return PROVIDERS['warp']
+
+    def _detect_warp(self):
+        """Return True if Cloudflare WARP appears to be installed."""
+        return shutil.which('warp-cli') is not None
+
+    def _detect_netskope(self):
+        """Return True if Netskope appears to be installed.
+
+        Checks known certificate file paths first (fast), then falls back to
+        looking for a running Netskope process. On macOS, the client runs as
+        "Netskope Client"; on Linux, it runs as STAgent.
+        """
+        plat = platform.system()
+        cert_sources = PROVIDERS['netskope'].get('cert_sources', {}).get(plat, [])
+        for path in cert_sources:
+            if os.path.exists(path):
+                return True
+
+        # Check for encrypted cert variant
+        for path in cert_sources:
+            if os.path.exists(path + '.enc'):
+                return True
+
+        # Fall back to process check with platform-appropriate process name
+        try:
+            proc_pattern = 'Netskope Client' if plat == 'Darwin' else 'STAgent'
+            result = subprocess.run(
+                ['pgrep', '-f', proc_pattern],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return True
+        except Exception:
+            pass
+
+        return False
+
     def is_install_mode(self):
         return self.mode == 'install'
     
@@ -357,8 +458,10 @@ class FumitmPython:
 
         Uses CalVer version comparison instead of file hashes to avoid
         false positives from local modifications or formatting differences.
+        Skips the update warning when running from a local git working copy
+        (non-main branch or dirty tree), since the user is likely developing.
 
-        Uses an unverified SSL context since WARP certificate trust might not
+        Uses an unverified SSL context since proxy certificate trust might not
         be configured yet (which is why the user is running this script).
 
         Returns:
@@ -400,6 +503,18 @@ class FumitmPython:
                 return False
 
             if remote_tuple > local_tuple:
+                # When running from a git working copy on a non-main branch or
+                # with local modifications, the version mismatch is expected.
+                is_dev = VERSION_INFO['branch'] not in ('main', 'master', 'unknown') or VERSION_INFO['dirty']
+                if is_dev:
+                    branch = VERSION_INFO['branch']
+                    dirty = ' (modified)' if VERSION_INFO['dirty'] else ''
+                    print()
+                    self.print_info(f"Running from local working copy (branch: {branch}{dirty})")
+                    self.print_info(f"  Local:  {local_version}  |  Remote: {remote_version}")
+                    print()
+                    return False
+
                 print()
                 self.print_warn("=" * 60)
                 self.print_warn("A newer version of fumitm.py is available!")
@@ -442,7 +557,7 @@ class FumitmPython:
     def suggest_user_path(self, original_path, purpose):
         """Suggest alternative path."""
         filename = os.path.basename(original_path)
-        return os.path.expanduser(f"~/.cloudflare-warp/{purpose}/{filename}")
+        return os.path.join(self.bundle_dir, purpose, filename)
     
     def detect_shell(self):
         """Detect the user's default shell with multiple fallbacks."""
@@ -576,11 +691,11 @@ class FumitmPython:
     def get_cert_fingerprint(self, cert_path=None):
         """Get certificate fingerprint (cached)."""
         if cert_path is None:
-            cert_path = CERT_PATH
-            
-        if self.cert_fingerprint and cert_path == CERT_PATH:
+            cert_path = self.cert_path
+
+        if self.cert_fingerprint and cert_path == self.cert_path:
             return self.cert_fingerprint
-            
+
         if os.path.exists(cert_path):
             try:
                 result = subprocess.run(
@@ -589,7 +704,7 @@ class FumitmPython:
                 )
                 if result.returncode == 0:
                     fingerprint = result.stdout.strip().split('=')[1]
-                    if cert_path == CERT_PATH:
+                    if cert_path == self.cert_path:
                         self.cert_fingerprint = fingerprint
                     self.print_debug(f"Cached certificate fingerprint: {fingerprint}")
                     return fingerprint
@@ -914,7 +1029,7 @@ class FumitmPython:
 
             # If we have a reference WARP cert, exact-equality to it is suspicious
             if warp_cert_path and self.files_are_identical(bundle_path, warp_cert_path):
-                return (True, "bundle is identical to the WARP certificate file")
+                return (True, "bundle is identical to the proxy certificate file")
 
             return (False, "")
         except Exception as e:
@@ -1104,7 +1219,7 @@ class FumitmPython:
         self.print_info("=" * 70)
         print()
         self.print_info("You're running fumitm inside a devcontainer where warp-cli isn't available.")
-        self.print_info("The WARP certificate needs to be obtained from your Windows host machine.")
+        self.print_info("The proxy certificate needs to be obtained from your Windows host machine.")
         print()
         self.print_info("QUICKEST METHOD:")
         self.print_info(f"1. On your Windows host, open PowerShell/Terminal and run:")
@@ -1179,9 +1294,134 @@ class FumitmPython:
         
         return formatted_cert
     
+    def _get_warp_cert(self):
+        """Retrieve the CA certificate from warp-cli.
+
+        Returns:
+            str or None: PEM certificate text, or None on failure.
+        """
+        try:
+            result = subprocess.run(
+                ['warp-cli', 'certs', '--no-paginate'],
+                capture_output=True, text=True
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                self.print_error("Failed to get certificate from warp-cli")
+                self.print_error("Make sure you are connected to Cloudflare WARP")
+                return None
+            return result.stdout.strip()
+        except Exception as e:
+            self.print_error(f"Error running warp-cli: {e}")
+            return None
+
+    def _get_netskope_cert(self):
+        """Retrieve the Netskope CA certificate.
+
+        Tries these sources in order:
+        1. Known file paths (nscacert_combined.pem, then nscacert.pem)
+        2. macOS Keychain extraction (root + intermediate)
+        3. Detects encrypted .enc certs and advises --cert-file
+
+        Returns:
+            str or None: PEM certificate text, or None on failure.
+        """
+        plat = platform.system()
+        cert_sources = self.provider.get('cert_sources', {}).get(plat, [])
+
+        # Try reading from known file paths
+        for path in cert_sources:
+            if os.path.exists(path):
+                try:
+                    with open(path, 'r') as f:
+                        content = f.read().strip()
+                    if '-----BEGIN CERTIFICATE-----' in content:
+                        self.print_info(f"Using Netskope certificate from {path}")
+                        return content
+                except Exception as e:
+                    self.print_debug(f"Could not read {path}: {e}")
+
+        # Check for encrypted cert variant — the encryptClientConfig hardening
+        # flag encrypts on-disk certs. We note this and try the keychain instead.
+        found_encrypted = False
+        for path in cert_sources:
+            enc_path = path + '.enc'
+            if os.path.exists(enc_path):
+                found_encrypted = True
+                self.print_info(f"Found encrypted Netskope certificate at {enc_path}")
+                self.print_info("  This usually means the encryptClientConfig hardening flag is enabled")
+                break
+
+        # macOS keychain fallback: extract root and intermediate CAs
+        if plat == 'Darwin':
+            if found_encrypted:
+                self.print_info("  Attempting to extract certificate from macOS System Keychain instead...")
+            result = self._get_netskope_cert_from_keychain()
+            if result:
+                return result
+
+        if found_encrypted:
+            self.print_error("Could not extract Netskope certificate from keychain")
+            self.print_error("Use --cert-file to provide the certificate manually, or download it from")
+            self.print_error("  your Netskope tenant at Settings > Manage > Certificates")
+        else:
+            self.print_error("Could not find Netskope certificate")
+            self.print_error("Use --cert-file to provide the certificate manually")
+        return None
+
+    def _get_netskope_cert_from_keychain(self):
+        """Extract Netskope root and intermediate CA certificates from the macOS System Keychain.
+
+        The root CA typically has a CN containing "certadmin" and the
+        intermediate has a CN containing "goskope". The -c flag on
+        security find-certificate does substring matching, which handles
+        org-specific variants like ca.thg.goskope.com.
+
+        Returns:
+            str or None: Combined PEM certificate text, or None on failure.
+        """
+        certs = []
+
+        # Root CA (CN contains "certadmin")
+        try:
+            result = subprocess.run(
+                ['security', 'find-certificate', '-c', 'certadmin', '-p',
+                 '/Library/Keychains/System.keychain'],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0 and '-----BEGIN CERTIFICATE-----' in result.stdout:
+                certs.append(result.stdout.strip())
+                self.print_debug("Found Netskope root CA in System Keychain")
+        except Exception as e:
+            self.print_debug(f"Keychain root CA search failed: {e}")
+
+        if not certs:
+            self.print_error("Could not find Netskope root CA in macOS System Keychain")
+            self.print_error("Use --cert-file to provide the certificate manually")
+            return None
+
+        # Intermediate CA (CN contains "goskope")
+        try:
+            result = subprocess.run(
+                ['security', 'find-certificate', '-c', 'goskope', '-p',
+                 '/Library/Keychains/System.keychain'],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0 and '-----BEGIN CERTIFICATE-----' in result.stdout:
+                certs.append(result.stdout.strip())
+                self.print_debug("Found Netskope intermediate CA in System Keychain")
+            else:
+                self.print_warn("Netskope intermediate CA not found in keychain; proceeding with root CA only")
+        except Exception as e:
+            self.print_debug(f"Keychain intermediate CA search failed: {e}")
+            self.print_warn("Could not search for Netskope intermediate CA; proceeding with root CA only")
+
+        self.print_info("Using Netskope certificate(s) from macOS System Keychain")
+        return '\n'.join(certs)
+
     def download_certificate(self):
         """Download and verify certificate."""
-        self.print_info("Retrieving Cloudflare WARP certificate...")
+        provider_name = self.provider['name']
+        self.print_info(f"Retrieving {provider_name} certificate...")
         
         warp_cert = None
         
@@ -1207,11 +1447,11 @@ class FumitmPython:
             if not warp_cert:
                 return False
         
-        # Priority 3: Auto-detect devcontainer/WSL without warp-cli
+        # Priority 3: Auto-detect devcontainer/WSL without native CLI
         elif self.is_devcontainer() and not self.command_exists('warp-cli'):
             # Check if certificate already exists
-            if os.path.exists(CERT_PATH):
-                self.print_info(f"Found existing certificate at {CERT_PATH}")
+            if os.path.exists(self.cert_path):
+                self.print_info(f"Found existing certificate at {self.cert_path}")
                 # In install mode, ask if they want to update it
                 if self.is_install_mode():
                     response = input("Do you want to update it with a new certificate? (y/N) ")
@@ -1220,12 +1460,12 @@ class FumitmPython:
                         if not warp_cert:
                             return False
                     else:
-                        with open(CERT_PATH, 'r') as f:
+                        with open(self.cert_path, 'r') as f:
                             warp_cert = f.read()
                         self.print_info("Using existing certificate")
                 else:
                     # In status mode, just use existing
-                    with open(CERT_PATH, 'r') as f:
+                    with open(self.cert_path, 'r') as f:
                         warp_cert = f.read()
                     self.print_info("Using existing certificate for status check")
             else:
@@ -1235,31 +1475,21 @@ class FumitmPython:
                     self.print_error("Cannot proceed without a certificate in devcontainer environment")
                     self.print_info("Tip: Run './fumitm.py --fix' to set up the certificate")
                     return False
-        
-        # Priority 4: Standard path - use warp-cli if available
-        elif self.command_exists('warp-cli'):
-            # Get current certificate from warp-cli
-            try:
-                result = subprocess.run(
-                    ['warp-cli', 'certs', '--no-paginate'],
-                    capture_output=True, text=True
-                )
-                
-                if result.returncode != 0 or not result.stdout.strip():
-                    self.print_error("Failed to get certificate from warp-cli")
-                    self.print_error("Make sure you are connected to Cloudflare WARP")
-                    return False
-                
-                warp_cert = result.stdout.strip()
-            except Exception as e:
-                self.print_error(f"Error running warp-cli: {e}")
+
+        # Priority 4: Provider-specific certificate retrieval
+        elif self.provider is PROVIDERS['warp']:
+            warp_cert = self._get_warp_cert()
+            if not warp_cert:
+                return False
+        elif self.provider is PROVIDERS['netskope']:
+            warp_cert = self._get_netskope_cert()
+            if not warp_cert:
                 return False
         else:
-            self.print_error("warp-cli command not found and not in a detected container environment.")
-            self.print_error("Please ensure Cloudflare WARP is installed.")
+            self.print_error(f"{provider_name} provider has no certificate retrieval method.")
             return False
         
-        # Create a temp file for the WARP certificate
+        # Create a temp file for the proxy certificate
         with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as temp_cert:
             temp_cert.write(warp_cert)
             temp_cert_path = temp_cert.name
@@ -1279,32 +1509,31 @@ class FumitmPython:
             os.unlink(temp_cert_path)
             return False
         
-        self.print_info("WARP certificate retrieved successfully")
-        
-        # Check if certificate needs to be saved to CERT_PATH
+        self.print_info(f"{provider_name} certificate retrieved successfully")
+
+        # Check if certificate needs to be saved
         needs_save = False
-        if os.path.exists(CERT_PATH):
-            # Check if existing cert matches WARP cert
-            with open(CERT_PATH, 'r') as f:
+        if os.path.exists(self.cert_path):
+            with open(self.cert_path, 'r') as f:
                 existing_cert = f.read()
-            
+
             if existing_cert != warp_cert:
-                self.print_info(f"Certificate at {CERT_PATH} needs updating")
+                self.print_info(f"Certificate at {self.cert_path} needs updating")
                 needs_save = True
             else:
-                self.print_info(f"Certificate at {CERT_PATH} is up to date")
+                self.print_info(f"Certificate at {self.cert_path} is up to date")
         else:
-            self.print_info(f"Certificate will be saved to {CERT_PATH}")
+            self.print_info(f"Certificate will be saved to {self.cert_path}")
             needs_save = True
-        
+
         # Save certificate if needed
         if needs_save:
             if not self.is_install_mode():
-                self.print_action(f"Would save certificate to {CERT_PATH}")
+                self.print_action(f"Would save certificate to {self.cert_path}")
             else:
                 # Save certificate
-                shutil.copy(temp_cert_path, CERT_PATH)
-                self.print_info(f"Certificate saved to {CERT_PATH}")
+                shutil.copy(temp_cert_path, self.cert_path)
+                self.print_info(f"Certificate saved to {self.cert_path}")
         
         # Clean up
         os.unlink(temp_cert_path)
@@ -1328,7 +1557,7 @@ class FumitmPython:
         if node_extra_ca_certs:
             if os.path.exists(node_extra_ca_certs):
                 # Check if the file contains our certificate using normalized comparison
-                if self.certificate_exists_in_file(CERT_PATH, node_extra_ca_certs):
+                if self.certificate_exists_in_file(self.cert_path, node_extra_ca_certs):
                     # Certificate already exists in NODE_EXTRA_CA_CERTS, skip to npm setup
                     pass
                 else:
@@ -1345,7 +1574,7 @@ class FumitmPython:
                         if not self.is_install_mode():
                             self.print_action(f"Would create directory: {os.path.dirname(new_path)}")
                             self.print_action(f"Would copy {node_extra_ca_certs} to {new_path}")
-                            self.print_action(f"Would append Cloudflare certificate to {new_path}")
+                            self.print_action(f"Would append proxy certificate to {new_path}")
                             self.print_action(f"Would update NODE_EXTRA_CA_CERTS to point to {new_path}")
                         else:
                             response = input("Do you want to use this alternative path? (Y/n) ")
@@ -1357,16 +1586,16 @@ class FumitmPython:
                                     except Exception:
                                         Path(new_path).touch()
                                 
-                                self.safe_append_certificate(CERT_PATH, new_path)
+                                self.safe_append_certificate(self.cert_path, new_path)
 
                                 self.add_to_shell_config("NODE_EXTRA_CA_CERTS", new_path, shell_config)
                                 self.print_info(f"Created new certificate bundle at {new_path}")
                     else:
                         if not self.is_install_mode():
-                            self.print_action(f"Would append Cloudflare certificate to {node_extra_ca_certs}")
+                            self.print_action(f"Would append proxy certificate to {node_extra_ca_certs}")
                         else:
-                            self.print_info(f"Appending Cloudflare certificate to {node_extra_ca_certs}")
-                            self.safe_append_certificate(CERT_PATH, node_extra_ca_certs)
+                            self.print_info(f"Appending proxy certificate to {node_extra_ca_certs}")
+                            self.safe_append_certificate(self.cert_path, node_extra_ca_certs)
             else:
                 needs_setup = True
                 self.print_info("Configuring Node.js certificate...")
@@ -1376,22 +1605,22 @@ class FumitmPython:
             needs_setup = True
             self.print_info("Configuring Node.js certificate...")
             # NODE_EXTRA_CA_CERTS not set, create a new bundle
-            node_bundle = os.path.expanduser("~/.cloudflare-warp/node/ca-bundle.pem")
+            node_bundle = os.path.join(self.bundle_dir, "node/ca-bundle.pem")
             
             if not self.is_install_mode():
                 self.print_action(f"Would create Node.js CA bundle at {node_bundle}")
-                self.print_action("Would include Cloudflare certificate in the bundle")
+                self.print_action("Would include proxy certificate in the bundle")
                 self.print_action(f"Would set NODE_EXTRA_CA_CERTS={node_bundle}")
             else:
                 self.print_info(f"Creating Node.js CA bundle at {node_bundle}")
                 os.makedirs(os.path.dirname(node_bundle), exist_ok=True)
                 
-                # Start with just the Cloudflare certificate
+                # Start with just the proxy certificate
                 # (NODE_EXTRA_CA_CERTS supplements system certs, doesn't replace them)
-                shutil.copy(CERT_PATH, node_bundle)
+                shutil.copy(self.cert_path, node_bundle)
                 
                 self.add_to_shell_config("NODE_EXTRA_CA_CERTS", node_bundle, shell_config)
-                self.print_info("Created Node.js CA bundle with Cloudflare certificate")
+                self.print_info("Created Node.js CA bundle with proxy certificate")
         
         # Setup npm cafile if npm is available
         if self.command_exists('npm'):
@@ -1414,13 +1643,13 @@ class FumitmPython:
             current_cafile = ""
         
         # npm needs a full CA bundle, not just a single certificate
-        npm_bundle = os.path.expanduser("~/.cloudflare-warp/npm/ca-bundle.pem")
+        npm_bundle = os.path.join(self.bundle_dir, "npm/ca-bundle.pem")
         needs_setup = False
         
         if current_cafile and current_cafile not in ["null", "undefined"]:
             if os.path.exists(current_cafile):
                 # First check if the existing cafile looks suspiciously small
-                suspicious, reason = self.is_suspicious_full_bundle(current_cafile, CERT_PATH)
+                suspicious, reason = self.is_suspicious_full_bundle(current_cafile, self.cert_path)
                 if suspicious:
                     self.print_info("Configuring npm certificate...")
                     self.print_warn(f"Existing npm cafile looks suspiciously small ({reason})")
@@ -1430,16 +1659,16 @@ class FumitmPython:
                     else:
                         os.makedirs(os.path.dirname(npm_bundle), exist_ok=True)
                         self.create_bundle_with_system_certs(npm_bundle)
-                        self.safe_append_certificate(CERT_PATH, npm_bundle)
+                        self.safe_append_certificate(self.cert_path, npm_bundle)
                         subprocess.run(['npm', 'config', 'set', 'cafile', npm_bundle])
                         self.print_info(f"Repointed npm cafile to managed bundle: {npm_bundle}")
                     return
 
                 # Check if the file contains our certificate using normalized comparison
-                if not self.certificate_exists_in_file(CERT_PATH, current_cafile):
+                if not self.certificate_exists_in_file(self.cert_path, current_cafile):
                     needs_setup = True
                     self.print_info("Configuring npm certificate...")
-                    self.print_warn("Current npm cafile doesn't contain Cloudflare certificate")
+                    self.print_warn("Current npm cafile doesn't contain proxy certificate")
                     
                     # Check if we can write to the npm cafile
                     if not self.is_writable(current_cafile):
@@ -1448,7 +1677,7 @@ class FumitmPython:
                         
                         if not self.is_install_mode():
                             self.print_action(f"Would create directory: {os.path.dirname(npm_bundle)}")
-                            self.print_action(f"Would create full CA bundle at {npm_bundle} with system certificates and Cloudflare certificate")
+                            self.print_action(f"Would create full CA bundle at {npm_bundle} with system certificates and proxy certificate")
                             self.print_action(f"Would run: npm config set cafile {npm_bundle}")
                         else:
                             os.makedirs(os.path.dirname(npm_bundle), exist_ok=True)
@@ -1459,18 +1688,18 @@ class FumitmPython:
                                     shutil.copy(current_cafile, npm_bundle)
 
                             # Append certificate to bundle
-                            self.safe_append_certificate(CERT_PATH, npm_bundle)
+                            self.safe_append_certificate(self.cert_path, npm_bundle)
 
                             subprocess.run(['npm', 'config', 'set', 'cafile', npm_bundle])
                             self.print_info(f"Created new npm cafile at {npm_bundle}")
                     else:
                         if not self.is_install_mode():
-                            self.print_action(f"Would ask to append Cloudflare certificate to {current_cafile}")
+                            self.print_action(f"Would ask to append proxy certificate to {current_cafile}")
                         else:
                             response = input("Do you want to append it to the existing cafile? (y/N) ")
                             if response.lower() == 'y':
-                                self.print_info(f"Appending Cloudflare certificate to {current_cafile}")
-                                self.safe_append_certificate(CERT_PATH, current_cafile)
+                                self.print_info(f"Appending proxy certificate to {current_cafile}")
+                                self.safe_append_certificate(self.cert_path, current_cafile)
             else:
                 needs_setup = True
                 self.print_info("Configuring npm certificate...")
@@ -1484,7 +1713,7 @@ class FumitmPython:
                     if response.lower() != 'n':
                         os.makedirs(os.path.dirname(npm_bundle), exist_ok=True)
                         self.create_bundle_with_system_certs(npm_bundle)
-                        self.safe_append_certificate(CERT_PATH, npm_bundle)
+                        self.safe_append_certificate(self.cert_path, npm_bundle)
                         subprocess.run(['npm', 'config', 'set', 'cafile', npm_bundle])
                         self.print_info(f"Created and configured npm cafile at {npm_bundle}")
         else:
@@ -1493,15 +1722,15 @@ class FumitmPython:
             self.print_info("npm cafile is not configured")
             
             if not self.is_install_mode():
-                self.print_action(f"Would create full CA bundle at {npm_bundle} with system certificates and Cloudflare certificate")
+                self.print_action(f"Would create full CA bundle at {npm_bundle} with system certificates and proxy certificate")
                 self.print_action(f"Would run: npm config set cafile {npm_bundle}")
             else:
-                response = input("Do you want to configure npm with a CA bundle including Cloudflare certificate? (Y/n) ")
+                response = input("Do you want to configure npm with a CA bundle including proxy certificate? (Y/n) ")
                 if response.lower() != 'n':
                     os.makedirs(os.path.dirname(npm_bundle), exist_ok=True)
                     if not self.create_bundle_with_system_certs(npm_bundle):
-                        self.print_warn("Could not find system CA bundle, creating new bundle with only Cloudflare certificate")
-                    self.safe_append_certificate(CERT_PATH, npm_bundle)
+                        self.print_warn("Could not find system CA bundle, creating new bundle with only proxy certificate")
+                    self.safe_append_certificate(self.cert_path, npm_bundle)
                     subprocess.run(['npm', 'config', 'set', 'cafile', npm_bundle])
                     self.print_info(f"Configured npm cafile to: {npm_bundle}")
                     
@@ -1554,12 +1783,12 @@ class FumitmPython:
                 return  # Not set, nothing to do
 
             # Check if it points to our managed npm bundle (that's fine)
-            npm_bundle = os.path.expanduser("~/.cloudflare-warp/npm/ca-bundle.pem")
+            npm_bundle = os.path.join(self.bundle_dir, "npm/ca-bundle.pem")
             if current_cafile == npm_bundle:
                 return  # Points to fumitm-managed bundle, that's OK
 
             # Check if file exists and contains WARP cert
-            if os.path.exists(current_cafile) and self.certificate_exists_in_file(CERT_PATH, current_cafile):
+            if os.path.exists(current_cafile) and self.certificate_exists_in_file(self.cert_path, current_cafile):
                 return  # Working config, leave it
 
             # Problematic config - delete it
@@ -1567,7 +1796,7 @@ class FumitmPython:
             if not os.path.exists(current_cafile):
                 self.print_warn(f"yarn {config_key} points to non-existent file: {current_cafile}")
             else:
-                self.print_warn(f"yarn {config_key} doesn't contain WARP certificate: {current_cafile}")
+                self.print_warn(f"yarn {config_key} doesn't contain proxy certificate: {current_cafile}")
 
             if not self.is_install_mode():
                 self.print_action(f"Would remove yarn {config_key} config")
@@ -1597,12 +1826,12 @@ class FumitmPython:
                 return  # Not set, nothing to do
 
             # Check if it points to our managed npm bundle (that's fine)
-            npm_bundle = os.path.expanduser("~/.cloudflare-warp/npm/ca-bundle.pem")
+            npm_bundle = os.path.join(self.bundle_dir, "npm/ca-bundle.pem")
             if current_cafile == npm_bundle:
                 return  # Points to fumitm-managed bundle, that's OK
 
             # Check if file exists and contains WARP cert
-            if os.path.exists(current_cafile) and self.certificate_exists_in_file(CERT_PATH, current_cafile):
+            if os.path.exists(current_cafile) and self.certificate_exists_in_file(self.cert_path, current_cafile):
                 return  # Working config, leave it
 
             # Problematic config - delete it
@@ -1610,7 +1839,7 @@ class FumitmPython:
             if not os.path.exists(current_cafile):
                 self.print_warn(f"pnpm cafile points to non-existent file: {current_cafile}")
             else:
-                self.print_warn(f"pnpm cafile doesn't contain WARP certificate: {current_cafile}")
+                self.print_warn(f"pnpm cafile doesn't contain proxy certificate: {current_cafile}")
 
             if not self.is_install_mode():
                 self.print_action("Would remove pnpm cafile config")
@@ -1654,7 +1883,7 @@ class FumitmPython:
                     if not self.is_install_mode():
                         self.print_action(f"Would create directory: {os.path.dirname(new_path)}")
                         self.print_action(f"Would copy {requests_ca_bundle} to {new_path}")
-                        self.print_action(f"Would append Cloudflare certificate to {new_path}")
+                        self.print_action(f"Would append proxy certificate to {new_path}")
                         self.print_action(f"Would update REQUESTS_CA_BUNDLE to point to {new_path}")
                     else:
                         response = input("Do you want to use this alternative path? (Y/n) ")
@@ -1667,7 +1896,7 @@ class FumitmPython:
                                     Path(new_path).touch()
                             
                             # Append certificate to the new path
-                            self.safe_append_certificate(CERT_PATH, new_path)
+                            self.safe_append_certificate(self.cert_path, new_path)
 
                             needs_setup = True
                             self.print_info("Configuring Python certificate...")
@@ -1678,7 +1907,7 @@ class FumitmPython:
                             self.print_info(f"Created new certificate bundle at {new_path}")
                 else:
                     # Check if the existing bundle looks suspicious (likely just WARP CA)
-                    suspicious, reason = self.is_suspicious_full_bundle(requests_ca_bundle, CERT_PATH)
+                    suspicious, reason = self.is_suspicious_full_bundle(requests_ca_bundle, self.cert_path)
                     if suspicious:
                         needs_setup = True
                         self.print_info("Configuring Python certificate...")
@@ -1688,7 +1917,7 @@ class FumitmPython:
                             self.print_action(f"Would repoint REQUESTS_CA_BUNDLE to {python_bundle}")
                         else:
                             self.create_bundle_with_system_certs(python_bundle)
-                            self.safe_append_certificate(CERT_PATH, python_bundle)
+                            self.safe_append_certificate(self.cert_path, python_bundle)
                             self.add_to_shell_config("REQUESTS_CA_BUNDLE", python_bundle, shell_config)
                             self.add_to_shell_config("SSL_CERT_FILE", python_bundle, shell_config)
                             self.add_to_shell_config("CURL_CA_BUNDLE", python_bundle, shell_config)
@@ -1696,16 +1925,16 @@ class FumitmPython:
                         return
 
                     # Check if the file contains our certificate using normalized comparison
-                    if not self.certificate_exists_in_file(CERT_PATH, requests_ca_bundle):
+                    if not self.certificate_exists_in_file(self.cert_path, requests_ca_bundle):
                         needs_setup = True
                         self.print_info("Configuring Python certificate...")
                         self.print_info(f"REQUESTS_CA_BUNDLE is already set to: {requests_ca_bundle}")
 
                         if not self.is_install_mode():
-                            self.print_action(f"Would append Cloudflare certificate to {requests_ca_bundle}")
+                            self.print_action(f"Would append proxy certificate to {requests_ca_bundle}")
                         else:
-                            self.print_info(f"Appending Cloudflare certificate to {requests_ca_bundle}")
-                            self.safe_append_certificate(CERT_PATH, requests_ca_bundle)
+                            self.print_info(f"Appending proxy certificate to {requests_ca_bundle}")
+                            self.safe_append_certificate(self.cert_path, requests_ca_bundle)
             else:
                 needs_setup = True
                 self.print_info("Configuring Python certificate...")
@@ -1717,12 +1946,12 @@ class FumitmPython:
             
             if not self.is_install_mode():
                 self.print_action(f"Would create Python CA bundle at {python_bundle}")
-                self.print_action("Would copy system certificates and append Cloudflare certificate")
+                self.print_action("Would copy system certificates and append proxy certificate")
             else:
                 self.print_info(f"Creating Python CA bundle at {python_bundle}")
                 if not self.create_bundle_with_system_certs(python_bundle):
                     self.print_warn("Could not find system CA bundle, creating new bundle")
-                self.safe_append_certificate(CERT_PATH, python_bundle)
+                self.safe_append_certificate(self.cert_path, python_bundle)
 
             self.add_to_shell_config("REQUESTS_CA_BUNDLE", python_bundle, shell_config)
             self.add_to_shell_config("SSL_CERT_FILE", python_bundle, shell_config)
@@ -1733,7 +1962,7 @@ class FumitmPython:
         ssl_cert_file = os.environ.get('SSL_CERT_FILE', '')
         if ssl_cert_file and ssl_cert_file != python_bundle:
             if os.path.exists(ssl_cert_file):
-                suspicious, reason = self.is_suspicious_full_bundle(ssl_cert_file, CERT_PATH)
+                suspicious, reason = self.is_suspicious_full_bundle(ssl_cert_file, self.cert_path)
                 if suspicious:
                     self.print_info("Configuring SSL_CERT_FILE...")
                     self.print_warn(f"SSL_CERT_FILE looks suspiciously small ({reason})")
@@ -1743,18 +1972,18 @@ class FumitmPython:
                         # Ensure the managed bundle exists
                         if not os.path.exists(python_bundle):
                             self.create_bundle_with_system_certs(python_bundle)
-                            self.safe_append_certificate(CERT_PATH, python_bundle)
+                            self.safe_append_certificate(self.cert_path, python_bundle)
                         self.add_to_shell_config("SSL_CERT_FILE", python_bundle, shell_config)
                         self.print_info(f"Repointed SSL_CERT_FILE to managed bundle: {python_bundle}")
-                elif not self.certificate_exists_in_file(CERT_PATH, ssl_cert_file):
+                elif not self.certificate_exists_in_file(self.cert_path, ssl_cert_file):
                     self.print_info("Configuring SSL_CERT_FILE...")
-                    self.print_warn("SSL_CERT_FILE doesn't contain WARP certificate")
+                    self.print_warn("SSL_CERT_FILE doesn't contain proxy certificate")
                     if not self.is_install_mode():
                         self.print_action(f"Would repoint SSL_CERT_FILE to {python_bundle}")
                     else:
                         if not os.path.exists(python_bundle):
                             self.create_bundle_with_system_certs(python_bundle)
-                            self.safe_append_certificate(CERT_PATH, python_bundle)
+                            self.safe_append_certificate(self.cert_path, python_bundle)
                         self.add_to_shell_config("SSL_CERT_FILE", python_bundle, shell_config)
                         self.print_info(f"Repointed SSL_CERT_FILE to managed bundle: {python_bundle}")
             else:
@@ -1765,7 +1994,7 @@ class FumitmPython:
                 else:
                     if not os.path.exists(python_bundle):
                         self.create_bundle_with_system_certs(python_bundle)
-                        self.safe_append_certificate(CERT_PATH, python_bundle)
+                        self.safe_append_certificate(self.cert_path, python_bundle)
                     self.add_to_shell_config("SSL_CERT_FILE", python_bundle, shell_config)
                     self.print_info(f"Repointed SSL_CERT_FILE to managed bundle: {python_bundle}")
 
@@ -1801,7 +2030,7 @@ class FumitmPython:
             needs_setup = True
         elif os.path.exists(current_ca_file):
             # First check if the existing CA file looks suspiciously small
-            suspicious, reason = self.is_suspicious_full_bundle(current_ca_file, CERT_PATH)
+            suspicious, reason = self.is_suspicious_full_bundle(current_ca_file, self.cert_path)
             if suspicious:
                 self.print_info("Configuring gcloud certificate...")
                 self.print_warn(f"Existing gcloud CA file looks suspiciously small ({reason})")
@@ -1811,13 +2040,13 @@ class FumitmPython:
                 else:
                     os.makedirs(gcloud_cert_dir, exist_ok=True)
                     self.create_bundle_with_system_certs(gcloud_bundle)
-                    self.safe_append_certificate(CERT_PATH, gcloud_bundle)
+                    self.safe_append_certificate(self.cert_path, gcloud_bundle)
                     subprocess.run(['gcloud', 'config', 'set', 'core/custom_ca_certs_file', gcloud_bundle], capture_output=True, timeout=30)
                     self.print_info(f"Repointed gcloud custom CA file to managed bundle: {gcloud_bundle}")
                 return
 
             # Check if current CA file contains our certificate using normalized comparison
-            if not self.certificate_exists_in_file(CERT_PATH, current_ca_file):
+            if not self.certificate_exists_in_file(self.cert_path, current_ca_file):
                 needs_setup = True
         else:
             needs_setup = True
@@ -1853,13 +2082,13 @@ class FumitmPython:
         if not self.is_install_mode():
             self.print_action(f"Would create directory: {gcloud_cert_dir}")
             self.print_action(f"Would create gcloud CA bundle at {gcloud_bundle}")
-            self.print_action("Would copy system certificates and append Cloudflare certificate")
+            self.print_action("Would copy system certificates and append proxy certificate")
             self.print_action(f"Would run: gcloud config set core/custom_ca_certs_file {gcloud_bundle}")
         else:
             # Create combined bundle
             self.print_info(f"Creating gcloud CA bundle at {gcloud_bundle}")
             self.create_bundle_with_system_certs(gcloud_bundle)
-            self.safe_append_certificate(CERT_PATH, gcloud_bundle)
+            self.safe_append_certificate(self.cert_path, gcloud_bundle)
 
             # Configure gcloud
             result = subprocess.run(
@@ -1883,7 +2112,7 @@ class FumitmPython:
         """Setup Git sslCAInfo to a managed full bundle."""
         if not self.command_exists('git'):
             return
-        git_bundle = os.path.expanduser("~/.cloudflare-warp/git/ca-bundle.pem")
+        git_bundle = os.path.join(self.bundle_dir, "git/ca-bundle.pem")
         # Check current setting
         try:
             result = subprocess.run(['git', 'config', '--global', 'http.sslCAInfo'], capture_output=True, text=True)
@@ -1893,7 +2122,7 @@ class FumitmPython:
         # Decide whether to repoint
         repoint = False
         if current_ca and os.path.exists(current_ca):
-            suspicious, reason = self.is_suspicious_full_bundle(current_ca, CERT_PATH)
+            suspicious, reason = self.is_suspicious_full_bundle(current_ca, self.cert_path)
             if suspicious:
                 repoint = True
                 self.print_info("Configuring Git certificate...")
@@ -1911,7 +2140,7 @@ class FumitmPython:
         # Build full bundle and configure
         os.makedirs(os.path.dirname(git_bundle), exist_ok=True)
         self.create_bundle_with_system_certs(git_bundle)
-        self.safe_append_certificate(CERT_PATH, git_bundle)
+        self.safe_append_certificate(self.cert_path, git_bundle)
         subprocess.run(['git', 'config', '--global', 'http.sslCAInfo', git_bundle], capture_output=True, text=True)
         self.print_info(f"Configured git http.sslCAInfo to: {git_bundle}")
 
@@ -1934,7 +2163,7 @@ class FumitmPython:
             self.print_debug("curl already works via system trust, skipping configuration")
             return
 
-        curl_bundle = os.path.expanduser("~/.cloudflare-warp/curl/ca-bundle.pem")
+        curl_bundle = os.path.join(self.bundle_dir, "curl/ca-bundle.pem")
         curl_env = os.environ.get('CURL_CA_BUNDLE', '')
 
         # Case 1: CURL_CA_BUNDLE is set but points to suspicious or non-existent file
@@ -1947,7 +2176,7 @@ class FumitmPython:
                     self.print_action(f"Would repoint CURL_CA_BUNDLE to {curl_bundle}")
                     return
             else:
-                suspicious, reason = self.is_suspicious_full_bundle(curl_env, CERT_PATH)
+                suspicious, reason = self.is_suspicious_full_bundle(curl_env, self.cert_path)
                 if suspicious:
                     self.print_info("Configuring curl certificate bundle...")
                     self.print_warn(f"Existing CURL_CA_BUNDLE looks suspiciously small ({reason})")
@@ -1972,7 +2201,7 @@ class FumitmPython:
         # Create the bundle and configure
         os.makedirs(os.path.dirname(curl_bundle), exist_ok=True)
         self.create_bundle_with_system_certs(curl_bundle)
-        self.safe_append_certificate(CERT_PATH, curl_bundle)
+        self.safe_append_certificate(self.cert_path, curl_bundle)
         shell_type = self.detect_shell()
         shell_config = self.get_shell_config(shell_type)
         self.add_to_shell_config("CURL_CA_BUNDLE", curl_bundle, shell_config)
@@ -1991,7 +2220,8 @@ class FumitmPython:
                         suspicious, reason = self.is_suspicious_full_bundle(git_ca, None)
                         if suspicious:
                             self.print_warn(f"  ⚠ http.sslCAInfo looks suspiciously small ({reason})")
-                            self.print_action("    Run with --fix or use: git config --global http.sslCAInfo ~/.cloudflare-warp/git/ca-bundle.pem")
+                            git_bundle_path = os.path.join(self.bundle_dir, "git/ca-bundle.pem")
+                            self.print_action(f"    Run with --fix or use: git config --global http.sslCAInfo {git_bundle_path}")
                             has_issues = True
                     else:
                         self.print_warn(f"  ✗ http.sslCAInfo points to non-existent file: {git_ca}")
@@ -2013,7 +2243,7 @@ class FumitmPython:
             verify_result = self.verify_connection("curl")
 
             if verify_result == "WORKING":
-                self.print_info("  ✓ curl can connect through WARP")
+                self.print_info("  ✓ curl can connect through proxy")
 
                 # Check if it's using SecureTransport (macOS system curl)
                 try:
@@ -2082,8 +2312,14 @@ class FumitmPython:
                 if '-->' in line:
                     # Extract path after -->
                     path = line.split('-->')[1].strip()
-                    # Skip "system" entries that point to user home
-                    if path and not path.endswith(os.path.expanduser('~')):
+                    if not path:
+                        continue
+                    # Validate that this is actually a JDK by checking for
+                    # cacerts. The "system" entry often resolves to the CWD
+                    # or user home when no system Java is configured.
+                    cacerts = os.path.join(path, 'lib', 'security', 'cacerts')
+                    jre_cacerts = os.path.join(path, 'jre', 'lib', 'security', 'cacerts')
+                    if os.path.exists(cacerts) or os.path.exists(jre_cacerts):
                         java_homes.add(path)
 
             return sorted(list(java_homes))
@@ -2119,11 +2355,11 @@ class FumitmPython:
             # Check if certificate already exists
             try:
                 result = subprocess.run(
-                    ['keytool', '-list', '-alias', 'cloudflare-zerotrust',
+                    ['keytool', '-list', '-alias', self.provider['keytool_alias'],
                      '-keystore', cacerts, '-storepass', 'changeit'],
                     capture_output=True
                 )
-                if result.returncode == 0 and 'cloudflare-zerotrust' in result.stdout.decode():
+                if result.returncode == 0 and self.provider['keytool_alias'] in result.stdout.decode():
                     self.print_info(f"  ✓ {version_name}: Certificate already installed")
                     continue
             except Exception:
@@ -2135,14 +2371,20 @@ class FumitmPython:
                 self.print_action(f"    Would import certificate to: {cacerts}")
             else:
                 result = subprocess.run(
-                    ['keytool', '-import', '-trustcacerts', '-alias', 'cloudflare-zerotrust',
-                     '-file', CERT_PATH, '-keystore', cacerts, '-storepass', 'changeit', '-noprompt'],
+                    ['keytool', '-import', '-trustcacerts', '-alias', self.provider['keytool_alias'],
+                     '-file', self.cert_path, '-keystore', cacerts, '-storepass', 'changeit', '-noprompt'],
                     capture_output=True
                 )
                 if result.returncode == 0:
                     self.print_info(f"    ✓ {version_name}: Certificate added successfully")
                 else:
                     self.print_warn(f"    ✗ {version_name}: Failed to add certificate (may require sudo)")
+                    self.print_info( "      Fix with:")
+                    print(f"        sudo keytool -import -trustcacerts \\")
+                    print(f"          -alias {self.provider['keytool_alias']} \\")
+                    print(f"          -file {self.cert_path} \\")
+                    print(f"          -keystore {cacerts} \\")
+                    print( "          -storepass changeit -noprompt")
 
     def setup_jenv_cert(self):
         """Setup Java certificates for all jenv-managed Java installations."""
@@ -2171,11 +2413,11 @@ class FumitmPython:
             # Check if certificate already exists
             try:
                 result = subprocess.run(
-                    ['keytool', '-list', '-alias', 'cloudflare-zerotrust',
+                    ['keytool', '-list', '-alias', self.provider['keytool_alias'],
                      '-keystore', cacerts, '-storepass', 'changeit'],
                     capture_output=True
                 )
-                if result.returncode == 0 and 'cloudflare-zerotrust' in result.stdout.decode():
+                if result.returncode == 0 and self.provider['keytool_alias'] in result.stdout.decode():
                     # Certificate already exists
                     self.print_info(f"  ✓ {version_name}: Certificate already installed")
                     continue
@@ -2188,8 +2430,8 @@ class FumitmPython:
                 self.print_action(f"    Would import certificate to: {cacerts}")
             else:
                 result = subprocess.run(
-                    ['keytool', '-import', '-trustcacerts', '-alias', 'cloudflare-zerotrust',
-                     '-file', CERT_PATH, '-keystore', cacerts, '-storepass', 'changeit', '-noprompt'],
+                    ['keytool', '-import', '-trustcacerts', '-alias', self.provider['keytool_alias'],
+                     '-file', self.cert_path, '-keystore', cacerts, '-storepass', 'changeit', '-noprompt'],
                     capture_output=True,
                     text=True
                 )
@@ -2197,8 +2439,15 @@ class FumitmPython:
                     self.print_info(f"    ✓ {version_name}: Certificate added successfully")
                 else:
                     self.print_warn(f"    ✗ {version_name}: Failed to add certificate (may require sudo)")
+                    self.print_info( "      Fix with:")
+                    print(f"        sudo keytool -import -trustcacerts \\")
+                    print(f"          -alias {self.provider['keytool_alias']} \\")
+                    print(f"          -file {self.cert_path} \\")
+                    print(f"          -keystore {cacerts} \\")
+                    print( "          -storepass changeit -noprompt")
                     if len(result.stdout) > 0:
                         self.print_warn(f"      Keytool response: {result.stdout}")
+
     def setup_gradle_cert(self):
         """Setup Gradle certificate configuration."""
         gradle_props = self.get_gradle_properties_path()
@@ -2236,11 +2485,11 @@ class FumitmPython:
         # Check if certificate already exists
         try:
             result = subprocess.run(
-                [dbeaver_keytool, '-list', '-alias', 'cloudflare-zerotrust', 
+                [dbeaver_keytool, '-list', '-alias', self.provider['keytool_alias'], 
                  '-keystore', dbeaver_cacerts, '-storepass', 'changeit'],
                 capture_output=True
             )
-            if result.returncode == 0 and 'cloudflare-zerotrust' in result.stdout.decode():
+            if result.returncode == 0 and self.provider['keytool_alias'] in result.stdout.decode():
                 # Certificate already exists, nothing to do
                 return
         except Exception:
@@ -2251,21 +2500,26 @@ class FumitmPython:
         
         if not self.is_install_mode():
             self.print_action(f"Would import certificate to DBeaver keystore: {dbeaver_cacerts}")
-            self.print_action(f"Would run: {dbeaver_keytool} -import -trustcacerts -alias cloudflare-zerotrust -file {CERT_PATH} -keystore {dbeaver_cacerts} -storepass changeit -noprompt")
+            self.print_action(f"Would run: {dbeaver_keytool} -import -trustcacerts -alias {self.provider['keytool_alias']} -file {self.cert_path} -keystore {dbeaver_cacerts} -storepass changeit -noprompt")
         else:
             self.print_info("Adding certificate to DBeaver keystore...")
             result = subprocess.run(
-                [dbeaver_keytool, '-import', '-trustcacerts', '-alias', 'cloudflare-zerotrust',
-                 '-file', CERT_PATH, '-keystore', dbeaver_cacerts, '-storepass', 'changeit', '-noprompt'],
+                [dbeaver_keytool, '-import', '-trustcacerts', '-alias', self.provider['keytool_alias'],
+                 '-file', self.cert_path, '-keystore', dbeaver_cacerts, '-storepass', 'changeit', '-noprompt'],
                 capture_output=True
             )
             if result.returncode == 0:
                 self.print_info("Certificate added to DBeaver keystore successfully")
             else:
                 self.print_warn("Failed to add certificate to DBeaver keystore (may require sudo)")
+                self.print_info( "      Fix with:")
+                print(f"        sudo {dbeaver_keytool} -import -trustcacerts \\")
+                print(f"          -alias {self.provider['keytool_alias']} \\")
+                print(f"          -file {self.cert_path} \\")
+                print(f"          -keystore {dbeaver_cacerts} \\")
+                print( "          -storepass changeit -noprompt")
                 if len(result.stdout) > 0:
                     self.print_warn(f"Keytool response: {result.stdout.decode('utf-8')}")
-                self.print_warn("You may need to run: sudo ./fumitm.py --fix")
     
     def setup_wget_cert(self):
         """Setup wget certificate."""
@@ -2280,7 +2534,7 @@ class FumitmPython:
             return
 
         wgetrc_path = os.path.expanduser("~/.wgetrc")
-        config_line = f"ca_certificate={CERT_PATH}"
+        config_line = f"ca_certificate={self.cert_path}"
 
         if os.path.exists(wgetrc_path):
             with open(wgetrc_path, 'r') as f:
@@ -2288,7 +2542,7 @@ class FumitmPython:
             
             if "ca_certificate=" in content:
                 # Check if it's already set to our certificate
-                if CERT_PATH in content:
+                if self.cert_path in content:
                     return
                 
                 self.print_info("Configuring wget certificate...")
@@ -2350,10 +2604,10 @@ class FumitmPython:
 
         # Primary method: Install to ~/.docker/certs.d/ (shared with other container tools)
         docker_certs_dir = os.path.expanduser("~/.docker/certs.d")
-        cert_dest = os.path.join(docker_certs_dir, "cloudflare-warp.crt")
+        cert_dest = os.path.join(docker_certs_dir, f"{self.provider['container_cert_name']}.crt")
 
         # Check if certificate is already installed with correct content
-        if os.path.exists(cert_dest) and self.certificate_likely_exists_in_file(CERT_PATH, cert_dest):
+        if os.path.exists(cert_dest) and self.certificate_likely_exists_in_file(self.cert_path, cert_dest):
             self.print_debug("Podman certificate already installed, skipping configuration")
             return
 
@@ -2373,18 +2627,18 @@ class FumitmPython:
         else:
             # Create directory and copy certificate (persistent location)
             os.makedirs(docker_certs_dir, exist_ok=True)
-            shutil.copy(CERT_PATH, cert_dest)
+            shutil.copy(self.cert_path, cert_dest)
             self.print_info(f"Certificate installed to {cert_dest}")
 
             # If VM is running, also install for immediate effect
             if vm_is_running:
                 self.print_info("Podman machine is running - also installing certificate into VM...")
 
-                with open(CERT_PATH, 'r') as f:
+                with open(self.cert_path, 'r') as f:
                     cert_content = f.read()
 
                 result = subprocess.run(
-                    ['podman', 'machine', 'ssh', 'sudo tee /etc/pki/ca-trust/source/anchors/cloudflare-warp.pem'],
+                    ['podman', 'machine', 'ssh', f'sudo tee /etc/pki/ca-trust/source/anchors/{self.provider["container_cert_name"]}.pem'],
                     input=cert_content, text=True, capture_output=True
                 )
 
@@ -2418,10 +2672,10 @@ class FumitmPython:
 
         # Primary method: Install to ~/.docker/certs.d/ (shared with other container tools)
         docker_certs_dir = os.path.expanduser("~/.docker/certs.d")
-        cert_dest = os.path.join(docker_certs_dir, "cloudflare-warp.crt")
+        cert_dest = os.path.join(docker_certs_dir, f"{self.provider['container_cert_name']}.crt")
 
         # Check if certificate is already installed with correct content
-        if os.path.exists(cert_dest) and self.certificate_likely_exists_in_file(CERT_PATH, cert_dest):
+        if os.path.exists(cert_dest) and self.certificate_likely_exists_in_file(self.cert_path, cert_dest):
             self.print_debug("Rancher Desktop certificate already installed, skipping configuration")
             return
 
@@ -2441,18 +2695,18 @@ class FumitmPython:
         else:
             # Create directory and copy certificate (persistent location)
             os.makedirs(docker_certs_dir, exist_ok=True)
-            shutil.copy(CERT_PATH, cert_dest)
+            shutil.copy(self.cert_path, cert_dest)
             self.print_info(f"Certificate installed to {cert_dest}")
 
             # If VM is running, also install for immediate effect
             if vm_is_running:
                 self.print_info("Rancher Desktop is running - also installing certificate into VM...")
 
-                with open(CERT_PATH, 'r') as f:
+                with open(self.cert_path, 'r') as f:
                     cert_content = f.read()
 
                 result = subprocess.run(
-                    ['rdctl', 'shell', 'sudo', 'tee', '/usr/local/share/ca-certificates/cloudflare-warp.pem'],
+                    ['rdctl', 'shell', 'sudo', 'tee', f'/usr/local/share/ca-certificates/{self.provider["container_cert_name"]}.pem'],
                     input=cert_content, text=True, capture_output=True
                 )
 
@@ -2500,8 +2754,8 @@ class FumitmPython:
         if not self.is_install_mode():
             self.print_action("Would restart ADB with root permissions: adb root")
             self.print_action("Would remount system partition: adb remount")
-            self.print_action(f"Would push certificate to emulator: adb push {CERT_PATH} /system/etc/security/cacerts/cloudflare-warp.pem")
-            self.print_action("Would set permissions: adb shell chmod 644 /system/etc/security/cacerts/cloudflare-warp.pem")
+            self.print_action(f"Would push certificate to emulator: adb push {self.cert_path} /system/etc/security/cacerts/{self.provider['container_cert_name']}.pem")
+            self.print_action(f"Would set permissions: adb shell chmod 644 /system/etc/security/cacerts/{self.provider['container_cert_name']}.pem")
             self.print_action("Would reboot emulator: adb reboot")
         else:
             response = input("Do you want to install the certificate on the running Android emulator? (y/N) ")
@@ -2524,13 +2778,13 @@ class FumitmPython:
                 
                 # Push certificate
                 result = subprocess.run(
-                    ['adb', 'push', CERT_PATH, '/system/etc/security/cacerts/cloudflare-warp.pem'],
+                    ['adb', 'push', self.cert_path, f'/system/etc/security/cacerts/{self.provider["container_cert_name"]}.pem'],
                     capture_output=True
                 )
                 if result.returncode == 0:
                     # Set permissions
                     subprocess.run(
-                        ['adb', 'shell', 'chmod', '644', '/system/etc/security/cacerts/cloudflare-warp.pem'],
+                        ['adb', 'shell', 'chmod', '644', f'/system/etc/security/cacerts/{self.provider["container_cert_name"]}.pem'],
                         capture_output=True
                     )
                     self.print_info("Certificate installed. Rebooting emulator...")
@@ -2555,10 +2809,10 @@ class FumitmPython:
         # Primary method: Install to ~/.docker/certs.d/ (persistent, works offline)
         # Colima automatically mounts this directory and applies certs on startup
         docker_certs_dir = os.path.expanduser("~/.docker/certs.d")
-        cert_dest = os.path.join(docker_certs_dir, "cloudflare-warp.crt")
+        cert_dest = os.path.join(docker_certs_dir, f"{self.provider['container_cert_name']}.crt")
 
         # Check if certificate is already installed with correct content
-        if os.path.exists(cert_dest) and self.certificate_likely_exists_in_file(CERT_PATH, cert_dest):
+        if os.path.exists(cert_dest) and self.certificate_likely_exists_in_file(self.cert_path, cert_dest):
             self.print_debug("Colima certificate already installed, skipping configuration")
             return
 
@@ -2578,7 +2832,7 @@ class FumitmPython:
         else:
             # Create directory and copy certificate (persistent location)
             os.makedirs(docker_certs_dir, exist_ok=True)
-            shutil.copy(CERT_PATH, cert_dest)
+            shutil.copy(self.cert_path, cert_dest)
             self.print_info(f"Certificate installed to {cert_dest}")
             self.print_info("This certificate will be automatically loaded on Colima start")
 
@@ -2586,11 +2840,11 @@ class FumitmPython:
             if vm_is_running:
                 self.print_info("Colima is running - also installing certificate into VM...")
 
-                with open(CERT_PATH, 'r') as f:
+                with open(self.cert_path, 'r') as f:
                     cert_content = f.read()
 
                 result = subprocess.run(
-                    ['colima', 'ssh', '--', 'sudo', 'tee', '/usr/local/share/ca-certificates/cloudflare-warp.crt'],
+                    ['colima', 'ssh', '--', 'sudo', 'tee', f'/usr/local/share/ca-certificates/{self.provider["container_cert_name"]}.crt'],
                     input=cert_content, text=True, capture_output=True
                 )
 
@@ -2622,13 +2876,13 @@ class FumitmPython:
                 self.print_info("Colima is not running - certificate will be applied on next start")
     
     def verify_connection(self, tool_name):
-        """Verify if a tool can connect through WARP."""
+        """Verify if a tool can connect through proxy."""
         # Skip verification if requested or in devcontainer
         if self.skip_verify:
             self.print_debug(f"Skipping {tool_name} verification (--skip-verify flag)")
             return "SKIPPED"
         
-        # Skip verification in devcontainers as network doesn't go through WARP
+        # Skip verification in devcontainers as network doesn't go through proxy
         if self.is_devcontainer():
             self.print_debug(f"Skipping {tool_name} verification in devcontainer environment")
             return "SKIPPED"
@@ -2681,8 +2935,8 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 result = "NOT_INSTALLED"
         
         elif tool_name == "python":
-            # Check if Python trusts the system Cloudflare WARP certificate
-            self.print_info("Checking if Python trusts system Cloudflare WARP certificate...")
+            # Check if Python trusts the system proxy certificate
+            self.print_info("Checking if Python trusts system proxy certificate...")
             
             try:
                 # Create a simple HTTPS request
@@ -2696,7 +2950,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     # Additional validation - check SSL context
                     context = ssl.create_default_context()
                     self.print_debug(f"Python SSL default verify paths: {ssl.get_default_verify_paths()}")
-                    self.print_debug("Python successfully trusts the system Cloudflare WARP certificate")
+                    self.print_debug("Python successfully trusts the system proxy certificate")
                     
             except urllib.error.HTTPError as e:
                 self.print_debug(f"HTTP Error {e.code} - but SSL worked")
@@ -2845,15 +3099,15 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 self.print_info(f"  NODE_EXTRA_CA_CERTS is set to: {node_extra_ca_certs}")
                 if os.path.exists(node_extra_ca_certs):
                     if self.certificate_exists_in_file(temp_warp_cert, node_extra_ca_certs):
-                        self.print_info("  ✓ NODE_EXTRA_CA_CERTS contains current WARP certificate")
+                        self.print_info("  ✓ NODE_EXTRA_CA_CERTS contains current certificate")
                         verify_result = self.verify_connection("node")
                         if verify_result == "WORKING":
-                            self.print_info("  ✓ Node.js can connect through WARP")
+                            self.print_info("  ✓ Node.js can connect through proxy")
                         else:
                             self.print_warn("  ✗ Node.js connection test failed")
                             has_issues = True
                     else:
-                        self.print_warn("  ✗ NODE_EXTRA_CA_CERTS file exists but doesn't contain current WARP certificate")
+                        self.print_warn("  ✗ NODE_EXTRA_CA_CERTS file exists but doesn't contain current certificate")
                         self.print_action("    Run with --fix to append the certificate to this file")
                         has_issues = True
                 else:
@@ -2872,14 +3126,14 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     if npm_cafile and npm_cafile not in ["null", "undefined"]:
                         if os.path.exists(npm_cafile):
                             if self.certificate_exists_in_file(temp_warp_cert, npm_cafile):
-                                self.print_info("  ✓ npm cafile contains current WARP certificate")
+                                self.print_info("  ✓ npm cafile contains current certificate")
                                 suspicious, reason = self.is_suspicious_full_bundle(npm_cafile, None)
                                 if suspicious:
                                     self.print_warn(f"  ⚠ npm cafile looks suspiciously small ({reason})")
                                     self.print_action("    Run with --fix to repoint npm to a full CA bundle")
                                     has_issues = True
                             else:
-                                self.print_warn("  ✗ npm cafile doesn't contain current WARP certificate")
+                                self.print_warn("  ✗ npm cafile doesn't contain current certificate")
                                 has_issues = True
                         else:
                             self.print_warn("  ✗ npm cafile points to non-existent file")
@@ -2903,14 +3157,14 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     yarn_cafile = result.stdout.strip()
 
                     if yarn_cafile and yarn_cafile not in ['undefined', '']:
-                        npm_bundle = os.path.expanduser("~/.cloudflare-warp/npm/ca-bundle.pem")
+                        npm_bundle = os.path.join(self.bundle_dir, "npm/ca-bundle.pem")
                         if yarn_cafile == npm_bundle:
                             self.print_info(f"  ✓ yarn {config_key} points to managed npm bundle")
                         elif os.path.exists(yarn_cafile):
                             if self.certificate_exists_in_file(temp_warp_cert, yarn_cafile):
-                                self.print_info(f"  ✓ yarn {config_key} contains current WARP certificate")
+                                self.print_info(f"  ✓ yarn {config_key} contains current certificate")
                             else:
-                                self.print_warn(f"  ⚠ yarn {config_key} doesn't contain WARP certificate: {yarn_cafile}")
+                                self.print_warn(f"  ⚠ yarn {config_key} doesn't contain proxy certificate: {yarn_cafile}")
                                 self.print_action("    Run with --fix to remove this stale configuration")
                                 has_issues = True
                         else:
@@ -2930,14 +3184,14 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     pnpm_cafile = result.stdout.strip()
 
                     if pnpm_cafile and pnpm_cafile not in ['undefined', '']:
-                        npm_bundle = os.path.expanduser("~/.cloudflare-warp/npm/ca-bundle.pem")
+                        npm_bundle = os.path.join(self.bundle_dir, "npm/ca-bundle.pem")
                         if pnpm_cafile == npm_bundle:
                             self.print_info("  ✓ pnpm cafile points to managed npm bundle")
                         elif os.path.exists(pnpm_cafile):
                             if self.certificate_exists_in_file(temp_warp_cert, pnpm_cafile):
-                                self.print_info("  ✓ pnpm cafile contains current WARP certificate")
+                                self.print_info("  ✓ pnpm cafile contains current certificate")
                             else:
-                                self.print_warn(f"  ⚠ pnpm cafile doesn't contain WARP certificate: {pnpm_cafile}")
+                                self.print_warn(f"  ⚠ pnpm cafile doesn't contain proxy certificate: {pnpm_cafile}")
                                 self.print_action("    Run with --fix to remove this stale configuration")
                                 has_issues = True
                         else:
@@ -2960,8 +3214,8 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             python_verify_result = self.verify_connection("python")
             
             if python_verify_result == "WORKING":
-                self.print_info("  ✓ Python trusts the system Cloudflare WARP certificate")
-                self.print_info("  ✓ Python can connect through WARP without additional configuration")
+                self.print_info("  ✓ Python trusts the system proxy certificate")
+                self.print_info("  ✓ Python can connect through proxy without additional configuration")
             else:
                 # Python doesn't trust system cert, check environment variables
                 python_configured = False
@@ -2971,7 +3225,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     self.print_info(f"  REQUESTS_CA_BUNDLE is set to: {requests_ca_bundle}")
                     if os.path.exists(requests_ca_bundle):
                         if self.certificate_exists_in_file(temp_warp_cert, requests_ca_bundle):
-                            self.print_info("  ✓ REQUESTS_CA_BUNDLE contains current WARP certificate")
+                            self.print_info("  ✓ REQUESTS_CA_BUNDLE contains current certificate")
                             suspicious, reason = self.is_suspicious_full_bundle(requests_ca_bundle, None)
                             if suspicious:
                                 self.print_warn(f"  ⚠ REQUESTS_CA_BUNDLE looks suspiciously small ({reason})")
@@ -2979,7 +3233,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                                 has_issues = True
                             python_configured = True
                         else:
-                            self.print_warn("  ✗ REQUESTS_CA_BUNDLE file exists but doesn't contain current WARP certificate")
+                            self.print_warn("  ✗ REQUESTS_CA_BUNDLE file exists but doesn't contain current certificate")
                             self.print_action("    Run with --fix to create a new bundle with both certificates")
                     else:
                         self.print_warn(f"  ✗ REQUESTS_CA_BUNDLE points to non-existent file: {requests_ca_bundle}")
@@ -2990,7 +3244,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     self.print_info(f"  SSL_CERT_FILE is set to: {ssl_cert_file}")
                     if os.path.exists(ssl_cert_file):
                         if self.certificate_exists_in_file(temp_warp_cert, ssl_cert_file):
-                            self.print_info("  ✓ SSL_CERT_FILE contains current WARP certificate")
+                            self.print_info("  ✓ SSL_CERT_FILE contains current certificate")
                             suspicious, reason = self.is_suspicious_full_bundle(ssl_cert_file, None)
                             if suspicious:
                                 self.print_warn(f"  ⚠ SSL_CERT_FILE looks suspiciously small ({reason})")
@@ -3017,7 +3271,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             verify_result = self.verify_connection("gcloud")
 
             if verify_result == "WORKING":
-                self.print_info("  ✓ gcloud can connect through WARP")
+                self.print_info("  ✓ gcloud can connect through proxy")
 
                 # Check if custom CA is configured (informational only)
                 try:
@@ -3030,7 +3284,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     if gcloud_ca and os.path.exists(gcloud_ca):
                         self.print_info(f"  - Custom CA configured at: {gcloud_ca}")
                         if self.certificate_exists_in_file(temp_warp_cert, gcloud_ca):
-                            self.print_info("  ✓ Custom CA contains current WARP certificate")
+                            self.print_info("  ✓ Custom CA contains current certificate")
                     else:
                         self.print_info("  - Using system certificate trust (no custom CA needed)")
                 except Exception:
@@ -3046,14 +3300,14 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
 
                     if gcloud_ca and os.path.exists(gcloud_ca):
                         if self.certificate_exists_in_file(temp_warp_cert, gcloud_ca):
-                            self.print_info("  ✓ gcloud configured with current WARP certificate")
+                            self.print_info("  ✓ gcloud configured with current certificate")
                             suspicious, reason = self.is_suspicious_full_bundle(gcloud_ca, None)
                             if suspicious:
                                 self.print_warn(f"  ⚠ gcloud custom CA file looks suspiciously small ({reason})")
                                 self.print_action("    Run with --fix to repoint to a full CA bundle")
                                 has_issues = True
                         else:
-                            self.print_warn("  ✗ gcloud CA file doesn't contain current WARP certificate")
+                            self.print_warn("  ✗ gcloud CA file doesn't contain current certificate")
                             has_issues = True
                     else:
                         self.print_info("  - gcloud custom CA not configured (verification skipped)")
@@ -3075,7 +3329,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                             self.print_warn("  - Custom CA is configured with WARP cert but connection still fails")
                             self.print_action("    Check gcloud and Python configuration")
                         else:
-                            self.print_warn("  ✗ gcloud CA file doesn't contain current WARP certificate")
+                            self.print_warn("  ✗ gcloud CA file doesn't contain current certificate")
                             self.print_action("    Run with --fix to update the CA configuration")
                     else:
                         self.print_warn("  ✗ gcloud not configured with custom CA")
@@ -3120,7 +3374,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             # Check if cert exists in keystore
             try:
                 result = subprocess.run(
-                    ['keytool', '-list', '-alias', 'cloudflare-zerotrust',
+                    ['keytool', '-list', '-alias', self.provider['keytool_alias'],
                      '-keystore', cacerts, '-storepass', 'changeit'],
                     capture_output=True
                 )
@@ -3164,11 +3418,11 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             # Check if certificate exists
             try:
                 result = subprocess.run(
-                    ['keytool', '-list', '-alias', 'cloudflare-zerotrust',
+                    ['keytool', '-list', '-alias', self.provider['keytool_alias'],
                      '-keystore', cacerts, '-storepass', 'changeit'],
                     capture_output=True
                 )
-                if result.returncode == 0 and 'cloudflare-zerotrust' in result.stdout.decode():
+                if result.returncode == 0 and self.provider['keytool_alias'] in result.stdout.decode():
                     self.print_info(f"    ✓ {version_name}: Certificate installed")
                 else:
                     self.print_warn(f"    ✗ {version_name}: Certificate missing")
@@ -3217,14 +3471,14 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             if os.path.exists(dbeaver_keytool) and os.path.exists(dbeaver_cacerts):
                 try:
                     result = subprocess.run(
-                        [dbeaver_keytool, '-list', '-alias', 'cloudflare-zerotrust',
+                        [dbeaver_keytool, '-list', '-alias', self.provider['keytool_alias'],
                          '-keystore', dbeaver_cacerts, '-storepass', 'changeit'],
                         capture_output=True
                     )
-                    if result.returncode == 0 and 'cloudflare-zerotrust' in result.stdout.decode():
-                        self.print_info("  ✓ DBeaver keystore contains Cloudflare certificate")
+                    if result.returncode == 0 and self.provider['keytool_alias'] in result.stdout.decode():
+                        self.print_info("  ✓ DBeaver keystore contains proxy certificate")
                     else:
-                        self.print_warn("  ✗ DBeaver keystore missing Cloudflare certificate")
+                        self.print_warn("  ✗ DBeaver keystore missing proxy certificate")
                         has_issues = True
                 except Exception:
                     self.print_warn("  ✗ Failed to check DBeaver keystore")
@@ -3243,15 +3497,15 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             verify_result = self.verify_connection("wget")
 
             if verify_result == "WORKING":
-                self.print_info("  ✓ wget can connect through WARP")
+                self.print_info("  ✓ wget can connect through proxy")
 
                 # Check config status (informational only)
                 wgetrc_path = os.path.expanduser("~/.wgetrc")
                 if os.path.exists(wgetrc_path):
                     with open(wgetrc_path, 'r') as f:
                         content = f.read()
-                    if "ca_certificate=" in content and CERT_PATH in content:
-                        self.print_info("  ✓ wget configured with Cloudflare certificate")
+                    if "ca_certificate=" in content and self.cert_path in content:
+                        self.print_info("  ✓ wget configured with proxy certificate")
                     else:
                         self.print_info("  - Using system certificate trust (no custom CA needed)")
                 else:
@@ -3262,11 +3516,11 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 if os.path.exists(wgetrc_path):
                     with open(wgetrc_path, 'r') as f:
                         content = f.read()
-                    if "ca_certificate=" in content and CERT_PATH in content:
+                    if "ca_certificate=" in content and self.cert_path in content:
                         self.print_warn("  ✗ wget configured but connection test failed")
                         has_issues = True
                     else:
-                        self.print_warn("  ✗ wget not configured with Cloudflare certificate")
+                        self.print_warn("  ✗ wget not configured with proxy certificate")
                         has_issues = True
                 else:
                     self.print_warn("  ✗ wget not configured")
@@ -3284,7 +3538,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         if self.command_exists('podman'):
             # Check persistent certificate location first (primary)
             docker_certs_dir = os.path.expanduser("~/.docker/certs.d")
-            cert_path = os.path.join(docker_certs_dir, "cloudflare-warp.crt")
+            cert_path = os.path.join(docker_certs_dir, f"{self.provider['container_cert_name']}.crt")
 
             if os.path.exists(cert_path):
                 if self.certificate_likely_exists_in_file(temp_warp_cert, cert_path):
@@ -3302,7 +3556,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 if 'Currently running' in result.stdout:
                     # VM is running - also check certificate in VM
                     result = subprocess.run(
-                        ['podman', 'machine', 'ssh', 'test -f /etc/pki/ca-trust/source/anchors/cloudflare-warp.pem'],
+                        ['podman', 'machine', 'ssh', f'test -f /etc/pki/ca-trust/source/anchors/{self.provider["container_cert_name"]}.pem'],
                         capture_output=True
                     )
                     if result.returncode == 0:
@@ -3326,7 +3580,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         if self.command_exists('rdctl'):
             # Check persistent certificate location first (primary)
             docker_certs_dir = os.path.expanduser("~/.docker/certs.d")
-            cert_path = os.path.join(docker_certs_dir, "cloudflare-warp.crt")
+            cert_path = os.path.join(docker_certs_dir, f"{self.provider['container_cert_name']}.crt")
 
             if os.path.exists(cert_path):
                 if self.certificate_likely_exists_in_file(temp_warp_cert, cert_path):
@@ -3344,7 +3598,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 if result.returncode == 0:
                     # VM is running - also check certificate in VM
                     result = subprocess.run(
-                        ['rdctl', 'shell', 'test', '-f', '/usr/local/share/ca-certificates/cloudflare-warp.pem'],
+                        ['rdctl', 'shell', 'test', '-f', f'/usr/local/share/ca-certificates/{self.provider["container_cert_name"]}.pem'],
                         capture_output=True
                     )
                     if result.returncode == 0:
@@ -3386,7 +3640,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         if self.command_exists('colima'):
             # Check persistent certificate location first (primary)
             docker_certs_dir = os.path.expanduser("~/.docker/certs.d")
-            cert_path = os.path.join(docker_certs_dir, "cloudflare-warp.crt")
+            cert_path = os.path.join(docker_certs_dir, f"{self.provider['container_cert_name']}.crt")
 
             if os.path.exists(cert_path):
                 if self.certificate_likely_exists_in_file(temp_warp_cert, cert_path):
@@ -3404,7 +3658,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 if result.returncode == 0:
                     # VM is running - also check certificate in VM
                     result = subprocess.run(
-                        ['colima', 'ssh', '--', 'test', '-f', '/usr/local/share/ca-certificates/cloudflare-warp.crt'],
+                        ['colima', 'ssh', '--', 'test', '-f', f'/usr/local/share/ca-certificates/{self.provider["container_cert_name"]}.crt'],
                         capture_output=True
                     )
                     if result.returncode == 0:
@@ -3419,17 +3673,18 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             self.print_info("  - Colima not installed")
         return has_issues
 
-    def check_all_status(self):
-        """Check status of all configurations."""
-        has_issues = False
-        temp_warp_cert = None
-        
-        self.print_info("Checking Cloudflare WARP Certificate Status")
-        self.print_info("===========================================")
-        print()
-        
-        # First, get the current WARP certificate to use for all comparisons
-        if self.command_exists('warp-cli'):
+    def _get_status_cert(self):
+        """Retrieve the current provider certificate for status comparisons.
+
+        Returns:
+            str or None: Path to a temp file containing the cert, or None on failure.
+        """
+        provider_name = self.provider['name']
+
+        if self.provider is PROVIDERS['warp']:
+            if not self.command_exists('warp-cli'):
+                self.print_error(f"warp-cli command not found. Please ensure {provider_name} is installed.")
+                return None
             try:
                 result = subprocess.run(
                     ['warp-cli', 'certs', '--no-paginate'],
@@ -3438,67 +3693,138 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 if result.returncode == 0 and result.stdout.strip():
                     with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as tf:
                         tf.write(result.stdout.strip())
-                        temp_warp_cert = tf.name
-                    
-                    self.print_debug("Retrieved WARP certificate for comparison")
-                    # Pre-cache fingerprint for the WARP cert
-                    self.cert_fingerprint = self.get_cert_fingerprint(temp_warp_cert)
-                    self.print_debug(f"WARP certificate fingerprint: {self.cert_fingerprint}")
-                else:
-                    self.print_error("Failed to retrieve WARP certificate")
-                    return
+                        return tf.name
+                self.print_error(f"Failed to retrieve {provider_name} certificate")
+                return None
             except Exception as e:
-                self.print_error(f"Error retrieving WARP certificate: {e}")
-                return
-        else:
-            self.print_error("warp-cli command not found. Please ensure Cloudflare WARP is installed.")
-            return
-        
-        # Check if WARP is connected
-        self.print_status("Cloudflare WARP Connection:")
-        if self.command_exists('warp-cli'):
+                self.print_error(f"Error retrieving {provider_name} certificate: {e}")
+                return None
+
+        elif self.provider is PROVIDERS['netskope']:
+            # For Netskope, read the cert from the stored cert_path or known source
+            cert_content = None
+            if os.path.exists(self.cert_path):
+                with open(self.cert_path, 'r') as f:
+                    cert_content = f.read().strip()
+            else:
+                cert_content = self._get_netskope_cert()
+
+            if cert_content:
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as tf:
+                    tf.write(cert_content)
+                    return tf.name
+            self.print_error(f"Could not find {provider_name} certificate for status check")
+            return None
+
+        self.print_error(f"No status cert retrieval for provider {provider_name}")
+        return None
+
+    def _check_provider_connection(self):
+        """Check whether the MITM proxy is connected/running.
+
+        Returns:
+            bool: True if issues were detected.
+        """
+        provider_name = self.provider['name']
+        short = self.provider['short_name']
+
+        if self.provider is PROVIDERS['warp']:
+            self.print_status(f"{provider_name} Connection:")
+            if self.command_exists('warp-cli'):
+                try:
+                    result = subprocess.run(['warp-cli', 'status'], capture_output=True, text=True)
+                    warp_status = result.stdout if result.returncode == 0 else "unknown"
+                    if "Connected" in warp_status:
+                        self.print_info(f"  ✓ {short} is connected")
+                        return False
+                    else:
+                        self.print_warn(f"  ✗ {short} is not connected")
+                        self.print_action("  Run: warp-cli connect")
+                        return True
+                except Exception:
+                    self.print_error(f"  ✗ Failed to check {short} status")
+                    return True
+            else:
+                self.print_error("  ✗ warp-cli not found")
+                self.print_action(f"  Install {provider_name} client")
+                return True
+
+        elif self.provider is PROVIDERS['netskope']:
+            self.print_status(f"{provider_name} Connection:")
+            plat = platform.system()
+            proc_pattern = 'Netskope Client' if plat == 'Darwin' else 'STAgent'
+            proc_label = 'Netskope Client' if plat == 'Darwin' else 'STAgent'
             try:
-                result = subprocess.run(['warp-cli', 'status'], capture_output=True, text=True)
-                warp_status = result.stdout if result.returncode == 0 else "unknown"
-                if "Connected" in warp_status:
-                    self.print_info("  ✓ WARP is connected")
+                result = subprocess.run(
+                    ['pgrep', '-f', proc_pattern],
+                    capture_output=True, text=True
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    self.print_info(f"  ✓ {proc_label} is running")
+                    return False
                 else:
-                    self.print_warn("  ✗ WARP is not connected")
-                    self.print_action("  Run: warp-cli connect")
-                    has_issues = True
+                    self.print_warn(f"  ✗ {proc_label} is not running")
+                    return True
             except Exception:
-                self.print_error("  ✗ Failed to check WARP status")
-                has_issues = True
-        else:
-            self.print_error("  ✗ warp-cli not found")
-            self.print_action("  Install Cloudflare WARP client")
+                # Fallback: check if cert source file exists
+                cert_sources = self.provider.get('cert_sources', {}).get(plat, [])
+                if any(os.path.exists(p) for p in cert_sources):
+                    self.print_info(f"  ✓ {short} certificate file found")
+                    return False
+                self.print_warn(f"  ✗ Could not verify {short} status")
+                return True
+
+        return False
+
+    def check_all_status(self):
+        """Check status of all configurations."""
+        has_issues = False
+        temp_warp_cert = None
+        provider_name = self.provider['name']
+        short = self.provider['short_name']
+
+        self.print_info(f"Checking {provider_name} Certificate Status")
+        self.print_info("=" * (len(f"Checking {provider_name} Certificate Status")))
+        print()
+
+        # Retrieve the current certificate for comparison
+        temp_warp_cert = self._get_status_cert()
+        if not temp_warp_cert:
+            return False
+
+        self.print_debug(f"Retrieved {short} certificate for comparison")
+        self.cert_fingerprint = self.get_cert_fingerprint(temp_warp_cert)
+        self.print_debug(f"{short} certificate fingerprint: {self.cert_fingerprint}")
+
+        # Check provider connection
+        if self._check_provider_connection():
             has_issues = True
         print()
         
         # Check certificate status
         self.print_status("Certificate Status:")
         
-        # Check if WARP certificate is valid
+        # Check if proxy certificate is valid
         try:
             result = subprocess.run(
                 ['openssl', 'x509', '-noout', '-checkend', '86400', '-in', temp_warp_cert],
                 capture_output=True
             )
             if result.returncode == 0:
-                self.print_info("  ✓ WARP certificate is valid")
+                self.print_info(f"  ✓ {short} certificate is valid")
                 
                 # Check where the certificate is currently stored
                 cert_locations = []
                 cert_found = False
                 
                 # Check common locations
-                if os.path.exists(CERT_PATH):
-                    with open(CERT_PATH, 'r') as f:
+                if os.path.exists(self.cert_path):
+                    with open(self.cert_path, 'r') as f:
                         existing_cert = f.read()
                     with open(temp_warp_cert, 'r') as f:
                         warp_cert_content = f.read()
                     if existing_cert == warp_cert_content:
-                        cert_locations.append(f"    - {CERT_PATH}")
+                        cert_locations.append(f"    - {self.cert_path}")
                         cert_found = True
                 
                 # Check NODE_EXTRA_CA_CERTS
@@ -3523,15 +3849,15 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                         cert_found = True
                 
                 if cert_found:
-                    self.print_info("  ✓ WARP certificate found in:")
+                    self.print_info(f"  ✓ {short} certificate found in:")
                     for loc in cert_locations:
                         print(loc)
                 else:
-                    self.print_warn("  ✗ WARP certificate not found in any configured location")
+                    self.print_warn(f"  ✗ {short} certificate not found in any configured location")
                     self.print_action("    Run with --fix to install the certificate")
                     has_issues = True
             else:
-                self.print_warn("  ✗ WARP certificate is expired or expiring soon")
+                self.print_warn(f"  ✗ {short} certificate is expired or expiring soon")
                 has_issues = True
         except Exception:
             self.print_error("  ✗ Failed to check certificate validity")
@@ -3559,7 +3885,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         if not self.selected_tools:
             self.print_status("Docker/Container Configuration:")
             docker_certs_dir = os.path.expanduser("~/.docker/certs.d")
-            cert_path = os.path.join(docker_certs_dir, "cloudflare-warp.crt")
+            cert_path = os.path.join(docker_certs_dir, f"{self.provider['container_cert_name']}.crt")
             if os.path.exists(cert_path):
                 if self.certificate_likely_exists_in_file(temp_warp_cert, cert_path):
                     self.print_info(f"  ✓ Certificate installed in {docker_certs_dir}")
@@ -3594,7 +3920,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             self.print_warn("Some configurations need attention.")
             self.print_action("Run './fumitm.py --fix' to fix the issues")
         else:
-            self.print_info("✓ All configured tools are properly set up for Cloudflare WARP")
+            self.print_info(f"✓ All configured tools are properly set up for {provider_name}")
         print()
         
         # Cleanup
@@ -3604,8 +3930,9 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
     def main(self):
         """Main function."""
         try:
-            self.print_info("Cloudflare Certificate Installation Script (Python)")
-            self.print_info("=================================================")
+            header = f"{self.provider['name']} Certificate Installation Script (Python)"
+            self.print_info(header)
+            self.print_info("=" * len(header))
             
             if self.is_debug_mode():
                 self.print_debug(f"Fumitm version: {VERSION_INFO['version']} (commit: {VERSION_INFO['commit']})")
@@ -3618,7 +3945,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 self.print_debug(f"Shell: {os.environ.get('SHELL', 'unknown')}")
                 self.print_debug(f"PATH: {os.environ.get('PATH', '')}")
                 self.print_debug(f"Home directory: {os.path.expanduser('~')}")
-                self.print_debug(f"Certificate path: {CERT_PATH}")
+                self.print_debug(f"Certificate path: {self.cert_path}")
                 if not self.is_install_mode():
                     self.print_debug("Status mode: Using fast certificate checks")
                 else:
@@ -3659,7 +3986,9 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             
             if not self.is_install_mode():
                 # In status mode, just check current status
-                self.check_all_status()
+                status_ok = self.check_all_status()
+                if status_ok is False:
+                    return 1
             else:
                 self.print_info("Running in FIX mode - changes will be made to your system")
                 print()
@@ -3698,7 +4027,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                         self.print_info("  Please restart your shell")
             
             print()
-            self.print_info(f"Certificate location: {CERT_PATH}")
+            self.print_info(f"Certificate location: {self.cert_path}")
             self.print_info("For additional applications, please refer to the documentation.")
             
             return 0  # Success
@@ -3734,6 +4063,8 @@ def main():
                         help='Force manual certificate input mode (for devcontainers)')
     parser.add_argument('--skip-verify', action='store_true',
                         help='Skip network verification tests (useful in devcontainers)')
+    parser.add_argument('--provider', choices=list(PROVIDERS.keys()),
+                        help='MITM proxy provider (default: auto-detect)')
     parser.add_argument('--debug', '--verbose', action='store_true',
                         help='Show detailed debug information')
     parser.add_argument('--version', '-V', action='store_true',
@@ -3775,12 +4106,13 @@ def main():
     
     # Create and run fumitm instance
     fumitm = FumitmPython(
-        mode=mode, 
-        debug=args.debug, 
+        mode=mode,
+        debug=args.debug,
         selected_tools=selected_tools,
         cert_file=args.cert_file,
         manual_cert=args.manual_cert,
-        skip_verify=args.skip_verify
+        skip_verify=args.skip_verify,
+        provider=args.provider
     )
     exit_code = fumitm.main()
     sys.exit(exit_code)

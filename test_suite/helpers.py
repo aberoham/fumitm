@@ -47,6 +47,20 @@ class MockBuilder:
         """Configure system without WARP installed."""
         self.which_mapping['warp-cli'] = None
         return self
+
+    def with_netskope_installed(self, cert_path=None):
+        """Configure Netskope as installed with cert at a known path."""
+        path = cert_path or mock_data.NETSKOPE_CERT_PATHS_MACOS[0]
+        self.exists_mapping[path] = True
+        self.file_contents[path] = mock_data.MOCK_NETSKOPE_CERTIFICATE
+        return self
+
+    def with_netskope_not_installed(self):
+        """Configure system without Netskope installed."""
+        for path in mock_data.NETSKOPE_CERT_PATHS_MACOS + mock_data.NETSKOPE_CERT_PATHS_LINUX:
+            self.exists_mapping[path] = False
+            self.exists_mapping[path + '.enc'] = False
+        return self
     
     def with_certificate(self, path=None):
         """Configure certificate file to exist."""
@@ -179,14 +193,19 @@ class FumitmTestCase:
     """Base class providing common test functionality."""
 
     @staticmethod
-    def create_fumitm_instance(mode='status', debug=False, selected_tools=None):
-        """Create a FumitmPython instance with proper mocking."""
+    def create_fumitm_instance(mode='status', debug=False, selected_tools=None, provider='warp'):
+        """Create a FumitmPython instance with proper mocking.
+
+        Defaults to provider='warp' to skip auto-detection, which would
+        otherwise trigger subprocess calls (pgrep) that consume mock responses.
+        """
         import fumitm
         with patch('platform.system', return_value='Darwin'):
             return fumitm.FumitmPython(
                 mode=mode,
                 debug=debug,
-                selected_tools=selected_tools or []
+                selected_tools=selected_tools or [],
+                provider=provider
             )
 
 
