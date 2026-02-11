@@ -84,6 +84,10 @@ class TestSuspiciousBundles(FumitmTestCase):
             .with_tools('gcloud')
             .with_file(gcloud_current, mock_data.MOCK_CERTIFICATE)
             .with_file('/etc/ssl/cert.pem', mock_data.SAMPLE_CA_BUNDLE)
+            # verify_connection("gcloud") → gcloud projects list --limit=1
+            # Return an SSL error so verify_connection returns "FAILED" and
+            # setup_gcloud_cert continues to the suspicious-bundle check.
+            .with_subprocess_response(returncode=1, stderr='ssl certificate problem')
             # gcloud config get
             .with_subprocess_response(stdout=gcloud_current)
             # gcloud config set

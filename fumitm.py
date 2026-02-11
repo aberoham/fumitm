@@ -193,6 +193,18 @@ class FumitmPython:
         self.manual_cert = manual_cert
         self.skip_verify = skip_verify
 
+        # When running under sudo on Linux, $HOME may resolve to /root instead
+        # of the real user's home directory. Correct it before any expanduser calls
+        # so that certificate and bundle paths land in the right place.
+        sudo_user = os.environ.get('SUDO_USER')
+        if os.getuid() == 0 and sudo_user:
+            try:
+                real_home = pwd.getpwnam(sudo_user).pw_dir
+                if os.path.expanduser('~') != real_home:
+                    os.environ['HOME'] = real_home
+            except KeyError:
+                pass
+
         # Resolve which MITM proxy provider to use. When provider is None,
         # auto-detection checks WARP first, then Netskope.
         self.provider = self._resolve_provider(provider)
@@ -558,7 +570,50 @@ class FumitmPython:
         """Suggest alternative path."""
         filename = os.path.basename(original_path)
         return os.path.join(self.bundle_dir, purpose, filename)
-    
+
+    def _is_running_as_sudo(self):
+        """True when the process is root via sudo, not actual root login."""
+        return os.getuid() == 0 and 'SUDO_UID' in os.environ
+
+    def _get_real_user_ids(self):
+        """Return (uid, gid) of the real user, even when running under sudo."""
+        if self._is_running_as_sudo():
+            return (int(os.environ['SUDO_UID']), int(os.environ['SUDO_GID']))
+        return (os.getuid(), os.getgid())
+
+    def _fix_ownership(self, path):
+        """Chown a home-directory path back to the real user when running under sudo.
+
+        System paths outside $HOME (e.g. /etc/ssl) are left untouched so that
+        files which legitimately belong to root stay root-owned.
+        """
+        if not self._is_running_as_sudo():
+            return
+        if not os.path.exists(path):
+            return
+        home = os.path.expanduser('~')
+        if not os.path.abspath(path).startswith(home):
+            return
+        uid, gid = self._get_real_user_ids()
+        try:
+            os.chown(path, uid, gid)
+        except OSError as e:
+            self.print_debug(f"Could not chown {path}: {e}")
+
+    def _safe_makedirs(self, path, exist_ok=True):
+        """Create directories and fix ownership of each newly created component."""
+        if os.path.isdir(path):
+            return
+        # Walk up to find the first existing ancestor so we can chown only new dirs.
+        to_create = []
+        current = os.path.abspath(path)
+        while not os.path.isdir(current):
+            to_create.append(current)
+            current = os.path.dirname(current)
+        os.makedirs(path, exist_ok=exist_ok)
+        for d in to_create:
+            self._fix_ownership(d)
+
     def detect_shell(self):
         """Detect the user's default shell with multiple fallbacks."""
         # Try environment variable first (current session)
@@ -686,6 +741,100 @@ class FumitmPython:
         self.print_warn("=" * 60)
         print()
 
+        return True
+
+    def check_ownership_sanity(self):
+        """Detect and warn about root-owned files in the user's home directory.
+
+        When users accidentally run ``sudo ./fumitm.py --fix``, the script creates
+        files owned by root inside ``$HOME``. Subsequent non-root runs then fail
+        with PermissionError. This method detects that situation and either warns
+        (when not root) or proactively corrects ownership (when running as sudo).
+
+        Returns:
+            bool: True if problems were found (or corrected), False if clean.
+        """
+        managed_paths = [self.cert_path, self.bundle_dir]
+        home = os.path.expanduser('~')
+
+        if self._is_running_as_sudo():
+            # Running as sudo — fix any pre-existing root-owned managed files
+            uid, gid = self._get_real_user_ids()
+            fixed = []
+            for path in managed_paths:
+                if not os.path.exists(path):
+                    continue
+                if os.path.isdir(path):
+                    for dirpath, dirnames, filenames in os.walk(path):
+                        for name in [dirpath] + [os.path.join(dirpath, f) for f in filenames]:
+                            try:
+                                st = os.stat(name)
+                                if st.st_uid != uid:
+                                    os.chown(name, uid, gid)
+                                    fixed.append(name)
+                            except OSError:
+                                pass
+                        for d in dirnames:
+                            full = os.path.join(dirpath, d)
+                            try:
+                                st = os.stat(full)
+                                if st.st_uid != uid:
+                                    os.chown(full, uid, gid)
+                                    fixed.append(full)
+                            except OSError:
+                                pass
+                else:
+                    try:
+                        st = os.stat(path)
+                        if st.st_uid != uid:
+                            os.chown(path, uid, gid)
+                            fixed.append(path)
+                    except OSError:
+                        pass
+            if fixed:
+                self.print_warn(f"Running as sudo — corrected ownership on {len(fixed)} file(s) in {home}")
+                self.print_info("New files created during this run will also be owned by the real user")
+            else:
+                self.print_info("Running as sudo — ownership correction will be applied to new files")
+            return bool(fixed)
+
+        # Not root — check for root-owned files and warn
+        root_owned = []
+        for path in managed_paths:
+            if not os.path.exists(path):
+                continue
+            if os.path.isdir(path):
+                for dirpath, _dirnames, filenames in os.walk(path):
+                    for name in [dirpath] + [os.path.join(dirpath, f) for f in filenames]:
+                        try:
+                            if os.stat(name).st_uid == 0:
+                                root_owned.append(name)
+                        except OSError:
+                            pass
+            else:
+                try:
+                    if os.stat(path).st_uid == 0:
+                        root_owned.append(path)
+                except OSError:
+                    pass
+
+        if not root_owned:
+            return False
+
+        print()
+        self.print_warn("Root-owned files detected in your home directory.")
+        self.print_warn("This usually happens after running with sudo.")
+        self.print_info("Affected paths:")
+        for p in root_owned[:10]:
+            self.print_error(f"  {p}")
+        if len(root_owned) > 10:
+            self.print_error(f"  ... and {len(root_owned) - 10} more")
+        print()
+        # Build a single chown command covering all managed paths
+        dirs_to_fix = ' '.join(p for p in managed_paths if os.path.exists(p))
+        self.print_info("To fix, run:")
+        self.print_info(f"  sudo chown -R $(whoami) {dirs_to_fix}")
+        print()
         return True
 
     def get_cert_fingerprint(self, cert_path=None):
@@ -891,9 +1040,10 @@ class FumitmPython:
         if not self.is_install_mode():
             self.print_action(f"Would update {desc} at {path}")
         else:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
+            self._safe_makedirs(os.path.dirname(path))
             with open(path, 'w') as f:
                 f.writelines(updated_lines)
+            self._fix_ownership(path)
             self.print_info(f"Updated {desc} at {path}")
         return True
     
@@ -1059,12 +1209,15 @@ class FumitmPython:
         """
         if os.path.exists("/etc/ssl/cert.pem"):
             shutil.copy("/etc/ssl/cert.pem", bundle_path)
+            self._fix_ownership(bundle_path)
             return True
         elif os.path.exists("/etc/ssl/certs/ca-certificates.crt"):
             shutil.copy("/etc/ssl/certs/ca-certificates.crt", bundle_path)
+            self._fix_ownership(bundle_path)
             return True
         else:
             Path(bundle_path).touch()
+            self._fix_ownership(bundle_path)
             return False
 
     def safe_append_certificate(self, cert_file, target_file):
@@ -1118,6 +1271,7 @@ class FumitmPython:
                     f.write('\n')
                 f.write(cert_content)
 
+            self._fix_ownership(target_file)
             self.print_info(f"Appended certificate to {target_file}")
             return True
 
@@ -1161,13 +1315,15 @@ class FumitmPython:
                         # Write back
                         with open(shell_config + '.bak', 'w') as f:
                             f.write(content)
+                        self._fix_ownership(shell_config + '.bak')
                         with open(shell_config, 'w') as f:
                             f.write('\n'.join(new_lines) + '\n')
-                        
+                        self._fix_ownership(shell_config)
+
                         self.shell_modified = True
                         self.print_info(f"Updated {var_name} in {shell_config}")
                 return
-        
+
         # Variable doesn't exist, add it
         if not self.is_install_mode():
             self.print_action(f"Would add to {shell_config}:")
@@ -1175,6 +1331,7 @@ class FumitmPython:
         else:
             with open(shell_config, 'a') as f:
                 f.write(f'\nexport {var_name}="{var_value}"\n')
+            self._fix_ownership(shell_config)
             self.shell_modified = True
             self.print_info(f"Added {var_name} to {shell_config}")
     
@@ -1533,8 +1690,9 @@ class FumitmPython:
             else:
                 # Save certificate
                 shutil.copy(temp_cert_path, self.cert_path)
+                self._fix_ownership(self.cert_path)
                 self.print_info(f"Certificate saved to {self.cert_path}")
-        
+
         # Clean up
         os.unlink(temp_cert_path)
         
@@ -1579,12 +1737,14 @@ class FumitmPython:
                         else:
                             response = input("Do you want to use this alternative path? (Y/n) ")
                             if response.lower() != 'n':
-                                os.makedirs(os.path.dirname(new_path), exist_ok=True)
+                                self._safe_makedirs(os.path.dirname(new_path))
                                 if os.path.exists(node_extra_ca_certs):
                                     try:
                                         shutil.copy(node_extra_ca_certs, new_path)
+                                        self._fix_ownership(new_path)
                                     except Exception:
                                         Path(new_path).touch()
+                                        self._fix_ownership(new_path)
                                 
                                 self.safe_append_certificate(self.cert_path, new_path)
 
@@ -1613,12 +1773,13 @@ class FumitmPython:
                 self.print_action(f"Would set NODE_EXTRA_CA_CERTS={node_bundle}")
             else:
                 self.print_info(f"Creating Node.js CA bundle at {node_bundle}")
-                os.makedirs(os.path.dirname(node_bundle), exist_ok=True)
+                self._safe_makedirs(os.path.dirname(node_bundle))
                 
                 # Start with just the proxy certificate
                 # (NODE_EXTRA_CA_CERTS supplements system certs, doesn't replace them)
                 shutil.copy(self.cert_path, node_bundle)
-                
+                self._fix_ownership(node_bundle)
+
                 self.add_to_shell_config("NODE_EXTRA_CA_CERTS", node_bundle, shell_config)
                 self.print_info("Created Node.js CA bundle with proxy certificate")
         
@@ -1657,7 +1818,7 @@ class FumitmPython:
                         self.print_action(f"Would create full CA bundle at {npm_bundle}")
                         self.print_action(f"Would run: npm config set cafile {npm_bundle}")
                     else:
-                        os.makedirs(os.path.dirname(npm_bundle), exist_ok=True)
+                        self._safe_makedirs(os.path.dirname(npm_bundle))
                         self.create_bundle_with_system_certs(npm_bundle)
                         self.safe_append_certificate(self.cert_path, npm_bundle)
                         subprocess.run(['npm', 'config', 'set', 'cafile', npm_bundle])
@@ -1680,12 +1841,13 @@ class FumitmPython:
                             self.print_action(f"Would create full CA bundle at {npm_bundle} with system certificates and proxy certificate")
                             self.print_action(f"Would run: npm config set cafile {npm_bundle}")
                         else:
-                            os.makedirs(os.path.dirname(npm_bundle), exist_ok=True)
+                            self._safe_makedirs(os.path.dirname(npm_bundle))
                             # Create a full bundle with system certs
                             if not self.create_bundle_with_system_certs(npm_bundle):
                                 # Copy existing bundle if available
                                 if os.path.exists(current_cafile):
                                     shutil.copy(current_cafile, npm_bundle)
+                                    self._fix_ownership(npm_bundle)
 
                             # Append certificate to bundle
                             self.safe_append_certificate(self.cert_path, npm_bundle)
@@ -1711,7 +1873,7 @@ class FumitmPython:
                 else:
                     response = input("Do you want to create a new CA bundle for npm? (Y/n) ")
                     if response.lower() != 'n':
-                        os.makedirs(os.path.dirname(npm_bundle), exist_ok=True)
+                        self._safe_makedirs(os.path.dirname(npm_bundle))
                         self.create_bundle_with_system_certs(npm_bundle)
                         self.safe_append_certificate(self.cert_path, npm_bundle)
                         subprocess.run(['npm', 'config', 'set', 'cafile', npm_bundle])
@@ -1727,7 +1889,7 @@ class FumitmPython:
             else:
                 response = input("Do you want to configure npm with a CA bundle including proxy certificate? (Y/n) ")
                 if response.lower() != 'n':
-                    os.makedirs(os.path.dirname(npm_bundle), exist_ok=True)
+                    self._safe_makedirs(os.path.dirname(npm_bundle))
                     if not self.create_bundle_with_system_certs(npm_bundle):
                         self.print_warn("Could not find system CA bundle, creating new bundle with only proxy certificate")
                     self.safe_append_certificate(self.cert_path, npm_bundle)
@@ -1888,13 +2050,15 @@ class FumitmPython:
                     else:
                         response = input("Do you want to use this alternative path? (Y/n) ")
                         if response.lower() != 'n':
-                            os.makedirs(os.path.dirname(new_path), exist_ok=True)
+                            self._safe_makedirs(os.path.dirname(new_path))
                             if os.path.exists(requests_ca_bundle):
                                 try:
                                     shutil.copy(requests_ca_bundle, new_path)
+                                    self._fix_ownership(new_path)
                                 except Exception:
                                     Path(new_path).touch()
-                            
+                                    self._fix_ownership(new_path)
+
                             # Append certificate to the new path
                             self.safe_append_certificate(self.cert_path, new_path)
 
@@ -2038,7 +2202,7 @@ class FumitmPython:
                     self.print_action(f"Would create gcloud CA bundle at {gcloud_bundle}")
                     self.print_action(f"Would run: gcloud config set core/custom_ca_certs_file {gcloud_bundle}")
                 else:
-                    os.makedirs(gcloud_cert_dir, exist_ok=True)
+                    self._safe_makedirs(gcloud_cert_dir)
                     self.create_bundle_with_system_certs(gcloud_bundle)
                     self.safe_append_certificate(self.cert_path, gcloud_bundle)
                     subprocess.run(['gcloud', 'config', 'set', 'core/custom_ca_certs_file', gcloud_bundle], capture_output=True, timeout=30)
@@ -2058,7 +2222,7 @@ class FumitmPython:
         
         # Create directory if it doesn't exist
         if self.is_install_mode():
-            os.makedirs(gcloud_cert_dir, exist_ok=True)
+            self._safe_makedirs(gcloud_cert_dir)
         
         if current_ca_file and current_ca_file != gcloud_bundle:
             self.print_warn(f"gcloud is already configured with custom CA: {current_ca_file}")
@@ -2138,7 +2302,7 @@ class FumitmPython:
             self.print_action(f"Would run: git config --global http.sslCAInfo {git_bundle}")
             return
         # Build full bundle and configure
-        os.makedirs(os.path.dirname(git_bundle), exist_ok=True)
+        self._safe_makedirs(os.path.dirname(git_bundle))
         self.create_bundle_with_system_certs(git_bundle)
         self.safe_append_certificate(self.cert_path, git_bundle)
         subprocess.run(['git', 'config', '--global', 'http.sslCAInfo', git_bundle], capture_output=True, text=True)
@@ -2199,7 +2363,7 @@ class FumitmPython:
                 return
 
         # Create the bundle and configure
-        os.makedirs(os.path.dirname(curl_bundle), exist_ok=True)
+        self._safe_makedirs(os.path.dirname(curl_bundle))
         self.create_bundle_with_system_certs(curl_bundle)
         self.safe_append_certificate(self.cert_path, curl_bundle)
         shell_type = self.detect_shell()
@@ -2626,8 +2790,9 @@ class FumitmPython:
                 self.print_action("Would also install certificate into running Podman VM for immediate effect")
         else:
             # Create directory and copy certificate (persistent location)
-            os.makedirs(docker_certs_dir, exist_ok=True)
+            self._safe_makedirs(docker_certs_dir)
             shutil.copy(self.cert_path, cert_dest)
+            self._fix_ownership(cert_dest)
             self.print_info(f"Certificate installed to {cert_dest}")
 
             # If VM is running, also install for immediate effect
@@ -2694,8 +2859,9 @@ class FumitmPython:
                 self.print_action("Would also install certificate into running Rancher Desktop VM for immediate effect")
         else:
             # Create directory and copy certificate (persistent location)
-            os.makedirs(docker_certs_dir, exist_ok=True)
+            self._safe_makedirs(docker_certs_dir)
             shutil.copy(self.cert_path, cert_dest)
+            self._fix_ownership(cert_dest)
             self.print_info(f"Certificate installed to {cert_dest}")
 
             # If VM is running, also install for immediate effect
@@ -2831,8 +2997,9 @@ class FumitmPython:
                 self.print_action("Would also install certificate into running VM for immediate effect")
         else:
             # Create directory and copy certificate (persistent location)
-            os.makedirs(docker_certs_dir, exist_ok=True)
+            self._safe_makedirs(docker_certs_dir)
             shutil.copy(self.cert_path, cert_dest)
+            self._fix_ownership(cert_dest)
             self.print_info(f"Certificate installed to {cert_dest}")
             self.print_info("This certificate will be automatically loaded on Colima start")
 
@@ -3946,6 +4113,9 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 self.print_debug(f"PATH: {os.environ.get('PATH', '')}")
                 self.print_debug(f"Home directory: {os.path.expanduser('~')}")
                 self.print_debug(f"Certificate path: {self.cert_path}")
+                if self._is_running_as_sudo():
+                    uid, gid = self._get_real_user_ids()
+                    self.print_debug(f"Running as sudo (real user UID={uid}, GID={gid})")
                 if not self.is_install_mode():
                     self.print_debug("Status mode: Using fast certificate checks")
                 else:
@@ -3969,6 +4139,9 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             # Check for broken CA environment variables early
             # This catches common issues before they cause confusing errors
             self.check_environment_sanity()
+
+            # Check for root-owned files that would cause PermissionError
+            self.check_ownership_sanity()
 
             # Validate selected tools
             if self.selected_tools:

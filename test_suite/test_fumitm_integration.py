@@ -1186,6 +1186,173 @@ class TestCodeQuality:
             "See issue #35 for details on why this is required."
         )
 
+    def test_no_raw_makedirs_in_setup_functions(self):
+        """Ensure setup functions use _safe_makedirs() instead of raw os.makedirs().
+
+        Running ``os.makedirs()`` under sudo creates root-owned directories in
+        the user's home directory. All setup functions must use the ownership-
+        correcting ``_safe_makedirs()`` wrapper instead. The only permitted raw
+        call is inside ``_safe_makedirs`` itself.
+        """
+        import os
+        import re
+
+        test_dir = os.path.dirname(os.path.abspath(__file__))
+        fumitm_path = os.path.join(os.path.dirname(test_dir), "fumitm.py")
+
+        with open(fumitm_path, 'r') as f:
+            lines = f.readlines()
+
+        in_safe_makedirs = False
+        violations = []
+
+        for i, line in enumerate(lines, 1):
+            stripped = line.strip()
+
+            # Track when we're inside _safe_makedirs
+            if 'def _safe_makedirs' in line:
+                in_safe_makedirs = True
+            elif in_safe_makedirs and re.match(r'^\s{4}def ', line):
+                in_safe_makedirs = False
+
+            if in_safe_makedirs:
+                continue
+
+            if 'os.makedirs(' in stripped:
+                violations.append(f"Line {i}: {stripped}")
+
+        assert not violations, (
+            f"Found raw os.makedirs() calls outside _safe_makedirs in fumitm.py:\n"
+            + "\n".join(violations) + "\n\n"
+            "Use self._safe_makedirs(path) instead to ensure correct ownership under sudo."
+        )
+
+
+class TestOwnershipProtection(FumitmTestCase):
+    """Tests for sudo detection and file ownership correction."""
+
+    def test_is_running_as_sudo_true(self):
+        """Detect when the process is root via sudo."""
+        instance = self.create_fumitm_instance()
+        with patch('os.getuid', return_value=0), \
+             patch.dict(os.environ, {'SUDO_UID': '1000', 'SUDO_GID': '1000'}):
+            assert instance._is_running_as_sudo() is True
+
+    def test_is_running_as_sudo_false_normal_user(self):
+        """Normal user (non-root) should not be detected as sudo."""
+        instance = self.create_fumitm_instance()
+        with patch('os.getuid', return_value=1000):
+            assert instance._is_running_as_sudo() is False
+
+    def test_is_running_as_sudo_false_actual_root(self):
+        """Actual root login (no SUDO_UID) should not be detected as sudo."""
+        instance = self.create_fumitm_instance()
+        env = os.environ.copy()
+        env.pop('SUDO_UID', None)
+        with patch('os.getuid', return_value=0), \
+             patch.dict(os.environ, env, clear=True):
+            assert instance._is_running_as_sudo() is False
+
+    def test_get_real_user_ids_under_sudo(self):
+        """Under sudo, return the real user's UID/GID from environment."""
+        instance = self.create_fumitm_instance()
+        with patch('os.getuid', return_value=0), \
+             patch.dict(os.environ, {'SUDO_UID': '501', 'SUDO_GID': '20'}):
+            uid, gid = instance._get_real_user_ids()
+            assert uid == 501
+            assert gid == 20
+
+    def test_get_real_user_ids_normal(self):
+        """Without sudo, return the current process UID/GID."""
+        instance = self.create_fumitm_instance()
+        with patch('os.getuid', return_value=1000), \
+             patch('os.getgid', return_value=1000):
+            uid, gid = instance._get_real_user_ids()
+            assert uid == 1000
+            assert gid == 1000
+
+    def test_fix_ownership_only_affects_home_paths(self, tmp_path):
+        """_fix_ownership should skip paths outside $HOME."""
+        instance = self.create_fumitm_instance()
+
+        system_file = tmp_path / "etc" / "ssl" / "cert.pem"
+        system_file.parent.mkdir(parents=True)
+        system_file.touch()
+
+        with patch('os.getuid', return_value=0), \
+             patch.dict(os.environ, {'SUDO_UID': '501', 'SUDO_GID': '20'}), \
+             patch('os.path.expanduser', return_value=str(tmp_path / "home" / "user")), \
+             patch('os.chown') as mock_chown:
+            instance._fix_ownership(str(system_file))
+            mock_chown.assert_not_called()
+
+    def test_fix_ownership_noop_when_not_sudo(self, tmp_path):
+        """_fix_ownership should be a no-op for non-sudo users."""
+        instance = self.create_fumitm_instance()
+
+        home_file = tmp_path / "home" / "user" / "test.pem"
+        home_file.parent.mkdir(parents=True)
+        home_file.touch()
+
+        with patch('os.getuid', return_value=1000), \
+             patch('os.chown') as mock_chown:
+            instance._fix_ownership(str(home_file))
+            mock_chown.assert_not_called()
+
+    def test_home_correction_under_sudo_linux(self):
+        """Verify HOME is corrected when sudo sets it to /root."""
+        import pwd
+
+        mock_pw = MagicMock()
+        mock_pw.pw_dir = '/home/realuser'
+
+        with patch('os.getuid', return_value=0), \
+             patch.dict(os.environ, {'SUDO_USER': 'realuser', 'HOME': '/root'}), \
+             patch('pwd.getpwnam', return_value=mock_pw), \
+             patch('platform.system', return_value='Linux'):
+            instance = fumitm.FumitmPython(mode='status', provider='warp')
+            assert os.environ['HOME'] == '/home/realuser'
+
+    def test_check_ownership_sanity_detects_root_files(self, tmp_path):
+        """check_ownership_sanity should warn about root-owned files."""
+        instance = self.create_fumitm_instance()
+        instance.cert_path = str(tmp_path / "cert.pem")
+        instance.bundle_dir = str(tmp_path / "bundle")
+
+        cert = tmp_path / "cert.pem"
+        cert.touch()
+
+        # Build a stat wrapper that only overrides st_uid for the target file
+        # while preserving all other stat fields (st_mode, etc.)
+        original_stat = os.stat
+        def mock_stat(path, *args, **kwargs):
+            result = original_stat(path, *args, **kwargs)
+            if str(path) == str(cert):
+                # Return a copy with st_uid patched to 0 (root)
+                return os.stat_result((
+                    result.st_mode, result.st_ino, result.st_dev, result.st_nlink,
+                    0,  # st_uid = root
+                    result.st_gid, result.st_size, result.st_atime, result.st_mtime, result.st_ctime
+                ))
+            return result
+
+        with patch('os.getuid', return_value=1000), \
+             patch('os.stat', side_effect=mock_stat), \
+             patch('os.path.expanduser', return_value=str(tmp_path)):
+            result = instance.check_ownership_sanity()
+            assert result is True
+
+    def test_check_ownership_sanity_clean(self, tmp_path):
+        """check_ownership_sanity should return False when no problems exist."""
+        instance = self.create_fumitm_instance()
+        instance.cert_path = str(tmp_path / "cert.pem")
+        instance.bundle_dir = str(tmp_path / "bundle")
+
+        # No files exist — nothing to flag
+        with patch('os.getuid', return_value=1000):
+            result = instance.check_ownership_sanity()
+            assert result is False
+
 
 class TestPerformance(FumitmTestCase):
     """Tests for performance and subprocess call limits.

@@ -67,6 +67,7 @@ Key test categories in `test_fumitm_integration.py`:
 - **TestCertificateContentMatching**: Tests for pure-Python certificate matching
 - **TestUpdateCheck**: Tests for the auto-update check functionality
 - **TestGcloudVerification**: Tests for gcloud connectivity verification
+- **TestOwnershipProtection**: Tests for sudo detection and file ownership correction
 
 Key test categories in `test_netskope_provider.py`:
 - **TestProviderDetection**: WARP and Netskope detection (cert files, encrypted certs, STAgent process)
@@ -105,12 +106,19 @@ The script follows a modular architecture with these key components:
    - `certificate_exists_in_file()`: Checks if certificate already exists in bundle files (uses pure-Python string matching for O(1) performance)
    - `verify_connection()`: Tests if tools can connect through the proxy (supports node, python, curl, wget, gcloud)
 
-6. **Status Checking**:
+6. **Ownership Protection** (sudo safety):
+   - `_is_running_as_sudo()` / `_get_real_user_ids()`: Detect sudo vs. real root login
+   - `_fix_ownership(path)`: Chowns home-directory files back to the real user when running under sudo; system paths are left untouched
+   - `_safe_makedirs(path)`: Wraps `os.makedirs()` and chowns newly created directories; all setup functions use this instead of raw `os.makedirs()`
+   - `check_ownership_sanity()`: Called early in `main()` — warns non-root users about root-owned files and proactively fixes ownership when running as sudo
+   - `$HOME` correction in `__init__`: On Linux, sudo may set `$HOME` to `/root`; the constructor detects this and repoints to the real user's home before any `expanduser` calls
+
+7. **Status Checking**:
    - `check_all_status()`: Comprehensive status report of all configurations
    - Shows what needs fixing without making changes
    - Verifies actual connectivity before flagging issues (e.g., gcloud may work via system trust store without custom CA)
 
-7. **Update Checking**:
+8. **Update Checking**:
    - `check_for_updates()`: Compares local file hash against GitHub main branch
    - Uses unverified SSL context (since WARP certificate trust might not be configured yet)
    - Warns users to update before running `--fix` if a newer version is available
@@ -125,6 +133,7 @@ The script follows a modular architecture with these key components:
 - Detects and adapts to user's shell (bash, zsh, fish)
 - Cross-platform Python implementation with proper type handling
 - The global `CERT_PATH` constant is kept for backward compatibility but is unused internally; all class methods use `self.cert_path`
+- All file writes to `$HOME` go through ownership-correcting helpers (`_fix_ownership`, `_safe_makedirs`) so that `sudo ./fumitm.py --fix` does not leave root-owned files behind
 
 ## Adding a New Provider
 

@@ -107,30 +107,6 @@ The Windows version (`fumitm_windows.py`) includes Windows-specific functionalit
 
 Fumitm should auto-detect VS Code devcontainers and WSL environments where `warp-cli`/`nsdiag` is only available on the underlying host. Within these environments, fumitm will guide the user where to obtain their MITM cert and will skip slow verification tests.
 
-## Installation Alternative
-
-You can also run the script directly from the repository:
-
-### Linux/macOS
-```bash
-# Clone the repository
-git clone https://github.com/aberoham/fumitm.git
-cd fumitm
-
-# Run the script
-./fumitm.py --fix
-```
-
-### Windows
-```powershell
-# Clone the repository
-git clone https://github.com/aberoham/fumitm.git
-cd fumitm
-
-# Run the Windows-specific script
-python fumitm_windows.py --fix
-```
-
 ## Troubleshooting
 
 If you encounter issues:

@@ -33,6 +33,10 @@ jobs:
           fumitm:
             - 'fumitm.py'
             - 'test_suite/test_fumitm_integration.py'
+            - 'test_suite/test_netskope_provider.py'
+            - 'test_suite/test_suspicious_bundles.py'
+            - 'test_suite/helpers.py'
+            - 'test_suite/mock_data.py'
           fumitm_windows:
             - 'fumitm_windows.py'
             - 'test_suite/test_fumitm_windows.py'
@@ -64,7 +68,7 @@ jobs:
       working-directory: test_suite
       run: |
         source .venv/bin/activate
-        python -m pytest test_fumitm_integration.py -v --tb=short
+        python -m pytest test_fumitm_integration.py test_netskope_provider.py test_suspicious_bundles.py -v --tb=short
 
   test-linux:
     runs-on: ubuntu-latest
@@ -93,7 +97,7 @@ jobs:
       working-directory: test_suite
       run: |
         source .venv/bin/activate
-        python -m pytest test_fumitm_integration.py -v --tb=short
+        python -m pytest test_fumitm_integration.py test_netskope_provider.py test_suspicious_bundles.py -v --tb=short
 
   test-windows:
     runs-on: windows-latest
