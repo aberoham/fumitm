@@ -1899,5 +1899,125 @@ class TestUpdateCheckCalVer(FumitmTestCase):
             assert result is False  # Graceful failure
 
 
+class TestProviderMigration(FumitmTestCase):
+    """Tests for provider migration detection and path correction.
+
+    When a user switches MITM proxy providers (e.g. WARP to Netskope), tool
+    configs may still reference the old provider's bundle_dir. These tests
+    verify that fumitm detects the mismatch and migrates paths accordingly.
+    """
+
+    def test_path_belongs_to_other_provider_cross_provider(self):
+        """A path under WARP's bundle_dir should be flagged when Netskope is active."""
+        instance = self.create_fumitm_instance(provider='netskope')
+        warp_path = os.path.expanduser("~/.cloudflare-warp/node/ca-bundle.pem")
+        result = instance._path_belongs_to_other_provider(warp_path)
+        assert result == "Cloudflare WARP"
+
+    def test_path_belongs_to_other_provider_same_provider(self):
+        """A path under the current provider's bundle_dir should return None."""
+        instance = self.create_fumitm_instance(provider='netskope')
+        netskope_path = os.path.expanduser("~/.netskope/node/ca-bundle.pem")
+        result = instance._path_belongs_to_other_provider(netskope_path)
+        assert result is None
+
+    def test_path_belongs_to_other_provider_unrelated(self):
+        """An unrelated path should return None."""
+        instance = self.create_fumitm_instance(provider='netskope')
+        result = instance._path_belongs_to_other_provider("/etc/ssl/certs/ca-certificates.crt")
+        assert result is None
+
+    def test_path_belongs_to_other_provider_netskope_when_warp_active(self):
+        """A path under Netskope's bundle_dir should be flagged when WARP is active."""
+        instance = self.create_fumitm_instance(provider='warp')
+        netskope_path = os.path.expanduser("~/.netskope/npm/ca-bundle.pem")
+        result = instance._path_belongs_to_other_provider(netskope_path)
+        assert result == "Netskope"
+
+    def test_check_node_status_flags_cross_provider_path(self):
+        """check_node_status should set has_issues when NODE_EXTRA_CA_CERTS points to another provider."""
+        warp_node_bundle = os.path.expanduser("~/.cloudflare-warp/node/ca-bundle.pem")
+
+        mock_config = (MockBuilder()
+            .with_tool('node')
+            .with_env_var('NODE_EXTRA_CA_CERTS', warp_node_bundle)
+            .build())
+
+        with mock_fumitm_environment(mock_config):
+            instance = self.create_fumitm_instance(provider='netskope')
+            has_issues = instance.check_node_status("FAKE_CERT_CONTENT")
+            assert has_issues is True
+
+    def test_check_git_status_flags_cross_provider_path(self):
+        """check_git_status should set has_issues when http.sslCAInfo points to another provider."""
+        warp_git_bundle = os.path.expanduser("~/.cloudflare-warp/git/ca-bundle.pem")
+
+        mock_config = (MockBuilder()
+            .with_tool('git')
+            .with_subprocess_response(returncode=0, stdout=warp_git_bundle)
+            .build())
+
+        with mock_fumitm_environment(mock_config):
+            instance = self.create_fumitm_instance(provider='netskope')
+            has_issues = instance.check_git_status("FAKE_CERT_CONTENT")
+            assert has_issues is True
+
+    def test_check_curl_status_flags_cross_provider_path(self):
+        """check_curl_status should flag CURL_CA_BUNDLE under another provider's dir."""
+        warp_curl_bundle = os.path.expanduser("~/.cloudflare-warp/curl/ca-bundle.pem")
+
+        mock_config = (MockBuilder()
+            .with_tool('curl')
+            # verify_connection returns WORKING
+            .with_subprocess_response(returncode=0, stderr="")
+            # curl --version
+            .with_subprocess_response(returncode=0, stdout="curl 8.4.0 (x86_64) libcurl/8.4.0 OpenSSL/3.0")
+            .with_env_var('CURL_CA_BUNDLE', warp_curl_bundle)
+            .build())
+
+        with mock_fumitm_environment(mock_config):
+            instance = self.create_fumitm_instance(provider='netskope')
+            has_issues = instance.check_curl_status("FAKE_CERT_CONTENT")
+            assert has_issues is True
+
+    def test_setup_node_cert_migrates_cross_provider_path(self):
+        """setup_node_cert should create a new bundle at the current provider's path when migrating."""
+        warp_node_bundle = os.path.expanduser("~/.cloudflare-warp/node/ca-bundle.pem")
+
+        mock_config = (MockBuilder()
+            .with_tool('node')
+            # npm/yarn/pnpm are not installed so setup_node_cert won't call into them
+            .with_env_var('NODE_EXTRA_CA_CERTS', warp_node_bundle)
+            .with_certificate(os.path.expanduser("~/.netskope-ca.pem"))
+            .build())
+
+        with mock_fumitm_environment(mock_config):
+            instance = self.create_fumitm_instance(mode='install', provider='netskope')
+            instance.setup_node_cert()
+
+            # The shell config should reference the netskope path, not the warp path
+            assert instance.bundle_dir == os.path.expanduser("~/.netskope")
+
+    def test_check_node_status_no_issues_for_same_provider(self):
+        """check_node_status should not flag paths belonging to the current provider."""
+        netskope_node_bundle = os.path.expanduser("~/.netskope/node/ca-bundle.pem")
+        cert_path = "/tmp/test-cert.pem"
+        cert_content = mock_data.MOCK_CERTIFICATE
+
+        mock_config = (MockBuilder()
+            .with_tool('node')
+            .with_env_var('NODE_EXTRA_CA_CERTS', netskope_node_bundle)
+            .with_file(netskope_node_bundle, cert_content)
+            .with_file(cert_path, cert_content)
+            # verify_connection for node
+            .with_subprocess_response(returncode=0, stderr="HTTP Status: 200")
+            .build())
+
+        with mock_fumitm_environment(mock_config):
+            instance = self.create_fumitm_instance(provider='netskope')
+            has_issues = instance.check_node_status(cert_path)
+            assert has_issues is False
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

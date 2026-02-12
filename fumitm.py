@@ -347,6 +347,21 @@ class FumitmPython:
         # missing warp-cli still make sense.
         return PROVIDERS['warp']
 
+    def _path_belongs_to_other_provider(self, path):
+        """Check whether a path lives under a different provider's bundle directory.
+
+        Returns the other provider's display name if the path is under a
+        different provider's bundle_dir, or None if it belongs to the current
+        provider or is unrelated to any known provider.
+        """
+        for config in PROVIDERS.values():
+            other_dir = os.path.expanduser(config['bundle_dir'])
+            if other_dir == self.bundle_dir:
+                continue
+            if path.startswith(other_dir + os.sep):
+                return config['name']
+        return None
+
     def _detect_warp(self):
         """Return True if Cloudflare WARP appears to be installed."""
         return shutil.which('warp-cli') is not None
@@ -1713,7 +1728,24 @@ class FumitmPython:
         node_extra_ca_certs = os.environ.get('NODE_EXTRA_CA_CERTS', '')
         
         if node_extra_ca_certs:
-            if os.path.exists(node_extra_ca_certs):
+            other_provider = self._path_belongs_to_other_provider(node_extra_ca_certs)
+            if other_provider:
+                # Path belongs to a different provider — migrate to current provider's bundle
+                needs_setup = True
+                node_bundle = os.path.join(self.bundle_dir, "node/ca-bundle.pem")
+                self.print_info("Configuring Node.js certificate...")
+                self.print_info(f"NODE_EXTRA_CA_CERTS points to previous provider ({other_provider}): {node_extra_ca_certs}")
+
+                if not self.is_install_mode():
+                    self.print_action(f"Would create Node.js CA bundle at {node_bundle}")
+                    self.print_action(f"Would set NODE_EXTRA_CA_CERTS={node_bundle}")
+                else:
+                    self._safe_makedirs(os.path.dirname(node_bundle))
+                    shutil.copy(self.cert_path, node_bundle)
+                    self._fix_ownership(node_bundle)
+                    self.add_to_shell_config("NODE_EXTRA_CA_CERTS", node_bundle, shell_config)
+                    self.print_info(f"Migrated Node.js CA bundle to {node_bundle}")
+            elif os.path.exists(node_extra_ca_certs):
                 # Check if the file contains our certificate using normalized comparison
                 if self.certificate_exists_in_file(self.cert_path, node_extra_ca_certs):
                     # Certificate already exists in NODE_EXTRA_CA_CERTS, skip to npm setup
@@ -1722,13 +1754,13 @@ class FumitmPython:
                     needs_setup = True
                     self.print_info("Configuring Node.js certificate...")
                     self.print_info(f"NODE_EXTRA_CA_CERTS is already set to: {node_extra_ca_certs}")
-                    
+
                     # Check if we can write to the file
                     if not self.is_writable(node_extra_ca_certs):
                         self.print_error(f"Cannot write to {node_extra_ca_certs} (permission denied)")
                         new_path = self.suggest_user_path(node_extra_ca_certs, "node")
                         self.print_warn(f"Suggesting alternative path: {new_path}")
-                        
+
                         if not self.is_install_mode():
                             self.print_action(f"Would create directory: {os.path.dirname(new_path)}")
                             self.print_action(f"Would copy {node_extra_ca_certs} to {new_path}")
@@ -1745,7 +1777,7 @@ class FumitmPython:
                                     except Exception:
                                         Path(new_path).touch()
                                         self._fix_ownership(new_path)
-                                
+
                                 self.safe_append_certificate(self.cert_path, new_path)
 
                                 self.add_to_shell_config("NODE_EXTRA_CA_CERTS", new_path, shell_config)
@@ -1808,6 +1840,22 @@ class FumitmPython:
         needs_setup = False
         
         if current_cafile and current_cafile not in ["null", "undefined"]:
+            # If the cafile belongs to a different provider, migrate unconditionally
+            other_provider = self._path_belongs_to_other_provider(current_cafile)
+            if other_provider:
+                self.print_info("Configuring npm certificate...")
+                self.print_info(f"npm cafile points to previous provider ({other_provider}): {current_cafile}")
+                if not self.is_install_mode():
+                    self.print_action(f"Would create full CA bundle at {npm_bundle}")
+                    self.print_action(f"Would run: npm config set cafile {npm_bundle}")
+                else:
+                    self._safe_makedirs(os.path.dirname(npm_bundle))
+                    self.create_bundle_with_system_certs(npm_bundle)
+                    self.safe_append_certificate(self.cert_path, npm_bundle)
+                    subprocess.run(['npm', 'config', 'set', 'cafile', npm_bundle])
+                    self.print_info(f"Migrated npm cafile to: {npm_bundle}")
+                return
+
             if os.path.exists(current_cafile):
                 # First check if the existing cafile looks suspiciously small
                 suspicious, reason = self.is_suspicious_full_bundle(current_cafile, self.cert_path)
@@ -2285,15 +2333,23 @@ class FumitmPython:
             current_ca = ""
         # Decide whether to repoint
         repoint = False
-        if current_ca and os.path.exists(current_ca):
-            suspicious, reason = self.is_suspicious_full_bundle(current_ca, self.cert_path)
-            if suspicious:
+        if current_ca:
+            other_provider = self._path_belongs_to_other_provider(current_ca)
+            if other_provider:
                 repoint = True
                 self.print_info("Configuring Git certificate...")
-                self.print_warn(f"Existing git http.sslCAInfo looks suspiciously small ({reason})")
+                self.print_info(f"http.sslCAInfo points to previous provider ({other_provider}): {current_ca}")
+            elif os.path.exists(current_ca):
+                suspicious, reason = self.is_suspicious_full_bundle(current_ca, self.cert_path)
+                if suspicious:
+                    repoint = True
+                    self.print_info("Configuring Git certificate...")
+                    self.print_warn(f"Existing git http.sslCAInfo looks suspiciously small ({reason})")
+            else:
+                # Path missing — don't configure by default; Git uses system trust store
+                return
         else:
-            # If not set or path missing, don't configure by default
-            # Git uses system trust store when not configured
+            # Not set — Git uses system trust store when not configured
             return
         if not repoint:
             return
@@ -2330,9 +2386,17 @@ class FumitmPython:
         curl_bundle = os.path.join(self.bundle_dir, "curl/ca-bundle.pem")
         curl_env = os.environ.get('CURL_CA_BUNDLE', '')
 
-        # Case 1: CURL_CA_BUNDLE is set but points to suspicious or non-existent file
+        # Case 1: CURL_CA_BUNDLE is set — check for provider mismatch first
         if curl_env:
-            if not os.path.exists(curl_env):
+            other_provider = self._path_belongs_to_other_provider(curl_env)
+            if other_provider:
+                self.print_info("Configuring curl certificate bundle...")
+                self.print_info(f"CURL_CA_BUNDLE points to previous provider ({other_provider}): {curl_env}")
+                if not self.is_install_mode():
+                    self.print_action(f"Would create curl CA bundle at {curl_bundle}")
+                    self.print_action(f"Would repoint CURL_CA_BUNDLE to {curl_bundle}")
+                    return
+            elif not os.path.exists(curl_env):
                 self.print_info("Configuring curl certificate bundle...")
                 self.print_warn(f"CURL_CA_BUNDLE points to non-existent file: {curl_env}")
                 if not self.is_install_mode():
@@ -2380,7 +2444,12 @@ class FumitmPython:
                 git_ca = result.stdout.strip() if result.returncode == 0 else ""
                 if git_ca:
                     self.print_info(f"  http.sslCAInfo is set to: {git_ca}")
-                    if os.path.exists(git_ca):
+                    other_provider = self._path_belongs_to_other_provider(git_ca)
+                    if other_provider:
+                        self.print_warn(f"  ⚠ http.sslCAInfo points to a previous provider's path ({other_provider})")
+                        self.print_action("    Run with --fix to migrate to the current provider's bundle")
+                        has_issues = True
+                    elif os.path.exists(git_ca):
                         suspicious, reason = self.is_suspicious_full_bundle(git_ca, None)
                         if suspicious:
                             self.print_warn(f"  ⚠ http.sslCAInfo looks suspiciously small ({reason})")
@@ -2417,8 +2486,13 @@ class FumitmPython:
                     elif os.environ.get('CURL_CA_BUNDLE'):
                         curl_bundle = os.environ['CURL_CA_BUNDLE']
                         self.print_info(f"  - CURL_CA_BUNDLE is set to: {curl_bundle}")
-                        # Check if the bundle is suspicious
-                        if os.path.exists(curl_bundle):
+                        other_provider = self._path_belongs_to_other_provider(curl_bundle)
+                        if other_provider:
+                            self.print_warn(f"  ⚠ CURL_CA_BUNDLE points to a previous provider's path ({other_provider})")
+                            self.print_action("    Run with --fix to migrate to the current provider's bundle")
+                            has_issues = True
+                        elif os.path.exists(curl_bundle):
+                            # Check if the bundle is suspicious
                             suspicious, reason = self.is_suspicious_full_bundle(curl_bundle, temp_warp_cert)
                             if suspicious:
                                 self.print_warn(f"  ⚠ CURL_CA_BUNDLE looks suspiciously small ({reason})")
@@ -2432,7 +2506,11 @@ class FumitmPython:
                 # curl doesn't work, check configuration
                 curl_bundle = os.environ.get('CURL_CA_BUNDLE', '')
                 if curl_bundle:
-                    if os.path.exists(curl_bundle):
+                    other_provider = self._path_belongs_to_other_provider(curl_bundle)
+                    if other_provider:
+                        self.print_warn(f"  ✗ CURL_CA_BUNDLE points to a previous provider's path ({other_provider})")
+                        self.print_action("    Run with --fix to migrate to the current provider's bundle")
+                    elif os.path.exists(curl_bundle):
                         suspicious, reason = self.is_suspicious_full_bundle(curl_bundle, temp_warp_cert)
                         if suspicious:
                             self.print_warn(f"  ✗ CURL_CA_BUNDLE points to suspicious bundle ({reason})")
@@ -3075,8 +3153,18 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
 }}).on('error', (err) => {{
     console.error('Error:', err.message);
     console.error('Error code:', err.code);
-    // Only exit with error for SSL issues
-    process.exit(err.code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' || err.code === 'CERT_HAS_EXPIRED' ? 1 : 0);
+    // Exit with error for any TLS certificate issue
+    const sslErrors = [
+        'UNABLE_TO_GET_ISSUER_CERT',
+        'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+        'CERT_HAS_EXPIRED',
+        'DEPTH_ZERO_SELF_SIGNED_CERT',
+        'SELF_SIGNED_CERT_IN_CHAIN',
+        'CERT_REJECTED',
+        'CERT_NOT_YET_VALID',
+        'ERR_TLS_CERT_ALTNAME_INVALID',
+    ];
+    process.exit(sslErrors.includes(err.code) ? 1 : 0);
 }});
 """
                 
@@ -3264,7 +3352,12 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             node_extra_ca_certs = os.environ.get('NODE_EXTRA_CA_CERTS', '')
             if node_extra_ca_certs:
                 self.print_info(f"  NODE_EXTRA_CA_CERTS is set to: {node_extra_ca_certs}")
-                if os.path.exists(node_extra_ca_certs):
+                other_provider = self._path_belongs_to_other_provider(node_extra_ca_certs)
+                if other_provider:
+                    self.print_warn(f"  ⚠ NODE_EXTRA_CA_CERTS points to a previous provider's path ({other_provider})")
+                    self.print_action("    Run with --fix to migrate to the current provider's bundle")
+                    has_issues = True
+                elif os.path.exists(node_extra_ca_certs):
                     if self.certificate_exists_in_file(temp_warp_cert, node_extra_ca_certs):
                         self.print_info("  ✓ NODE_EXTRA_CA_CERTS contains current certificate")
                         verify_result = self.verify_connection("node")
@@ -3291,7 +3384,12 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     npm_cafile = result.stdout.strip() if result.returncode == 0 else ""
                     
                     if npm_cafile and npm_cafile not in ["null", "undefined"]:
-                        if os.path.exists(npm_cafile):
+                        other_provider = self._path_belongs_to_other_provider(npm_cafile)
+                        if other_provider:
+                            self.print_warn(f"  ⚠ npm cafile points to a previous provider's path ({other_provider})")
+                            self.print_action("    Run with --fix to migrate to the current provider's bundle")
+                            has_issues = True
+                        elif os.path.exists(npm_cafile):
                             if self.certificate_exists_in_file(temp_warp_cert, npm_cafile):
                                 self.print_info("  ✓ npm cafile contains current certificate")
                                 suspicious, reason = self.is_suspicious_full_bundle(npm_cafile, None)
@@ -3324,8 +3422,13 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     yarn_cafile = result.stdout.strip()
 
                     if yarn_cafile and yarn_cafile not in ['undefined', '']:
+                        other_provider = self._path_belongs_to_other_provider(yarn_cafile)
                         npm_bundle = os.path.join(self.bundle_dir, "npm/ca-bundle.pem")
-                        if yarn_cafile == npm_bundle:
+                        if other_provider:
+                            self.print_warn(f"  ⚠ yarn {config_key} points to a previous provider's path ({other_provider})")
+                            self.print_action("    Run with --fix to remove this stale configuration")
+                            has_issues = True
+                        elif yarn_cafile == npm_bundle:
                             self.print_info(f"  ✓ yarn {config_key} points to managed npm bundle")
                         elif os.path.exists(yarn_cafile):
                             if self.certificate_exists_in_file(temp_warp_cert, yarn_cafile):
@@ -3351,8 +3454,13 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     pnpm_cafile = result.stdout.strip()
 
                     if pnpm_cafile and pnpm_cafile not in ['undefined', '']:
+                        other_provider = self._path_belongs_to_other_provider(pnpm_cafile)
                         npm_bundle = os.path.join(self.bundle_dir, "npm/ca-bundle.pem")
-                        if pnpm_cafile == npm_bundle:
+                        if other_provider:
+                            self.print_warn(f"  ⚠ pnpm cafile points to a previous provider's path ({other_provider})")
+                            self.print_action("    Run with --fix to remove this stale configuration")
+                            has_issues = True
+                        elif pnpm_cafile == npm_bundle:
                             self.print_info("  ✓ pnpm cafile points to managed npm bundle")
                         elif os.path.exists(pnpm_cafile):
                             if self.certificate_exists_in_file(temp_warp_cert, pnpm_cafile):
