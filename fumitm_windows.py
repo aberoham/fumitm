@@ -471,6 +471,17 @@ class FumitmWindows:
                 self.print_debug(
                     f"{tool_name} bundle already contains current certificate"
                 )
+                # Bundle is healthy — still ensure all env vars are set in the registry,
+                # since they may have been missed on a previous run.
+                if env_vars:
+                    for env_var in env_vars:
+                        if not self.get_environment_variable(env_var):
+                            if not self.is_install_mode():
+                                self.print_action(
+                                    f"Would set {env_var} to {bundle_path}"
+                                )
+                            else:
+                                self.set_environment_variable(env_var, bundle_path)
                 return bundle_path
 
         # Handle existing bundle
