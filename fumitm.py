@@ -2147,6 +2147,17 @@ class FumitmPython:
                         else:
                             self.print_info(f"Appending proxy certificate to {requests_ca_bundle}")
                             self.safe_append_certificate(self.cert_path, requests_ca_bundle)
+                    else:
+                        # REQUESTS_CA_BUNDLE is healthy — ensure SSL_CERT_FILE is also set,
+                        # since tools like httpx and Python's ssl module use it independently.
+                        shell_config = self.get_shell_config_path()
+                        ssl_cert_file = os.environ.get('SSL_CERT_FILE', '')
+                        if not ssl_cert_file:
+                            if not self.is_install_mode():
+                                self.print_action(f"Would set SSL_CERT_FILE to {requests_ca_bundle}")
+                            else:
+                                self.add_to_shell_config("SSL_CERT_FILE", requests_ca_bundle, shell_config)
+                                self.print_info(f"Set SSL_CERT_FILE to {requests_ca_bundle}")
             else:
                 needs_setup = True
                 self.print_info("Configuring Python certificate...")
@@ -2848,34 +2859,48 @@ class FumitmPython:
         docker_certs_dir = os.path.expanduser("~/.docker/certs.d")
         cert_dest = os.path.join(docker_certs_dir, f"{self.provider['container_cert_name']}.crt")
 
-        # Check if certificate is already installed with correct content
-        if os.path.exists(cert_dest) and self.certificate_likely_exists_in_file(self.cert_path, cert_dest):
+        # Check if certificate is already installed in persistent location
+        persistent_installed = os.path.exists(cert_dest) and self.certificate_likely_exists_in_file(self.cert_path, cert_dest)
+
+        # Check if Podman machine is running and if VM needs the certificate
+        vm_is_running = False
+        vm_needs_cert = False
+        try:
+            result = subprocess.run(['podman', 'machine', 'list'], capture_output=True, text=True)
+            vm_is_running = 'Currently running' in result.stdout
+            if vm_is_running:
+                # Check if certificate exists in VM
+                result = subprocess.run(
+                    ['podman', 'machine', 'ssh', f'test -f /etc/pki/ca-trust/source/anchors/{self.provider["container_cert_name"]}.pem'],
+                    capture_output=True
+                )
+                vm_needs_cert = result.returncode != 0
+        except Exception:
+            pass
+
+        # If everything is already configured, skip
+        if persistent_installed and (not vm_is_running or not vm_needs_cert):
             self.print_debug("Podman certificate already installed, skipping configuration")
             return
 
         self.print_info("Configuring Podman certificate...")
 
-        # Check if VM is currently running
-        try:
-            result = subprocess.run(['podman', 'machine', 'list'], capture_output=True, text=True)
-            vm_is_running = 'Currently running' in result.stdout
-        except Exception:
-            vm_is_running = False
-
         if not self.is_install_mode():
-            self.print_action(f"Would copy certificate to {cert_dest} (persistent)")
-            if vm_is_running:
-                self.print_action("Would also install certificate into running Podman VM for immediate effect")
+            if not persistent_installed:
+                self.print_action(f"Would copy certificate to {cert_dest} (persistent)")
+            if vm_is_running and vm_needs_cert:
+                self.print_action("Would install certificate into running Podman VM for immediate effect")
         else:
-            # Create directory and copy certificate (persistent location)
-            self._safe_makedirs(docker_certs_dir)
-            shutil.copy(self.cert_path, cert_dest)
-            self._fix_ownership(cert_dest)
-            self.print_info(f"Certificate installed to {cert_dest}")
+            # Install to persistent location if needed
+            if not persistent_installed:
+                self._safe_makedirs(docker_certs_dir)
+                shutil.copy(self.cert_path, cert_dest)
+                self._fix_ownership(cert_dest)
+                self.print_info(f"Certificate installed to {cert_dest}")
 
-            # If VM is running, also install for immediate effect
-            if vm_is_running:
-                self.print_info("Podman machine is running - also installing certificate into VM...")
+            # If VM is running and needs cert, install for immediate effect
+            if vm_is_running and vm_needs_cert:
+                self.print_info("Installing certificate into Podman VM...")
 
                 with open(self.cert_path, 'r') as f:
                     cert_content = f.read()
@@ -2899,7 +2924,9 @@ class FumitmPython:
                 else:
                     self.print_warn("Failed to install certificate into running VM")
                     self.print_info("Certificate in ~/.docker/certs.d/ will be available for future use")
-            else:
+            elif vm_is_running and not vm_needs_cert:
+                self.print_info("Certificate already installed in VM")
+            elif not vm_is_running:
                 self.print_info("Podman machine is not running")
                 self.print_info("Run 'podman machine start' then re-run fumitm to install into VM")
     
@@ -2917,34 +2944,48 @@ class FumitmPython:
         docker_certs_dir = os.path.expanduser("~/.docker/certs.d")
         cert_dest = os.path.join(docker_certs_dir, f"{self.provider['container_cert_name']}.crt")
 
-        # Check if certificate is already installed with correct content
-        if os.path.exists(cert_dest) and self.certificate_likely_exists_in_file(self.cert_path, cert_dest):
+        # Check if certificate is already installed in persistent location
+        persistent_installed = os.path.exists(cert_dest) and self.certificate_likely_exists_in_file(self.cert_path, cert_dest)
+
+        # Check if Rancher Desktop is running and if VM needs the certificate
+        vm_is_running = False
+        vm_needs_cert = False
+        try:
+            result = subprocess.run(['rdctl', 'version'], capture_output=True, text=True)
+            vm_is_running = result.returncode == 0
+            if vm_is_running:
+                # Check if certificate exists in VM
+                result = subprocess.run(
+                    ['rdctl', 'shell', 'test', '-f', f'/usr/local/share/ca-certificates/{self.provider["container_cert_name"]}.pem'],
+                    capture_output=True
+                )
+                vm_needs_cert = result.returncode != 0
+        except Exception:
+            pass
+
+        # If everything is already configured, skip
+        if persistent_installed and (not vm_is_running or not vm_needs_cert):
             self.print_debug("Rancher Desktop certificate already installed, skipping configuration")
             return
 
         self.print_info("Configuring Rancher Desktop certificate...")
 
-        # Check if Rancher Desktop is running
-        try:
-            result = subprocess.run(['rdctl', 'version'], capture_output=True, text=True)
-            vm_is_running = result.returncode == 0
-        except Exception:
-            vm_is_running = False
-
         if not self.is_install_mode():
-            self.print_action(f"Would copy certificate to {cert_dest} (persistent)")
-            if vm_is_running:
-                self.print_action("Would also install certificate into running Rancher Desktop VM for immediate effect")
+            if not persistent_installed:
+                self.print_action(f"Would copy certificate to {cert_dest} (persistent)")
+            if vm_is_running and vm_needs_cert:
+                self.print_action("Would install certificate into running Rancher Desktop VM for immediate effect")
         else:
-            # Create directory and copy certificate (persistent location)
-            self._safe_makedirs(docker_certs_dir)
-            shutil.copy(self.cert_path, cert_dest)
-            self._fix_ownership(cert_dest)
-            self.print_info(f"Certificate installed to {cert_dest}")
+            # Install to persistent location if needed
+            if not persistent_installed:
+                self._safe_makedirs(docker_certs_dir)
+                shutil.copy(self.cert_path, cert_dest)
+                self._fix_ownership(cert_dest)
+                self.print_info(f"Certificate installed to {cert_dest}")
 
-            # If VM is running, also install for immediate effect
-            if vm_is_running:
-                self.print_info("Rancher Desktop is running - also installing certificate into VM...")
+            # If VM is running and needs cert, install for immediate effect
+            if vm_is_running and vm_needs_cert:
+                self.print_info("Installing certificate into Rancher Desktop VM...")
 
                 with open(self.cert_path, 'r') as f:
                     cert_content = f.read()
@@ -2968,7 +3009,9 @@ class FumitmPython:
                 else:
                     self.print_warn("Failed to install certificate into running VM")
                     self.print_info("Certificate in ~/.docker/certs.d/ will be available for future use")
-            else:
+            elif vm_is_running and not vm_needs_cert:
+                self.print_info("Certificate already installed in VM")
+            elif not vm_is_running:
                 self.print_info("Rancher Desktop is not running")
                 self.print_info("Start Rancher Desktop then re-run fumitm to install into VM")
     
@@ -3055,35 +3098,49 @@ class FumitmPython:
         docker_certs_dir = os.path.expanduser("~/.docker/certs.d")
         cert_dest = os.path.join(docker_certs_dir, f"{self.provider['container_cert_name']}.crt")
 
-        # Check if certificate is already installed with correct content
-        if os.path.exists(cert_dest) and self.certificate_likely_exists_in_file(self.cert_path, cert_dest):
+        # Check if certificate is already installed in persistent location
+        persistent_installed = os.path.exists(cert_dest) and self.certificate_likely_exists_in_file(self.cert_path, cert_dest)
+
+        # Check if Colima is running and if VM needs the certificate
+        vm_is_running = False
+        vm_needs_cert = False
+        try:
+            status_result = subprocess.run(['colima', 'status'], capture_output=True)
+            vm_is_running = (status_result.returncode == 0)
+            if vm_is_running:
+                # Check if certificate exists in VM
+                result = subprocess.run(
+                    ['colima', 'ssh', '--', 'test', '-f', f'/usr/local/share/ca-certificates/{self.provider["container_cert_name"]}.crt'],
+                    capture_output=True
+                )
+                vm_needs_cert = result.returncode != 0
+        except Exception:
+            pass
+
+        # If everything is already configured, skip
+        if persistent_installed and (not vm_is_running or not vm_needs_cert):
             self.print_debug("Colima certificate already installed, skipping configuration")
             return
 
         self.print_info("Configuring Colima certificate...")
 
-        # Check if VM is currently running
-        try:
-            status_result = subprocess.run(['colima', 'status'], capture_output=True)
-            vm_is_running = (status_result.returncode == 0)
-        except Exception:
-            vm_is_running = False
-
         if not self.is_install_mode():
-            self.print_action(f"Would copy certificate to {cert_dest} (persistent)")
-            if vm_is_running:
-                self.print_action("Would also install certificate into running VM for immediate effect")
+            if not persistent_installed:
+                self.print_action(f"Would copy certificate to {cert_dest} (persistent)")
+            if vm_is_running and vm_needs_cert:
+                self.print_action("Would install certificate into running VM for immediate effect")
         else:
-            # Create directory and copy certificate (persistent location)
-            self._safe_makedirs(docker_certs_dir)
-            shutil.copy(self.cert_path, cert_dest)
-            self._fix_ownership(cert_dest)
-            self.print_info(f"Certificate installed to {cert_dest}")
-            self.print_info("This certificate will be automatically loaded on Colima start")
+            # Install to persistent location if needed
+            if not persistent_installed:
+                self._safe_makedirs(docker_certs_dir)
+                shutil.copy(self.cert_path, cert_dest)
+                self._fix_ownership(cert_dest)
+                self.print_info(f"Certificate installed to {cert_dest}")
+                self.print_info("This certificate will be automatically loaded on Colima start")
 
-            # If VM is running, also install for immediate effect
-            if vm_is_running:
-                self.print_info("Colima is running - also installing certificate into VM...")
+            # If VM is running and needs cert, install for immediate effect
+            if vm_is_running and vm_needs_cert:
+                self.print_info("Installing certificate into Colima VM...")
 
                 with open(self.cert_path, 'r') as f:
                     cert_content = f.read()
@@ -3117,7 +3174,9 @@ class FumitmPython:
                 else:
                     self.print_warn("Failed to install certificate into running VM")
                     self.print_info("Certificate in ~/.docker/certs.d/ will be applied on next Colima restart")
-            else:
+            elif vm_is_running and not vm_needs_cert:
+                self.print_info("Certificate already installed in VM")
+            elif not vm_is_running:
                 self.print_info("Colima is not running - certificate will be applied on next start")
     
     def verify_connection(self, tool_name):
