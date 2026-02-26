@@ -345,9 +345,9 @@ class TestCLIAndWorkflow(FumitmTestCase):
             mock_class.assert_called_with(
                 mode='install', debug=False, selected_tools=[],
                 cert_file=None, manual_cert=False, skip_verify=False,
-                provider=None
+                provider=None, auto_yes=False
             )
-    
+
     @patch('fumitm.sys.argv', ['fumitm.py', '--tools', 'node,python'])
     def test_cli_tool_selection(self):
         """Test --tools argument parsing."""
@@ -355,18 +355,50 @@ class TestCLIAndWorkflow(FumitmTestCase):
             mock_instance = MagicMock()
             mock_instance.main.return_value = 0
             mock_class.return_value = mock_instance
-            
+
             with patch('fumitm.sys.exit'):
                 fumitm.main()
-            
+
             mock_class.assert_called_with(
                 mode='status',
                 debug=False,
                 selected_tools=['node', 'python'],
                 cert_file=None, manual_cert=False, skip_verify=False,
-                provider=None
+                provider=None, auto_yes=False
             )
     
+    @patch('fumitm.sys.argv', ['fumitm.py', '--fix', '--yes'])
+    def test_cli_yes_flag(self):
+        """Test --yes flag passes auto_yes=True."""
+        with patch('fumitm.FumitmPython') as mock_class:
+            mock_instance = MagicMock()
+            mock_instance.main.return_value = 0
+            mock_class.return_value = mock_instance
+
+            with patch('fumitm.sys.exit'):
+                fumitm.main()
+
+            mock_class.assert_called_with(
+                mode='install', debug=False, selected_tools=[],
+                cert_file=None, manual_cert=False, skip_verify=False,
+                provider=None, auto_yes=True
+            )
+
+    def test_prompt_returns_y_without_stdin_when_auto_yes(self):
+        """--yes must work without any stdin input (e.g. curl pipe)."""
+        instance = self.create_fumitm_instance()
+        instance.auto_yes = True
+        result = instance._prompt("Do you want to proceed? (Y/n) ")
+        assert result == 'y'
+
+    @patch('builtins.input', side_effect=EOFError)
+    def test_prompt_reads_stdin_when_no_auto_yes(self, _mock_input):
+        """Without --yes, _prompt delegates to input() which needs stdin."""
+        instance = self.create_fumitm_instance()
+        instance.auto_yes = False
+        with pytest.raises(EOFError):
+            instance._prompt("Do you want to proceed? (Y/n) ")
+
     def test_complete_status_workflow(self):
         """Test complete status check workflow with multiple tools."""
         mock_config = (MockBuilder()

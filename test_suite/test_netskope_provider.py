@@ -292,7 +292,7 @@ class TestProviderCLI(FumitmTestCase):
             mock_class.assert_called_with(
                 mode='status', debug=False, selected_tools=[],
                 cert_file=None, manual_cert=False, skip_verify=False,
-                provider='netskope'
+                provider='netskope', auto_yes=False
             )
 
     @patch('fumitm.sys.argv', ['fumitm.py', '--provider', 'warp', '--fix'])
@@ -309,7 +309,7 @@ class TestProviderCLI(FumitmTestCase):
             mock_class.assert_called_with(
                 mode='install', debug=False, selected_tools=[],
                 cert_file=None, manual_cert=False, skip_verify=False,
-                provider='warp'
+                provider='warp', auto_yes=False
             )
 
     @patch('fumitm.sys.argv', ['fumitm.py', '--provider', 'invalid'])
