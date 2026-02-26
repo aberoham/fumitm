@@ -31,6 +31,9 @@ fumitm (Fix Up My Interception of TLS, Man) is a Python script that automaticall
 # List all available tools and their tags
 ./fumitm.py --list-tools
 
+# Non-interactive mode (answer yes to all prompts, for curl-pipe one-liners)
+./fumitm.py --fix --yes
+
 # Check/fix specific tools only
 ./fumitm.py --tools node --tools python  # Check Node.js and Python only
 ./fumitm.py --fix --tools node-npm,gcloud  # Fix Node.js/npm and gcloud only

@@ -7,14 +7,21 @@ Script to automatically verify and fix MITM TLS distrust issues commonly afflict
 ### Linux/macOS
 
 ```bash
-# Download the script
+# Fix everything in one shot (no prompts, no download needed)
+python3 <(curl -LsSf https://raw.githubusercontent.com/aberoham/fumitm/main/fumitm.py) --fix --yes
+source ~/.zshrc  # or ~/.bashrc
+```
+
+For more control, download the script first:
+
+```bash
 curl -LsSf https://raw.githubusercontent.com/aberoham/fumitm/main/fumitm.py -o fumitm.py
 chmod +x ./fumitm.py
 
 # Check status (no changes made)
 ./fumitm.py
 
-# Apply fixes
+# Apply fixes (prompts before each change)
 ./fumitm.py --fix
 
 # Run with detailed debug output (useful for troubleshooting)
