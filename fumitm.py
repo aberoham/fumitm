@@ -183,7 +183,7 @@ PROVIDERS = {
 }
 
 class FumitmPython:
-    def __init__(self, mode='status', debug=False, selected_tools=None, cert_file=None, manual_cert=False, skip_verify=False, provider=None):
+    def __init__(self, mode='status', debug=False, selected_tools=None, cert_file=None, manual_cert=False, skip_verify=False, provider=None, auto_yes=False):
         self.mode = mode
         self.debug = debug
         self.shell_modified = False
@@ -192,6 +192,7 @@ class FumitmPython:
         self.cert_file = cert_file
         self.manual_cert = manual_cert
         self.skip_verify = skip_verify
+        self.auto_yes = auto_yes
 
         # When running under sudo on Linux, $HOME may resolve to /root instead
         # of the real user's home directory. Correct it before any expanduser calls
@@ -480,6 +481,13 @@ class FumitmPython:
         if self.is_debug_mode():
             print(f"{BLUE}[DEBUG]{NC} {msg}", file=sys.stderr)
 
+    def _prompt(self, message):
+        """Prompt the user for input, or return 'y' when --yes is active."""
+        if self.auto_yes:
+            print(f"{message}y (--yes)")
+            return 'y'
+        return input(message)
+
     def check_for_updates(self):
         """Check if a newer version of fumitm is available on GitHub.
 
@@ -690,6 +698,7 @@ class FumitmPython:
             'REQUESTS_CA_BUNDLE',
             'NODE_EXTRA_CA_CERTS',
             'GIT_SSL_CAINFO',
+            'CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE',
         ]
 
         broken_vars = []
@@ -1313,7 +1322,7 @@ class FumitmPython:
                     self.print_action(f"Would ask to update {var_name} in {shell_config}")
                     self.print_action(f"Would set: export {var_name}=\"{var_value}\"")
                 else:
-                    response = input("Do you want to update it? (y/N) ")
+                    response = self._prompt("Do you want to update it? (y/N) ")
                     if response.lower() == 'y':
                         # Comment out old entries
                         lines = content.splitlines()
@@ -1404,6 +1413,11 @@ class FumitmPython:
         self.print_info(f"2. Run: ./fumitm.py --fix --cert-file /path/to/cert.pem")
         print()
         
+        if self.auto_yes:
+            self.print_error("Manual certificate input requires an interactive terminal. "
+                             "Use --cert-file to provide the certificate non-interactively.")
+            return None
+
         choice = input("Ready to paste? Press ENTER to continue, 'F' for file path, or 'Q' to quit: ").strip().upper()
         
         if choice == 'Q':
@@ -1626,7 +1640,7 @@ class FumitmPython:
                 self.print_info(f"Found existing certificate at {self.cert_path}")
                 # In install mode, ask if they want to update it
                 if self.is_install_mode():
-                    response = input("Do you want to update it with a new certificate? (y/N) ")
+                    response = self._prompt("Do you want to update it with a new certificate? (y/N) ")
                     if response.lower() == 'y':
                         warp_cert = self.get_certificate_from_user()
                         if not warp_cert:
@@ -1767,7 +1781,7 @@ class FumitmPython:
                             self.print_action(f"Would append proxy certificate to {new_path}")
                             self.print_action(f"Would update NODE_EXTRA_CA_CERTS to point to {new_path}")
                         else:
-                            response = input("Do you want to use this alternative path? (Y/n) ")
+                            response = self._prompt("Do you want to use this alternative path? (Y/n) ")
                             if response.lower() != 'n':
                                 self._safe_makedirs(os.path.dirname(new_path))
                                 if os.path.exists(node_extra_ca_certs):
@@ -1906,7 +1920,7 @@ class FumitmPython:
                         if not self.is_install_mode():
                             self.print_action(f"Would ask to append proxy certificate to {current_cafile}")
                         else:
-                            response = input("Do you want to append it to the existing cafile? (y/N) ")
+                            response = self._prompt("Do you want to append it to the existing cafile? (y/N) ")
                             if response.lower() == 'y':
                                 self.print_info(f"Appending proxy certificate to {current_cafile}")
                                 self.safe_append_certificate(self.cert_path, current_cafile)
@@ -1919,7 +1933,7 @@ class FumitmPython:
                     self.print_action(f"Would create full CA bundle at {npm_bundle}")
                     self.print_action(f"Would run: npm config set cafile {npm_bundle}")
                 else:
-                    response = input("Do you want to create a new CA bundle for npm? (Y/n) ")
+                    response = self._prompt("Do you want to create a new CA bundle for npm? (Y/n) ")
                     if response.lower() != 'n':
                         self._safe_makedirs(os.path.dirname(npm_bundle))
                         self.create_bundle_with_system_certs(npm_bundle)
@@ -1935,7 +1949,7 @@ class FumitmPython:
                 self.print_action(f"Would create full CA bundle at {npm_bundle} with system certificates and proxy certificate")
                 self.print_action(f"Would run: npm config set cafile {npm_bundle}")
             else:
-                response = input("Do you want to configure npm with a CA bundle including proxy certificate? (Y/n) ")
+                response = self._prompt("Do you want to configure npm with a CA bundle including proxy certificate? (Y/n) ")
                 if response.lower() != 'n':
                     self._safe_makedirs(os.path.dirname(npm_bundle))
                     if not self.create_bundle_with_system_certs(npm_bundle):
@@ -2096,7 +2110,7 @@ class FumitmPython:
                         self.print_action(f"Would append proxy certificate to {new_path}")
                         self.print_action(f"Would update REQUESTS_CA_BUNDLE to point to {new_path}")
                     else:
-                        response = input("Do you want to use this alternative path? (Y/n) ")
+                        response = self._prompt("Do you want to use this alternative path? (Y/n) ")
                         if response.lower() != 'n':
                             self._safe_makedirs(os.path.dirname(new_path))
                             if os.path.exists(requests_ca_bundle):
@@ -2221,8 +2235,97 @@ class FumitmPython:
                     self.add_to_shell_config("SSL_CERT_FILE", python_bundle, shell_config)
                     self.print_info(f"Repointed SSL_CERT_FILE to managed bundle: {python_bundle}")
 
+    def _ensure_gcloud_properties(self, ca_bundle):
+        """Pre-create ~/.config/gcloud/properties with custom_ca_certs_file.
+
+        The gcloud SDK reads this file during bootstrap, before any config
+        commands are available. This is the only reliable way to pass a custom
+        CA bundle to `brew install --cask gcloud-cli`, because Homebrew
+        sanitizes environment variables (stripping CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE)
+        and gcloud's bundled requests ignores REQUESTS_CA_BUNDLE.
+        """
+        properties_dir = os.path.expanduser("~/.config/gcloud")
+        properties_file = os.path.join(properties_dir, "properties")
+        target_line = f"custom_ca_certs_file = {ca_bundle}"
+
+        if os.path.exists(properties_file):
+            with open(properties_file, 'r') as f:
+                content = f.read()
+            if "custom_ca_certs_file" in content:
+                for line in content.splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith("custom_ca_certs_file"):
+                        current_value = stripped.split("=", 1)[-1].strip()
+                        if current_value == ca_bundle:
+                            return
+                        if os.path.exists(current_value) and \
+                                self.certificate_exists_in_file(self.cert_path, current_value):
+                            return
+                # Existing value is stale or wrong — replace it
+                lines = content.splitlines()
+                new_lines = []
+                for line in lines:
+                    if line.strip().startswith("custom_ca_certs_file"):
+                        new_lines.append(target_line)
+                    else:
+                        new_lines.append(line)
+                if not self.is_install_mode():
+                    self.print_action(f"Would update custom_ca_certs_file in {properties_file}")
+                else:
+                    with open(properties_file, 'w') as f:
+                        f.write('\n'.join(new_lines) + '\n')
+                    self._fix_ownership(properties_file)
+                    self.print_info(f"Updated custom_ca_certs_file in {properties_file}")
+                return
+
+            # File exists but no custom_ca_certs_file — append under [core]
+            if "[core]" in content:
+                if not self.is_install_mode():
+                    self.print_action(f"Would add custom_ca_certs_file to {properties_file}")
+                else:
+                    content = content.replace(
+                        "[core]",
+                        f"[core]\n{target_line}",
+                        1,
+                    )
+                    with open(properties_file, 'w') as f:
+                        f.write(content)
+                    self._fix_ownership(properties_file)
+                    self.print_info(f"Added custom_ca_certs_file to {properties_file}")
+            else:
+                if not self.is_install_mode():
+                    self.print_action(f"Would add [core] section with custom_ca_certs_file to {properties_file}")
+                else:
+                    with open(properties_file, 'a') as f:
+                        f.write(f"\n[core]\n{target_line}\n")
+                    self._fix_ownership(properties_file)
+                    self.print_info(f"Added [core] section with custom_ca_certs_file to {properties_file}")
+        else:
+            if not self.is_install_mode():
+                self.print_action(f"Would create {properties_file} with custom_ca_certs_file")
+            else:
+                self._safe_makedirs(properties_dir)
+                with open(properties_file, 'w') as f:
+                    f.write(f"[core]\n{target_line}\n")
+                self._fix_ownership(properties_file)
+                self.print_info(f"Created {properties_file} with custom_ca_certs_file")
+
     def setup_gcloud_cert(self):
         """Setup gcloud certificate."""
+        # Pre-create the gcloud properties file so that future gcloud installs
+        # (e.g. `brew install --cask gcloud-cli`) can bootstrap behind a MITM
+        # proxy. Also set the env var for direct gcloud invocations.
+        python_bundle = os.path.expanduser("~/.python-ca-bundle.pem")
+        if os.path.exists(python_bundle):
+            self._ensure_gcloud_properties(python_bundle)
+            shell_type = self.detect_shell()
+            shell_config = self.get_shell_config(shell_type)
+            self.add_to_shell_config(
+                "CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE",
+                python_bundle,
+                shell_config,
+            )
+
         if not self.command_exists('gcloud'):
             self.print_info("gcloud not found, skipping gcloud setup")
             return
@@ -2298,7 +2401,7 @@ class FumitmPython:
                     self.print_action("Would ask to update gcloud CA configuration")
                     return
                 else:
-                    response = input("Do you want to update it? (y/N) ")
+                    response = self._prompt("Do you want to update it? (y/N) ")
                     if response.lower() != 'y':
                         return
         
@@ -2811,7 +2914,7 @@ class FumitmPython:
                     self.print_action(f"Would ask to update the ca_certificate in {wgetrc_path}")
                     self.print_action(f"Would set: {config_line}")
                 else:
-                    response = input("Do you want to update it? (y/N) ")
+                    response = self._prompt("Do you want to update it? (y/N) ")
                     if response.lower() == 'y':
                         # Comment out old entries
                         lines = content.splitlines()
@@ -3045,7 +3148,7 @@ class FumitmPython:
             self.print_action(f"Would set permissions: adb shell chmod 644 /system/etc/security/cacerts/{self.provider['container_cert_name']}.pem")
             self.print_action("Would reboot emulator: adb reboot")
         else:
-            response = input("Do you want to install the certificate on the running Android emulator? (y/N) ")
+            response = self._prompt("Do you want to install the certificate on the running Android emulator? (y/N) ")
             if response.lower() == 'y':
                 self.print_info("Installing certificate on Android emulator...")
                 
@@ -4405,6 +4508,8 @@ def main():
                         help='Skip network verification tests (useful in devcontainers)')
     parser.add_argument('--provider', choices=list(PROVIDERS.keys()),
                         help='MITM proxy provider (default: auto-detect)')
+    parser.add_argument('--yes', '-y', action='store_true',
+                        help='Answer yes to all prompts (for non-interactive use)')
     parser.add_argument('--debug', '--verbose', action='store_true',
                         help='Show detailed debug information')
     parser.add_argument('--version', '-V', action='store_true',
@@ -4452,7 +4557,8 @@ def main():
         cert_file=args.cert_file,
         manual_cert=args.manual_cert,
         skip_verify=args.skip_verify,
-        provider=args.provider
+        provider=args.provider,
+        auto_yes=args.yes
     )
     exit_code = fumitm.main()
     sys.exit(exit_code)
