@@ -1,6 +1,6 @@
 # fumitm (MITM Certificate .. Fixer Upper)
 
-Script to automatically verify and fix MITM TLS distrust issues commonly afflicting corporate device users who are subject to traffic inspection via agents such as Cloudflare WARP or Netskope.
+Script to automatically verify and fix MITM TLS distrust issues commonly afflicting corporate device users who are subject to traffic inspection via agents such as Cloudflare WARP or Netskope. ZScaler is not yet supported.
 
 ## Usage
 
@@ -38,9 +38,8 @@ chmod +x ./fumitm.py
 ./fumitm.py --fix --provider warp
 ./fumitm.py --fix --provider netskope
 
-# Devcontainer/WSL helpers when provider CLI is unavailable
-./fumitm.py --fix --cert-file ./company-ca.pem --skip-verify
-./fumitm.py --fix --manual-cert --skip-verify
+# Running in a devcontainer/WSL?
+# See the "VS Code Devcontainers / WSL" section below.
 ```
 
 ### Windows
@@ -76,11 +75,11 @@ The act of toggling your MITM off also seriously hints that you have no clue wha
 
 ### General
 - Cloudflare WARP or Netskope Client should be installed and connected
-- `warp-cli` or `nsdiag` command should be available (unless using `--cert-file` or `--manual-cert`)
+- `warp-cli` is needed for WARP flows. Netskope auto-detection uses known certificate paths or a running STAgent process (`nsdiag` is optional)
 - Python 3 (macOS/Linux, Windows/WSL)
 
 ### Windows-Specific
-- `warp-cli.exe` or `nsdiag.exe` command must be available 
+- `warp-cli.exe` command must be available 
 - Administrator privileges may be required for some fixes
 
 ## Contribute
@@ -131,13 +130,23 @@ The Windows version (`fumitm_windows.py`) includes Windows-specific functionalit
 
 ### VS Code Devcontainers / WSL
 
-Fumitm should auto-detect VS Code devcontainers and WSL environments where `warp-cli`/`nsdiag` is only available on the underlying host. Within these environments, fumitm will guide the user where to obtain their MITM cert and will skip slow verification tests.
+Fumitm should auto-detect VS Code devcontainers and WSL environments where the provider CLI is only available on the underlying host. Within these environments, fumitm will guide you where to obtain your MITM cert and will skip slow verification tests.
+
+If the cert cannot be pulled automatically from inside the container, use one of these flows:
+
+```bash
+# Use an existing cert file from your host/dev environment
+./fumitm.py --fix --cert-file ./company-ca.pem --skip-verify
+
+# Paste cert content manually
+./fumitm.py --fix --manual-cert --skip-verify
+```
 
 ## Troubleshooting
 
 If you encounter issues:
 
-1. Ensure your MITM is connected: `warp-cli status`, `nsdiag -f`
+1. Ensure your MITM is connected: `warp-cli status` (WARP) or confirm Netskope Client/STAgent is running (`nsdiag -f` is optional)
 2. Run with debug output: `./fumitm.py --debug` (Linux/macOS) or `python fumitm_windows.py --debug` (Windows)
 3. Check that Python 3 is properly installed and in your PATH
 4. Verify you have appropriate permissions for the tools you're trying to fix
