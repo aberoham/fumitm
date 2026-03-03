@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import tempfile
+from datetime import datetime
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -195,46 +196,53 @@ class TestLogFile(FumitmTestCase):
 
     def test_log_dir_symlink_updates_on_second_run(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            # First run
+            # First run with deterministic timestamp via mock
             inst1 = self.create_fumitm_instance(
                 no_color=True, log_dir=tmpdir
             )
-            inst1._open_log_files()
+            with patch('fumitm.datetime') as mock_dt:
+                mock_dt.now.return_value.strftime.return_value = '20260101-000001'
+                mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+                inst1._open_log_files()
             inst1.print_info("first")
             inst1._close_log_files()
-            first_target = os.readlink(
-                os.path.join(tmpdir, 'fumitm-latest.log')
-            )
+            symlink = os.path.join(tmpdir, 'fumitm-latest.log')
+            first_target = os.readlink(symlink)
 
-            # Second run (different PID-derived name since same second)
-            import time
-            time.sleep(0.01)  # Ensure different timestamp possible
+            # Second run with different timestamp
             inst2 = self.create_fumitm_instance(
                 no_color=True, log_dir=tmpdir
             )
-            inst2._open_log_files()
+            with patch('fumitm.datetime') as mock_dt:
+                mock_dt.now.return_value.strftime.return_value = '20260101-000002'
+                mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+                inst2._open_log_files()
             inst2.print_info("second")
             inst2._close_log_files()
-            second_target = os.readlink(
-                os.path.join(tmpdir, 'fumitm-latest.log')
-            )
+            second_target = os.readlink(symlink)
 
-            # Symlink should point to second run's file
-            target_path = os.path.join(tmpdir, second_target)
-            assert 'second' in open(target_path).read()
+            # Symlink must have changed and both files must exist
+            assert first_target != second_target
+            assert os.path.isfile(os.path.join(tmpdir, first_target))
+            assert os.path.isfile(os.path.join(tmpdir, second_target))
+            assert 'second' in open(os.path.join(tmpdir, second_target)).read()
 
 
-    def test_unwritable_log_path_warns_continues(self):
+    def test_unwritable_log_path_warns_continues(self, capsys):
         """Unwritable --log-dir prints stderr warning, tool still runs."""
         instance = self.create_fumitm_instance(
             no_color=True, log_dir='/nonexistent/unwritable/path',
         )
         with patch('os.makedirs', side_effect=OSError("Permission denied")):
-            # Should not raise; prints warning to stderr instead
             instance._open_log_files()
 
         # Log handle should remain None (log file wasn't opened)
         assert instance._log_file_handle is None
+
+        # Warning must appear on stderr
+        captured = capsys.readouterr()
+        assert '[WARN]' in captured.err
+        assert 'Permission denied' in captured.err
 
         # Tool should still work without logging
         instance.print_info("this should not crash")
@@ -530,19 +538,6 @@ class TestExitCodes(FumitmTestCase):
 
     def test_exit_130_keyboard_interrupt(self):
         instance = self.create_fumitm_instance(mode='install')
-        with patch.object(
-            instance, '_open_log_files'
-        ), patch.object(
-            instance, '_close_log_files'
-        ), patch.object(
-            instance, '_main_inner',
-            side_effect=KeyboardInterrupt
-        ):
-            # KeyboardInterrupt is caught inside _main_inner, so we
-            # need to test the actual _main_inner method
-            pass
-
-        # Test directly via _main_inner
         with patch.object(instance, 'check_for_updates'), \
              patch.object(
                  instance, 'is_devcontainer', return_value=False
@@ -661,56 +656,37 @@ class TestSkipUpdateCheck(FumitmTestCase):
 class TestUserScopeGating(FumitmTestCase):
     """User-scoped tools are skipped when running as root without user context."""
 
-    def test_user_scoped_tools_skipped_without_context(self):
-        """Root without --run-as-user skips user-scoped tools."""
+    def test_user_and_hybrid_tools_skipped_without_context(self):
+        """Root without --run-as-user skips user and hybrid tools via _main_inner."""
         instance = self.create_fumitm_instance(mode='install')
         instance._target_uid = None
 
-        results = []
-        with patch('os.getuid', return_value=0):
-            no_user = (os.getuid() == 0 and not instance._has_user_context())
-            assert no_user is True
+        # Collect setup funcs by scope so we can verify call/no-call
+        setup_mocks = {}
+        for tool_key, tool_info in instance.tools_registry.items():
+            mock_func = MagicMock(
+                return_value=ToolResult(tool_key, 'already_ok', ''),
+            )
+            tool_info['setup_func'] = mock_func
+            setup_mocks[tool_key] = (mock_func, tool_info.get('scope'))
 
-            for tool_key, tool_info in instance.tools_registry.items():
-                if tool_info.get('scope') in ('user', 'hybrid') and no_user:
-                    results.append(
-                        ToolResult(tool_key, 'skipped', 'No user context')
-                    )
+        with patch('os.getuid', return_value=0), \
+             patch.object(instance, 'check_for_updates'), \
+             patch.object(instance, 'is_devcontainer', return_value=False), \
+             patch.object(instance, 'check_environment_sanity'), \
+             patch.object(instance, 'check_ownership_sanity'), \
+             patch.object(instance, 'download_certificate', return_value=True):
+            instance._main_inner()
 
-        # All user-scoped tools should be skipped
-        user_tools = [
-            k for k, v in instance.tools_registry.items()
-            if v.get('scope') == 'user'
-        ]
-        skipped = [r.tool for r in results]
-        for tool in user_tools:
-            assert tool in skipped
-
-    def test_hybrid_tools_skipped_without_user_context(self):
-        """Hybrid-scoped tools produce 'skipped' when no_user is true."""
-        instance = self.create_fumitm_instance(mode='install')
-        instance._target_uid = None
-
-        hybrid_tools = [
-            k for k, v in instance.tools_registry.items()
-            if v.get('scope') == 'hybrid'
-        ]
-        assert len(hybrid_tools) > 0, "No hybrid tools in registry"
-
-        results = []
-        with patch('os.getuid', return_value=0):
-            no_user = (os.getuid() == 0 and not instance._has_user_context())
-            assert no_user is True
-
-            for tool_key, tool_info in instance.tools_registry.items():
-                if tool_info.get('scope') in ('user', 'hybrid') and no_user:
-                    results.append(
-                        ToolResult(tool_key, 'skipped', 'No user context')
-                    )
-
-        skipped = [r.tool for r in results]
-        for tool in hybrid_tools:
-            assert tool in skipped
+        for tool_key, (mock_func, scope) in setup_mocks.items():
+            if scope in ('user', 'hybrid'):
+                mock_func.assert_not_called(), (
+                    f"{tool_key} (scope={scope}) should be skipped"
+                )
+            elif scope == 'system':
+                mock_func.assert_called_once(), (
+                    f"{tool_key} (scope={scope}) should have run"
+                )
 
     def test_system_scoped_tools_run_without_context(self):
         """System-scoped tools still run when there's no user context."""
