@@ -356,7 +356,8 @@ class TestBrewCacerts(FumitmTestCase):
                 mode='status', provider='warp'
             )
 
-        with patch('subprocess.run') as mock_run:
+        with patch('subprocess.run') as mock_run, \
+             patch('platform.machine', return_value='arm64'):
             mock_run.return_value = MagicMock(
                 returncode=1, stdout='', stderr='error'
             )
