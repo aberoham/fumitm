@@ -236,6 +236,7 @@ class FumitmPython:
         # Error-counting side-channel for _run_setup()
         self._in_setup_context = False
         self._setup_error_count = 0
+        self._current_tool_key = None
 
         # User targeting for JAMF/Ansible/Puppet (Phase 2)
         self._target_uid = None
@@ -558,28 +559,60 @@ class FumitmPython:
         pid = os.getpid()
 
         if self._log_dir:
-            os.makedirs(self._log_dir, exist_ok=True)
-            path = os.path.join(self._log_dir, f"fumitm-{ts}-{pid}.log")
-            self._log_file_handle = open(path, 'w')
-            symlink = os.path.join(self._log_dir, 'fumitm-latest.log')
-            self._update_symlink(symlink, path)
+            try:
+                os.makedirs(self._log_dir, exist_ok=True)
+                path = os.path.join(self._log_dir, f"fumitm-{ts}-{pid}.log")
+                self._log_file_handle = open(path, 'w')
+                symlink = os.path.join(self._log_dir, 'fumitm-latest.log')
+                self._update_symlink(symlink, path)
+            except OSError as e:
+                print(
+                    f"[WARN] Cannot open log file in {self._log_dir}: {e}",
+                    file=sys.stderr,
+                )
         elif self._log_file_path:
-            parent = os.path.dirname(self._log_file_path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            self._log_file_handle = open(self._log_file_path, 'w')
+            try:
+                parent = os.path.dirname(self._log_file_path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                self._log_file_handle = open(self._log_file_path, 'w')
+            except OSError as e:
+                print(
+                    f"[WARN] Cannot open log file {self._log_file_path}: {e}",
+                    file=sys.stderr,
+                )
 
         if self._json_log_dir:
-            os.makedirs(self._json_log_dir, exist_ok=True)
-            path = os.path.join(self._json_log_dir, f"fumitm-{ts}-{pid}.jsonl")
-            self._json_log_file_handle = open(path, 'w')
-            symlink = os.path.join(self._json_log_dir, 'fumitm-latest.jsonl')
-            self._update_symlink(symlink, path)
+            try:
+                os.makedirs(self._json_log_dir, exist_ok=True)
+                path = os.path.join(
+                    self._json_log_dir, f"fumitm-{ts}-{pid}.jsonl",
+                )
+                self._json_log_file_handle = open(path, 'w')
+                symlink = os.path.join(
+                    self._json_log_dir, 'fumitm-latest.jsonl',
+                )
+                self._update_symlink(symlink, path)
+            except OSError as e:
+                print(
+                    f"[WARN] Cannot open JSON log file in "
+                    f"{self._json_log_dir}: {e}",
+                    file=sys.stderr,
+                )
         elif self._json_log_file_path:
-            parent = os.path.dirname(self._json_log_file_path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            self._json_log_file_handle = open(self._json_log_file_path, 'w')
+            try:
+                parent = os.path.dirname(self._json_log_file_path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                self._json_log_file_handle = open(
+                    self._json_log_file_path, 'w',
+                )
+            except OSError as e:
+                print(
+                    f"[WARN] Cannot open JSON log file "
+                    f"{self._json_log_file_path}: {e}",
+                    file=sys.stderr,
+                )
 
     @staticmethod
     def _update_symlink(symlink_path, target_path):
@@ -664,6 +697,9 @@ class FumitmPython:
     def print_error(self, msg, **kwargs):
         if self._in_setup_context:
             self._setup_error_count += 1
+            if self._current_tool_key:
+                kwargs.setdefault('phase', 'tool')
+                kwargs.setdefault('tool', self._current_tool_key)
         self._emit(f"{RED}[ERROR]{NC} {msg}", level='error', **kwargs)
 
     def print_status(self, msg, **kwargs):
@@ -4843,6 +4879,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         """
         self._in_setup_context = True
         self._setup_error_count = 0
+        self._current_tool_key = tool_key
         try:
             ret = func()
             if isinstance(ret, ToolResult):
@@ -4858,15 +4895,20 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         finally:
             self._in_setup_context = False
             self._setup_error_count = 0
+            self._current_tool_key = None
 
     @staticmethod
     def _compute_changes_made(results):
         """Determine changes_made from a list of ToolResult values.
 
         Returns True if any tool returned 'configured', False if all returned
-        'already_ok', or None if only legacy 'completed' statuses exist
-        (change status unknown).
+        'already_ok' or 'skipped' (or results are empty), or None if only
+        legacy 'completed' statuses exist (change status unknown).
         """
+        if not results:
+            return False
+        if all(r.status == 'skipped' for r in results):
+            return False
         has_configured = any(r.status == 'configured' for r in results)
         has_already_ok = any(r.status == 'already_ok' for r in results)
         if has_configured:
@@ -4951,8 +4993,8 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         """Core logic, separated so main() can wrap it in log-file cleanup."""
         try:
             header = f"{self.provider['name']} Certificate Installation Script (Python)"
-            self.print_info(header)
-            self.print_info("=" * len(header))
+            self.print_info(header, phase='init')
+            self.print_info("=" * len(header), phase='init')
 
             if self.is_debug_mode():
                 self.print_debug(f"Fumitm version: {VERSION_INFO['version']} (commit: {VERSION_INFO['commit']})")
@@ -5035,10 +5077,13 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     setup_func = tool_info.get('setup_func')
                     if not setup_func:
                         continue
-                    # Skip user-scoped tools when running as root without user context
-                    if no_user and tool_info.get('scope') == 'user':
+                    # Skip user/hybrid-scoped tools when running as root without user context
+                    if no_user and tool_info.get('scope') in ('user', 'hybrid'):
                         results.append(ToolResult(tool_key, 'skipped', 'No user context'))
-                        self.print_warn(f"Skipping {tool_info['name']} (no user context)")
+                        self.print_warn(
+                            f"Skipping {tool_info['name']} (no user context)",
+                            phase='tool', tool=tool_key, result='skipped',
+                        )
                         continue
                     result = self._run_setup(tool_key, setup_func)
                     results.append(result)
@@ -5117,14 +5162,17 @@ def main():
                         help='Disable ANSI color output')
     parser.add_argument('--skip-update-check', action='store_true',
                         help='Skip checking for updates')
-    parser.add_argument('--log-file', metavar='PATH',
-                        help='Write plain-text log to PATH (overwrites each run)')
-    parser.add_argument('--log-dir', metavar='DIR',
-                        help='Write per-run text logs to DIR with fumitm-latest.log symlink')
-    parser.add_argument('--json-log-file', metavar='PATH',
-                        help='Write JSON-lines event log to PATH (overwrites each run)')
-    parser.add_argument('--json-log-dir', metavar='DIR',
-                        help='Write per-run JSON-lines logs to DIR with fumitm-latest.jsonl symlink')
+    log_group = parser.add_mutually_exclusive_group()
+    log_group.add_argument('--log-file', metavar='PATH',
+                           help='Write plain-text log to PATH (overwrites each run)')
+    log_group.add_argument('--log-dir', metavar='DIR',
+                           help='Write per-run text logs to DIR with fumitm-latest.log symlink')
+
+    json_log_group = parser.add_mutually_exclusive_group()
+    json_log_group.add_argument('--json-log-file', metavar='PATH',
+                                help='Write JSON-lines event log to PATH (overwrites each run)')
+    json_log_group.add_argument('--json-log-dir', metavar='DIR',
+                                help='Write per-run JSON-lines logs to DIR with fumitm-latest.jsonl symlink')
     parser.add_argument('--run-as-user', metavar='USERNAME',
                         help='Configure certs for USERNAME (requires root). '
                              'Use "auto" to detect console user on macOS.')

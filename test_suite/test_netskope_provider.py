@@ -288,7 +288,10 @@ class TestProviderCLI(FumitmTestCase):
     @patch('fumitm.sys.argv', ['fumitm.py', '--provider', 'netskope'])
     def test_cli_provider_netskope(self):
         """--provider netskope passes provider='netskope' to constructor."""
-        with patch('fumitm.FumitmPython') as mock_class:
+        env = {k: v for k, v in os.environ.items()
+               if k not in ('NO_COLOR', 'FUMITM_HEADLESS')}
+        with patch('fumitm.FumitmPython') as mock_class, \
+             patch.dict(os.environ, env, clear=True):
             mock_instance = MagicMock()
             mock_instance.main.return_value = 0
             mock_class.return_value = mock_instance
@@ -306,7 +309,10 @@ class TestProviderCLI(FumitmTestCase):
     @patch('fumitm.sys.argv', ['fumitm.py', '--provider', 'warp', '--fix'])
     def test_cli_provider_warp_with_fix(self):
         """--provider warp --fix passes both provider and mode."""
-        with patch('fumitm.FumitmPython') as mock_class:
+        env = {k: v for k, v in os.environ.items()
+               if k not in ('NO_COLOR', 'FUMITM_HEADLESS')}
+        with patch('fumitm.FumitmPython') as mock_class, \
+             patch.dict(os.environ, env, clear=True):
             mock_instance = MagicMock()
             mock_instance.main.return_value = 0
             mock_class.return_value = mock_instance

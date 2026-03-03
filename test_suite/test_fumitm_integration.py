@@ -633,7 +633,10 @@ class TestCLIAndWorkflow(FumitmTestCase):
     @patch('fumitm.sys.argv', ['fumitm.py', '--fix'])
     def test_cli_fix_mode(self):
         """Test --fix argument sets install mode."""
-        with patch('fumitm.FumitmPython') as mock_class:
+        env = {k: v for k, v in os.environ.items()
+               if k not in ('NO_COLOR', 'FUMITM_HEADLESS')}
+        with patch('fumitm.FumitmPython') as mock_class, \
+             patch.dict(os.environ, env, clear=True):
             mock_instance = MagicMock()
             mock_instance.main.return_value = 0
             mock_class.return_value = mock_instance
@@ -650,7 +653,10 @@ class TestCLIAndWorkflow(FumitmTestCase):
     @patch('fumitm.sys.argv', ['fumitm.py', '--tools', 'node,python'])
     def test_cli_tool_selection(self):
         """Test --tools argument parsing."""
-        with patch('fumitm.FumitmPython') as mock_class:
+        env = {k: v for k, v in os.environ.items()
+               if k not in ('NO_COLOR', 'FUMITM_HEADLESS')}
+        with patch('fumitm.FumitmPython') as mock_class, \
+             patch.dict(os.environ, env, clear=True):
             mock_instance = MagicMock()
             mock_instance.main.return_value = 0
             mock_class.return_value = mock_instance
@@ -669,7 +675,10 @@ class TestCLIAndWorkflow(FumitmTestCase):
     @patch('fumitm.sys.argv', ['fumitm.py', '--fix', '--yes'])
     def test_cli_yes_flag(self):
         """Test --yes flag passes auto_yes=True."""
-        with patch('fumitm.FumitmPython') as mock_class:
+        env = {k: v for k, v in os.environ.items()
+               if k not in ('NO_COLOR', 'FUMITM_HEADLESS')}
+        with patch('fumitm.FumitmPython') as mock_class, \
+             patch.dict(os.environ, env, clear=True):
             mock_instance = MagicMock()
             mock_instance.main.return_value = 0
             mock_class.return_value = mock_instance

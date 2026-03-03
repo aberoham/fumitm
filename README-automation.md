@@ -72,9 +72,9 @@ Each tool in the registry has a scope that determines whether it runs without us
 |-------|-------|-----|
 | System | `brew-cacerts` | Reads/writes system paths, not `$HOME` |
 | User | `node`, `python`, `gcloud`, `git`, `curl`, `java`, `jenv`, `gradle`, `dbeaver`, `wget`, `android` | Write to `$HOME` (shell configs, env vars, user bundles) |
-| Hybrid | `podman`, `rancher`, `colima` | Container runtimes may have system and user configs |
+| Hybrid | `podman`, `rancher`, `colima` | Write to `~/.docker/certs.d/` and interact with user VMs |
 
-When running as root without `--run-as-user` and without `SUDO_USER`, user-scoped tools are skipped with a warning. System-scoped tools (cert download, detection, brew-cacerts) still run.
+When running as root without `--run-as-user` and without `SUDO_USER`, user-scoped and hybrid-scoped tools are skipped with a warning. System-scoped tools (cert download, detection, brew-cacerts) still run.
 
 ### Canonical identity mechanism per orchestrator
 

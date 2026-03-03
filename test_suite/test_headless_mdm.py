@@ -82,8 +82,11 @@ class TestHeadlessFlag(FumitmTestCase):
 
     def test_headless_env_var(self):
         """FUMITM_HEADLESS=1 should be equivalent to --headless."""
+        env = {k: v for k, v in os.environ.items()
+               if k not in ('NO_COLOR', 'FUMITM_HEADLESS')}
+        env['FUMITM_HEADLESS'] = '1'
         with patch('fumitm.sys.argv', ['fumitm.py']), \
-             patch.dict(os.environ, {'FUMITM_HEADLESS': '1'}), \
+             patch.dict(os.environ, env, clear=True), \
              patch('fumitm.FumitmPython') as mock_class:
             mock_instance = MagicMock()
             mock_instance.main.return_value = 0
@@ -221,6 +224,23 @@ class TestLogFile(FumitmTestCase):
             assert 'second' in open(target_path).read()
 
 
+    def test_unwritable_log_path_warns_continues(self):
+        """Unwritable --log-dir prints stderr warning, tool still runs."""
+        instance = self.create_fumitm_instance(
+            no_color=True, log_dir='/nonexistent/unwritable/path',
+        )
+        with patch('os.makedirs', side_effect=OSError("Permission denied")):
+            # Should not raise; prints warning to stderr instead
+            instance._open_log_files()
+
+        # Log handle should remain None (log file wasn't opened)
+        assert instance._log_file_handle is None
+
+        # Tool should still work without logging
+        instance.print_info("this should not crash")
+        instance._close_log_files()
+
+
 class TestJsonLogFile(FumitmTestCase):
     """Tests for --json-log-file and --json-log-dir JSON-lines logging."""
 
@@ -303,6 +323,32 @@ class TestJsonLogFile(FumitmTestCase):
 
             event = json.loads(open(path).readline())
             assert '\033[' not in event['message']
+        finally:
+            os.unlink(path)
+
+    def test_setup_events_have_phase_and_tool(self):
+        """JSON events emitted during _run_setup() contain phase and tool."""
+        with tempfile.NamedTemporaryFile(
+            suffix='.jsonl', delete=False
+        ) as f:
+            path = f.name
+        try:
+            instance = self.create_fumitm_instance(
+                no_color=True, json_log_file=path,
+            )
+            instance._open_log_files()
+
+            def failing_setup():
+                instance.print_error("something broke")
+
+            instance._run_setup('test-tool', failing_setup)
+            instance._close_log_files()
+
+            events = [json.loads(line) for line in open(path)]
+            error_events = [e for e in events if e['level'] == 'error']
+            assert len(error_events) >= 1
+            assert error_events[0]['phase'] == 'tool'
+            assert error_events[0]['tool'] == 'test-tool'
         finally:
             os.unlink(path)
 
@@ -416,6 +462,18 @@ class TestChangesmadeAccuracy(FumitmTestCase):
             ToolResult('b', 'already_ok', ''),
         ]
         assert fumitm.FumitmPython._compute_changes_made(results) is None
+
+    def test_all_skipped_returns_false(self):
+        """All-skipped runs (e.g., root without user context) return False."""
+        results = [
+            ToolResult('a', 'skipped', 'No user context'),
+            ToolResult('b', 'skipped', 'No user context'),
+        ]
+        assert fumitm.FumitmPython._compute_changes_made(results) is False
+
+    def test_empty_results_returns_false(self):
+        """No tools processed at all returns False."""
+        assert fumitm.FumitmPython._compute_changes_made([]) is False
 
 
 class TestExitCodes(FumitmTestCase):
@@ -586,7 +644,10 @@ class TestSkipUpdateCheck(FumitmTestCase):
 
     def test_headless_implies_skip_update_check(self):
         """--headless sets skip_update_check via module-level main()."""
+        env = {k: v for k, v in os.environ.items()
+               if k not in ('NO_COLOR', 'FUMITM_HEADLESS')}
         with patch('fumitm.sys.argv', ['fumitm.py', '--headless']), \
+             patch.dict(os.environ, env, clear=True), \
              patch('fumitm.FumitmPython') as mock_class:
             mock_instance = MagicMock()
             mock_instance.main.return_value = 0
@@ -611,7 +672,7 @@ class TestUserScopeGating(FumitmTestCase):
             assert no_user is True
 
             for tool_key, tool_info in instance.tools_registry.items():
-                if tool_info.get('scope') == 'user' and no_user:
+                if tool_info.get('scope') in ('user', 'hybrid') and no_user:
                     results.append(
                         ToolResult(tool_key, 'skipped', 'No user context')
                     )
@@ -625,6 +686,32 @@ class TestUserScopeGating(FumitmTestCase):
         for tool in user_tools:
             assert tool in skipped
 
+    def test_hybrid_tools_skipped_without_user_context(self):
+        """Hybrid-scoped tools produce 'skipped' when no_user is true."""
+        instance = self.create_fumitm_instance(mode='install')
+        instance._target_uid = None
+
+        hybrid_tools = [
+            k for k, v in instance.tools_registry.items()
+            if v.get('scope') == 'hybrid'
+        ]
+        assert len(hybrid_tools) > 0, "No hybrid tools in registry"
+
+        results = []
+        with patch('os.getuid', return_value=0):
+            no_user = (os.getuid() == 0 and not instance._has_user_context())
+            assert no_user is True
+
+            for tool_key, tool_info in instance.tools_registry.items():
+                if tool_info.get('scope') in ('user', 'hybrid') and no_user:
+                    results.append(
+                        ToolResult(tool_key, 'skipped', 'No user context')
+                    )
+
+        skipped = [r.tool for r in results]
+        for tool in hybrid_tools:
+            assert tool in skipped
+
     def test_system_scoped_tools_run_without_context(self):
         """System-scoped tools still run when there's no user context."""
         instance = self.create_fumitm_instance()
@@ -633,6 +720,58 @@ class TestUserScopeGating(FumitmTestCase):
             if v.get('scope') == 'system'
         ]
         assert 'brew-cacerts' in system_tools
+
+
+class TestMutuallyExclusiveLogFlags(FumitmTestCase):
+    """--log-file and --log-dir are mutually exclusive, same for JSON."""
+
+    def test_log_file_and_log_dir_conflict(self):
+        """Specifying both --log-file and --log-dir triggers argparse error."""
+        with patch('fumitm.sys.argv', [
+            'fumitm.py', '--log-file', '/tmp/f.log', '--log-dir', '/tmp/logs',
+        ]):
+            with pytest.raises(SystemExit) as exc_info:
+                fumitm.main()
+            assert exc_info.value.code == 2
+
+    def test_json_log_file_and_json_log_dir_conflict(self):
+        """Specifying both --json-log-file and --json-log-dir triggers error."""
+        with patch('fumitm.sys.argv', [
+            'fumitm.py',
+            '--json-log-file', '/tmp/f.jsonl',
+            '--json-log-dir', '/tmp/logs',
+        ]):
+            with pytest.raises(SystemExit) as exc_info:
+                fumitm.main()
+            assert exc_info.value.code == 2
+
+    def test_log_file_alone_accepted(self):
+        """--log-file alone is accepted (no argparse error)."""
+        env = {k: v for k, v in os.environ.items()
+               if k not in ('NO_COLOR', 'FUMITM_HEADLESS')}
+        with patch('fumitm.sys.argv', ['fumitm.py', '--log-file', '/tmp/f.log']), \
+             patch.dict(os.environ, env, clear=True), \
+             patch('fumitm.FumitmPython') as mock_class:
+            mock_instance = MagicMock()
+            mock_instance.main.return_value = 0
+            mock_class.return_value = mock_instance
+            with patch('fumitm.sys.exit'):
+                fumitm.main()
+            assert mock_class.call_args[1]['log_file'] == '/tmp/f.log'
+
+    def test_log_dir_alone_accepted(self):
+        """--log-dir alone is accepted (no argparse error)."""
+        env = {k: v for k, v in os.environ.items()
+               if k not in ('NO_COLOR', 'FUMITM_HEADLESS')}
+        with patch('fumitm.sys.argv', ['fumitm.py', '--log-dir', '/tmp/logs']), \
+             patch.dict(os.environ, env, clear=True), \
+             patch('fumitm.FumitmPython') as mock_class:
+            mock_instance = MagicMock()
+            mock_instance.main.return_value = 0
+            mock_class.return_value = mock_instance
+            with patch('fumitm.sys.exit'):
+                fumitm.main()
+            assert mock_class.call_args[1]['log_dir'] == '/tmp/logs'
 
 
 class TestSudoHelperUpdates(FumitmTestCase):
