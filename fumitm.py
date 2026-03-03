@@ -1737,6 +1737,38 @@ class FumitmPython:
         
         return True
     
+    def _get_brew_prefix(self):
+        """Return the Homebrew prefix directory.
+
+        Runs `brew --prefix` and validates the output. Falls back to a
+        platform-aware default (/opt/homebrew on Apple Silicon,
+        /usr/local on Intel macOS) when the command fails or returns
+        empty output.
+        """
+        default = (
+            '/opt/homebrew'
+            if platform.machine() == 'arm64'
+            else '/usr/local'
+        )
+        try:
+            result = subprocess.run(
+                ['brew', '--prefix'],
+                capture_output=True, text=True
+            )
+            prefix = result.stdout.strip()
+            if result.returncode == 0 and prefix:
+                return prefix
+            self.print_debug(
+                f"brew --prefix failed (rc={result.returncode}), "
+                f"using default {default}"
+            )
+        except Exception:
+            self.print_debug(
+                f"brew --prefix raised an exception, "
+                f"using default {default}"
+            )
+        return default
+
     def setup_brew_cacerts(self):
         """Regenerate Homebrew's ca-certificates bundle to include the proxy CA.
 
@@ -1760,15 +1792,7 @@ class FumitmPython:
         except Exception:
             return
 
-        try:
-            result = subprocess.run(
-                ['brew', '--prefix'],
-                capture_output=True, text=True
-            )
-            brew_prefix = result.stdout.strip()
-        except Exception:
-            brew_prefix = '/opt/homebrew'
-
+        brew_prefix = self._get_brew_prefix()
         bundle_path = os.path.join(
             brew_prefix, 'etc', 'ca-certificates', 'cert.pem'
         )
@@ -1782,11 +1806,33 @@ class FumitmPython:
                 )
             else:
                 self.print_info("Configuring Homebrew CA certificates...")
-                subprocess.run(
+                result = subprocess.run(
                     ['brew', 'postinstall', 'ca-certificates'],
                     capture_output=True, text=True
                 )
-                self.print_info("Ran brew postinstall ca-certificates")
+                if result.returncode == 0:
+                    if self.certificate_exists_in_file(
+                        self.cert_path, bundle_path
+                    ):
+                        self.print_info(
+                            "Homebrew CA bundle now includes "
+                            "proxy certificate"
+                        )
+                    else:
+                        self.print_warn(
+                            "brew postinstall succeeded but proxy "
+                            "certificate not found in bundle"
+                        )
+                        self.print_warn(
+                            "The proxy CA may not be in the "
+                            "macOS system keychain"
+                        )
+                else:
+                    self.print_error(
+                        "brew postinstall ca-certificates failed"
+                    )
+                    if result.stderr:
+                        self.print_debug(result.stderr.strip())
             return
 
         if self.certificate_exists_in_file(self.cert_path, bundle_path):
@@ -3630,15 +3676,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             )
             return has_issues
 
-        try:
-            result = subprocess.run(
-                ['brew', '--prefix'],
-                capture_output=True, text=True
-            )
-            brew_prefix = result.stdout.strip()
-        except Exception:
-            brew_prefix = '/opt/homebrew'
-
+        brew_prefix = self._get_brew_prefix()
         bundle_path = os.path.join(
             brew_prefix, 'etc', 'ca-certificates', 'cert.pem'
         )
