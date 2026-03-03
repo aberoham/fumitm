@@ -248,6 +248,26 @@ class TestLogFile(FumitmTestCase):
         instance.print_info("this should not crash")
         instance._close_log_files()
 
+    def test_unwritable_log_file_open_fails(self, capsys):
+        """open() failure after successful makedirs still warns and continues."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            instance = self.create_fumitm_instance(
+                no_color=True, log_file=os.path.join(tmpdir, 'nope.log'),
+            )
+            real_open = open
+            def failing_open(path, *args, **kwargs):
+                if str(path).endswith('nope.log'):
+                    raise OSError("Read-only file system")
+                return real_open(path, *args, **kwargs)
+
+            with patch('builtins.open', side_effect=failing_open):
+                instance._open_log_files()
+
+            assert instance._log_file_handle is None
+            captured = capsys.readouterr()
+            assert '[WARN]' in captured.err
+            assert 'Read-only file system' in captured.err
+
 
 class TestJsonLogFile(FumitmTestCase):
     """Tests for --json-log-file and --json-log-dir JSON-lines logging."""
@@ -688,14 +708,9 @@ class TestUserScopeGating(FumitmTestCase):
                     f"{tool_key} (scope={scope}) should have run"
                 )
 
-    def test_system_scoped_tools_run_without_context(self):
-        """System-scoped tools still run when there's no user context."""
-        instance = self.create_fumitm_instance()
-        system_tools = [
-            k for k, v in instance.tools_registry.items()
-            if v.get('scope') == 'system'
-        ]
-        assert 'brew-cacerts' in system_tools
+    # System-scoped tools running without context is already verified
+    # by test_user_and_hybrid_tools_skipped_without_context above,
+    # which asserts system setup funcs are called via _main_inner().
 
 
 class TestMutuallyExclusiveLogFlags(FumitmTestCase):
