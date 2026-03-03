@@ -146,6 +146,298 @@ class TestToolSetup(FumitmTestCase):
             assert any(call('python3') in mocks['which'].call_args_list for call in [call])
 
 
+class TestBrewCacerts(FumitmTestCase):
+    """Tests for Homebrew ca-certificates setup and status."""
+
+    def test_setup_skips_when_brew_not_installed(self):
+        """setup_brew_cacerts returns early when brew is not on PATH."""
+        mock_config = (MockBuilder()
+            .with_certificate()
+            .build())
+
+        with mock_fumitm_environment(mock_config):
+            instance = self.create_fumitm_instance(mode='install')
+            # brew is not in which_mapping, so command_exists returns False
+            instance.setup_brew_cacerts()
+            # No error, just silently returns
+
+    def test_setup_skips_when_formula_not_installed(self):
+        """setup_brew_cacerts returns early when ca-certificates is not installed."""
+        mock_config = (MockBuilder()
+            .with_certificate()
+            .with_tool('brew')
+            .with_subprocess_response(returncode=1, stderr="No such keg")
+            .build())
+
+        with mock_fumitm_environment(mock_config) as mocks:
+            instance = self.create_fumitm_instance(mode='install')
+            instance.setup_brew_cacerts()
+            assert_subprocess_called_with(
+                mocks['subprocess'],
+                ['brew', 'list', 'ca-certificates']
+            )
+
+    def test_setup_runs_postinstall_when_cert_missing(self):
+        """setup_brew_cacerts runs brew postinstall when proxy cert is missing from bundle."""
+        brew_prefix = '/opt/homebrew'
+        bundle_path = f'{brew_prefix}/etc/ca-certificates/cert.pem'
+
+        mock_config = (MockBuilder()
+            .with_certificate()
+            .with_tool('brew')
+            # brew list ca-certificates -> installed
+            .with_subprocess_response(returncode=0)
+            # brew --prefix
+            .with_subprocess_response(returncode=0, stdout=brew_prefix)
+            # brew postinstall ca-certificates
+            .with_subprocess_response(returncode=0)
+            .build())
+
+        # Bundle exists but does not contain the proxy cert
+        mock_config['exists_side_effect'] = lambda p: {
+            bundle_path: True,
+            f"{mock_data.HOME_DIR}/.cloudflare-ca.pem": True,
+        }.get(str(p), False)
+
+        with mock_fumitm_environment(mock_config) as mocks:
+            instance = self.create_fumitm_instance(mode='install')
+            instance.setup_brew_cacerts()
+            assert_subprocess_called_with(
+                mocks['subprocess'],
+                ['brew', 'postinstall', 'ca-certificates']
+            )
+
+    def test_setup_status_mode_shows_action(self):
+        """In status mode, setup_brew_cacerts prints action without running brew."""
+        brew_prefix = '/opt/homebrew'
+        bundle_path = f'{brew_prefix}/etc/ca-certificates/cert.pem'
+
+        mock_config = (MockBuilder()
+            .with_certificate()
+            .with_tool('brew')
+            .with_subprocess_response(returncode=0)  # brew list
+            .with_subprocess_response(returncode=0, stdout=brew_prefix)
+            .build())
+
+        mock_config['exists_side_effect'] = lambda p: {
+            bundle_path: True,
+            f"{mock_data.HOME_DIR}/.cloudflare-ca.pem": True,
+        }.get(str(p), False)
+
+        with mock_fumitm_environment(mock_config) as mocks:
+            instance = self.create_fumitm_instance(mode='status')
+            instance.setup_brew_cacerts()
+            # Should NOT call brew postinstall (only 2 subprocess calls)
+            calls = mocks['subprocess'].call_args_list
+            for c in calls:
+                args = c[0][0] if c[0] else []
+                assert 'postinstall' not in args
+
+    def test_check_status_no_brew(self, tmp_path):
+        """check_brew_cacerts_status returns False when brew is absent."""
+        cert_file = tmp_path / "test-cert.pem"
+        cert_file.write_text(mock_data.MOCK_CERTIFICATE)
+
+        with patch('platform.system', return_value='Darwin'):
+            instance = fumitm.FumitmPython(mode='status')
+
+        with patch.object(instance, 'command_exists', return_value=False):
+            result = instance.check_brew_cacerts_status(str(cert_file))
+
+        assert result is False
+
+    def test_check_status_cert_present(self, tmp_path):
+        """check_brew_cacerts_status reports no issues when cert is in bundle."""
+        cert_file = tmp_path / "test-cert.pem"
+        cert_file.write_text(mock_data.MOCK_CERTIFICATE)
+
+        with patch('platform.system', return_value='Darwin'):
+            instance = fumitm.FumitmPython(mode='status')
+
+        def cmd_exists(cmd):
+            return cmd == 'brew'
+
+        with patch.object(instance, 'command_exists', side_effect=cmd_exists), \
+             patch('subprocess.run') as mock_run, \
+             patch('os.path.exists', return_value=True), \
+             patch.object(instance, 'certificate_exists_in_file', return_value=True):
+
+            mock_run.side_effect = [
+                MagicMock(returncode=0),  # brew list
+                MagicMock(returncode=0, stdout='/opt/homebrew'),  # brew --prefix
+            ]
+            result = instance.check_brew_cacerts_status(str(cert_file))
+
+        assert result is False
+
+    def test_check_status_cert_missing(self, tmp_path):
+        """check_brew_cacerts_status reports issues when cert is missing from bundle."""
+        cert_file = tmp_path / "test-cert.pem"
+        cert_file.write_text(mock_data.MOCK_CERTIFICATE)
+
+        with patch('platform.system', return_value='Darwin'):
+            instance = fumitm.FumitmPython(mode='status')
+
+        def cmd_exists(cmd):
+            return cmd == 'brew'
+
+        with patch.object(instance, 'command_exists', side_effect=cmd_exists), \
+             patch('subprocess.run') as mock_run, \
+             patch('os.path.exists', return_value=True), \
+             patch.object(instance, 'certificate_exists_in_file', return_value=False):
+
+            mock_run.side_effect = [
+                MagicMock(returncode=0),  # brew list
+                MagicMock(returncode=0, stdout='/opt/homebrew'),  # brew --prefix
+            ]
+            result = instance.check_brew_cacerts_status(str(cert_file))
+
+        assert result is True
+
+    def test_setup_postinstall_failure_on_missing_bundle(self):
+        """setup_brew_cacerts reports error when postinstall fails on missing bundle."""
+        brew_prefix = '/opt/homebrew'
+
+        mock_config = (MockBuilder()
+            .with_certificate()
+            .with_tool('brew')
+            # brew list ca-certificates -> installed
+            .with_subprocess_response(returncode=0)
+            # brew --prefix
+            .with_subprocess_response(returncode=0, stdout=brew_prefix)
+            # brew postinstall ca-certificates -> fails
+            .with_subprocess_response(
+                returncode=1, stderr="Error: something went wrong"
+            )
+            .build())
+
+        # Bundle does not exist
+        mock_config['exists_side_effect'] = lambda p: {
+            f"{mock_data.HOME_DIR}/.cloudflare-ca.pem": True,
+        }.get(str(p), False)
+
+        with mock_fumitm_environment(mock_config) as mocks:
+            instance = self.create_fumitm_instance(mode='install')
+            instance.setup_brew_cacerts()
+            assert_subprocess_called_with(
+                mocks['subprocess'],
+                ['brew', 'postinstall', 'ca-certificates']
+            )
+
+    def test_setup_postinstall_success_but_cert_not_in_bundle(self):
+        """setup_brew_cacerts warns when postinstall succeeds but cert not in bundle."""
+        brew_prefix = '/opt/homebrew'
+        bundle_path = f'{brew_prefix}/etc/ca-certificates/cert.pem'
+
+        mock_config = (MockBuilder()
+            .with_certificate()
+            .with_tool('brew')
+            .with_subprocess_response(returncode=0)  # brew list
+            .with_subprocess_response(returncode=0, stdout=brew_prefix)
+            .with_subprocess_response(returncode=0)  # brew postinstall
+            .build())
+
+        # Bundle does not exist before postinstall
+        mock_config['exists_side_effect'] = lambda p: {
+            f"{mock_data.HOME_DIR}/.cloudflare-ca.pem": True,
+        }.get(str(p), False)
+
+        with mock_fumitm_environment(mock_config):
+            instance = self.create_fumitm_instance(mode='install')
+            # cert_exists_in_file returns False since bundle doesn't exist
+            instance.setup_brew_cacerts()
+            # Should have warned (no assertion error means it ran through)
+
+    def test_get_brew_prefix_fallback_on_failure(self):
+        """_get_brew_prefix falls back to default when brew --prefix fails."""
+        with patch('platform.system', return_value='Darwin'), \
+             patch('platform.machine', return_value='arm64'):
+            instance = fumitm.FumitmPython(
+                mode='status', provider='warp'
+            )
+
+        with patch('subprocess.run') as mock_run, \
+             patch('platform.machine', return_value='arm64'):
+            mock_run.return_value = MagicMock(
+                returncode=1, stdout='', stderr='error'
+            )
+            result = instance._get_brew_prefix()
+
+        assert result == '/opt/homebrew'
+
+    def test_get_brew_prefix_fallback_on_empty_stdout(self):
+        """_get_brew_prefix falls back to default when stdout is empty."""
+        with patch('platform.system', return_value='Darwin'), \
+             patch('platform.machine', return_value='x86_64'):
+            instance = fumitm.FumitmPython(
+                mode='status', provider='warp'
+            )
+
+        with patch('subprocess.run') as mock_run, \
+             patch('platform.machine', return_value='x86_64'):
+            mock_run.return_value = MagicMock(
+                returncode=0, stdout=''
+            )
+            result = instance._get_brew_prefix()
+
+        assert result == '/usr/local'
+
+    def test_get_brew_prefix_success(self):
+        """_get_brew_prefix returns brew --prefix output on success."""
+        with patch('platform.system', return_value='Darwin'):
+            instance = fumitm.FumitmPython(
+                mode='status', provider='warp'
+            )
+
+        with patch('subprocess.run') as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0, stdout='/opt/homebrew\n'
+            )
+            result = instance._get_brew_prefix()
+
+        assert result == '/opt/homebrew'
+
+    def test_get_brew_prefix_intel_fallback(self):
+        """_get_brew_prefix uses /usr/local on Intel macs."""
+        with patch('platform.system', return_value='Darwin'), \
+             patch('platform.machine', return_value='x86_64'):
+            instance = fumitm.FumitmPython(
+                mode='status', provider='warp'
+            )
+
+        with patch('subprocess.run') as mock_run, \
+             patch('platform.machine', return_value='x86_64'):
+            mock_run.side_effect = OSError("not found")
+            result = instance._get_brew_prefix()
+
+        assert result == '/usr/local'
+
+    def test_check_status_brew_prefix_fallback(self, tmp_path):
+        """check_brew_cacerts_status uses fallback when brew --prefix fails."""
+        cert_file = tmp_path / "test-cert.pem"
+        cert_file.write_text(mock_data.MOCK_CERTIFICATE)
+
+        with patch('platform.system', return_value='Darwin'), \
+             patch('platform.machine', return_value='arm64'):
+            instance = fumitm.FumitmPython(mode='status')
+
+        def cmd_exists(cmd):
+            return cmd == 'brew'
+
+        with patch.object(instance, 'command_exists', side_effect=cmd_exists), \
+             patch('subprocess.run') as mock_run, \
+             patch('os.path.exists', return_value=True), \
+             patch.object(instance, 'certificate_exists_in_file', return_value=True):
+
+            mock_run.side_effect = [
+                MagicMock(returncode=0),  # brew list
+                MagicMock(returncode=1, stdout=''),  # brew --prefix fails
+            ]
+            result = instance.check_brew_cacerts_status(str(cert_file))
+
+        assert result is False
+
+
 class TestJavaMultiInstallation(FumitmTestCase):
     """Tests for multi-Java installation detection and configuration."""
 
@@ -633,10 +925,11 @@ class TestStatusFunctionContracts(FumitmTestCase):
         status_methods = self.get_all_status_methods(instance)
 
         # Verify we found the expected methods (sanity check)
-        assert len(status_methods) >= 10, f"Expected at least 10 status methods, found {len(status_methods)}: {status_methods}"
+        assert len(status_methods) >= 11, f"Expected at least 11 status methods, found {len(status_methods)}: {status_methods}"
 
         # Expected methods based on the codebase
         expected_methods = [
+            'check_brew_cacerts_status',
             'check_git_status', 'check_node_status', 'check_python_status',
             'check_gcloud_status', 'check_java_status', 'check_jenv_status',
             'check_gradle_status', 'check_dbeaver_status', 'check_wget_status',
