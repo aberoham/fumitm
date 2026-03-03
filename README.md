@@ -142,6 +142,18 @@ If the cert cannot be pulled automatically from inside the container, use one of
 ./fumitm.py --fix --manual-cert --skip-verify
 ```
 
+## Headless / MDM Deployment
+
+fumitm supports JAMF Pro, Ansible, Puppet, and similar headless orchestration tools with `--headless`, `--run-as-user`, structured logging, and machine-parseable exit codes. See **[README-automation.md](README-automation.md)** for full details including wrapper scripts, Ansible playbooks, and Puppet manifests.
+
+Quick example (JAMF):
+
+```bash
+/usr/bin/python3 /path/to/fumitm.py --fix --yes --headless --provider netskope --run-as-user "$3" --log-dir /var/log/fumitm
+```
+
+For a pre-login/loginwindow-safe wrapper with `$3` guards, see [README-automation.md](README-automation.md#jamf-pro).
+
 ## Troubleshooting
 
 If you encounter issues:
