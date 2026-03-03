@@ -117,15 +117,15 @@ class TestToolSetup(FumitmTestCase):
             .with_subprocess_response(stdout=mock_data.NPM_CONFIG_CAFILE_NULL)  # npm config get
             .with_subprocess_response(returncode=0)  # npm config set
             .build())
-        
+
         with mock_fumitm_environment(mock_config) as mocks:
-            # Mock input to auto-answer 'Y' and Path.touch
             with patch('builtins.input', return_value='Y'), \
+                 patch('sys.stdin') as mock_stdin, \
                  patch('pathlib.Path.touch'):
+                mock_stdin.isatty.return_value = True
                 instance = self.create_fumitm_instance(mode='install')
                 instance.setup_node_cert()
-            
-            # Should check npm config
+
             assert_subprocess_called_with(mocks['subprocess'], ['npm', 'config', 'get', 'cafile'])
     
     def test_python_requests_setup(self):
@@ -623,6 +623,13 @@ class TestJavaMultiInstallation(FumitmTestCase):
 class TestCLIAndWorkflow(FumitmTestCase):
     """Tests for CLI argument parsing and complete workflows."""
     
+    # Default kwargs for new headless/MDM flags, used by CLI constructor tests
+    _DEFAULT_NEW_KWARGS = dict(
+        no_color=False, headless=False, skip_update_check=False,
+        log_file=None, log_dir=None, json_log_file=None, json_log_dir=None,
+        run_as_user=None,
+    )
+
     @patch('fumitm.sys.argv', ['fumitm.py', '--fix'])
     def test_cli_fix_mode(self):
         """Test --fix argument sets install mode."""
@@ -630,14 +637,14 @@ class TestCLIAndWorkflow(FumitmTestCase):
             mock_instance = MagicMock()
             mock_instance.main.return_value = 0
             mock_class.return_value = mock_instance
-            
+
             with patch('fumitm.sys.exit'):
                 fumitm.main()
-            
+
             mock_class.assert_called_with(
                 mode='install', debug=False, selected_tools=[],
                 cert_file=None, manual_cert=False, skip_verify=False,
-                provider=None, auto_yes=False
+                provider=None, auto_yes=False, **self._DEFAULT_NEW_KWARGS
             )
 
     @patch('fumitm.sys.argv', ['fumitm.py', '--tools', 'node,python'])
@@ -656,9 +663,9 @@ class TestCLIAndWorkflow(FumitmTestCase):
                 debug=False,
                 selected_tools=['node', 'python'],
                 cert_file=None, manual_cert=False, skip_verify=False,
-                provider=None, auto_yes=False
+                provider=None, auto_yes=False, **self._DEFAULT_NEW_KWARGS
             )
-    
+
     @patch('fumitm.sys.argv', ['fumitm.py', '--fix', '--yes'])
     def test_cli_yes_flag(self):
         """Test --yes flag passes auto_yes=True."""
@@ -673,7 +680,7 @@ class TestCLIAndWorkflow(FumitmTestCase):
             mock_class.assert_called_with(
                 mode='install', debug=False, selected_tools=[],
                 cert_file=None, manual_cert=False, skip_verify=False,
-                provider=None, auto_yes=True
+                provider=None, auto_yes=True, **self._DEFAULT_NEW_KWARGS
             )
 
     def test_prompt_returns_y_without_stdin_when_auto_yes(self):
@@ -688,8 +695,10 @@ class TestCLIAndWorkflow(FumitmTestCase):
         """Without --yes, _prompt delegates to input() which needs stdin."""
         instance = self.create_fumitm_instance()
         instance.auto_yes = False
-        with pytest.raises(EOFError):
-            instance._prompt("Do you want to proceed? (Y/n) ")
+        with patch('sys.stdin') as mock_stdin:
+            mock_stdin.isatty.return_value = True
+            with pytest.raises(EOFError):
+                instance._prompt("Do you want to proceed? (Y/n) ")
 
     def test_complete_status_workflow(self):
         """Test complete status check workflow with multiple tools."""
@@ -1528,19 +1537,22 @@ class TestCodeQuality:
         with open(fumitm_path, 'r') as f:
             lines = f.readlines()
 
-        in_safe_makedirs = False
+        # Methods that legitimately use raw os.makedirs (log dirs are system
+        # paths like /var/log/fumitm that should stay root-owned)
+        allowed_methods = {'_safe_makedirs', '_open_log_files'}
+        in_allowed = False
         violations = []
 
         for i, line in enumerate(lines, 1):
             stripped = line.strip()
 
-            # Track when we're inside _safe_makedirs
-            if 'def _safe_makedirs' in line:
-                in_safe_makedirs = True
-            elif in_safe_makedirs and re.match(r'^\s{4}def ', line):
-                in_safe_makedirs = False
+            # Track when we're inside an allowed method
+            if any(f'def {m}' in line for m in allowed_methods):
+                in_allowed = True
+            elif in_allowed and re.match(r'^\s{4}def ', line):
+                in_allowed = False
 
-            if in_safe_makedirs:
+            if in_allowed:
                 continue
 
             if 'os.makedirs(' in stripped:

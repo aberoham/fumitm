@@ -38,6 +38,17 @@ fumitm (Fix Up My Interception of TLS, Man) is a Python script that automaticall
 ./fumitm.py --tools node --tools python  # Check Node.js and Python only
 ./fumitm.py --fix --tools node-npm,gcloud  # Fix Node.js/npm and gcloud only
 ./fumitm.py --fix --tools java,db  # Fix Java and database tools using tags
+
+# Headless/MDM mode (JAMF, Ansible, Puppet)
+./fumitm.py --fix --yes --headless --provider netskope
+./fumitm.py --fix --yes --headless --run-as-user $USER --log-dir /var/log/fumitm
+
+# Disable colors (also respects NO_COLOR=1 env var)
+./fumitm.py --no-color
+
+# Log to file or directory
+./fumitm.py --log-file /tmp/fumitm.log
+./fumitm.py --log-dir /var/log/fumitm --json-log-dir /var/log/fumitm
 ```
 
 ### Testing
@@ -47,7 +58,7 @@ The project has a pytest-based test suite in `test_suite/`:
 ```bash
 # Run all tests
 cd test_suite
-uvx pytest test_fumitm_integration.py test_netskope_provider.py test_suspicious_bundles.py -v
+uvx pytest test_fumitm_integration.py test_netskope_provider.py test_suspicious_bundles.py test_headless_mdm.py -v
 
 # Run specific test files or classes
 uvx pytest test_fumitm_integration.py::TestStatusFunctionContracts -v
@@ -81,6 +92,19 @@ Key test categories in `test_netskope_provider.py`:
 - **TestProviderCLI**: `--provider` argument parsing
 - **TestCheckProviderConnection**: Provider-specific connection status checking
 
+Key test categories in `test_headless_mdm.py`:
+- **TestColorControl**: No color when `--no-color`, `NO_COLOR` env, `--headless`, non-TTY stdout
+- **TestHeadlessFlag**: `--headless` disables color and update check, does NOT imply `--yes`
+- **TestNonInteractiveError**: Non-TTY without `--yes` raises `NonInteractiveError`, exit code 2
+- **TestLogFile**: `--log-file` and `--log-dir` text logging with timestamps and symlinks
+- **TestJsonLogFile**: JSON-lines logging with schema validation
+- **TestToolResultWrapper**: `_run_setup()` wraps legacy functions, error counting, exception handling
+- **TestChangesmadeAccuracy**: `changes_made` is null/true/false based on ToolResult statuses
+- **TestExitCodes**: 0 success, 1 hard failure, 2 non-interactive, 3 partial, 130 interrupted
+- **TestRunAsUser**: `--run-as-user` user targeting, auto detection, root requirement
+- **TestUserScopeGating**: User-scoped tools skipped without user context
+- **TestSudoHelperUpdates**: Updated sudo helpers use `_target_uid`
+
 ## Architecture Overview
 
 The script follows a modular architecture with these key components:
@@ -110,12 +134,15 @@ The script follows a modular architecture with these key components:
    - `certificate_exists_in_file()`: Checks if certificate already exists in bundle files (uses pure-Python string matching for O(1) performance)
    - `verify_connection()`: Tests if tools can connect through the proxy (supports node, python, curl, wget, gcloud)
 
-6. **Ownership Protection** (sudo safety):
-   - `_is_running_as_sudo()` / `_get_real_user_ids()`: Detect sudo vs. real root login
-   - `_fix_ownership(path)`: Chowns home-directory files back to the real user when running under sudo; system paths are left untouched
+6. **Ownership Protection and User Targeting** (sudo/JAMF/Ansible safety):
+   - `_apply_target_user(username)`: Resolves username via `pwd.getpwnam()`, sets `_target_uid`/`_target_gid`, corrects `$HOME`. Supports `'auto'` for macOS console-user detection via `/dev/console` ownership.
+   - `_detect_console_user()`: Static method that reads `/dev/console` ownership on macOS to find the GUI-session user.
+   - `_is_running_as_sudo()` / `_get_real_user_ids()`: Detect sudo or `--run-as-user` context. Priority: `_target_uid` > `SUDO_UID` > current UID.
+   - `_has_user_context()`: Returns True when a target user is resolved for user-scoped operations.
+   - `_fix_ownership(path)`: Chowns home-directory files back to the real user; system paths are left untouched
    - `_safe_makedirs(path)`: Wraps `os.makedirs()` and chowns newly created directories; all setup functions use this instead of raw `os.makedirs()`
    - `check_ownership_sanity()`: Called early in `main()` — warns non-root users about root-owned files and proactively fixes ownership when running as sudo
-   - `$HOME` correction in `__init__`: On Linux, sudo may set `$HOME` to `/root`; the constructor detects this and repoints to the real user's home before any `expanduser` calls
+   - User resolution priority: `--run-as-user` > `--run-as-user auto` > `SUDO_USER` > root-without-context (warn, system-only) > current user
 
 7. **Status Checking**:
    - `check_all_status()`: Comprehensive status report of all configurations
@@ -126,6 +153,23 @@ The script follows a modular architecture with these key components:
    - `check_for_updates()`: Compares local file hash against GitHub main branch
    - Uses unverified SSL context (since WARP certificate trust might not be configured yet)
    - Warns users to update before running `--fix` if a newer version is available
+   - Skipped when `--headless` or `--skip-update-check` is active
+
+9. **Output Infrastructure** (headless/MDM support):
+   - `_emit(message, level, ...)`: Central output method. All `print_*` methods route through it. Handles color stripping, text log writing, and JSON-lines event emission.
+   - `_strip_ansi(text)`: Static method to remove ANSI escape codes.
+   - `_open_log_files()` / `_close_log_files()`: Manage log file handles. File mode overwrites; directory mode generates timestamped filenames with `fumitm-latest.*` symlinks.
+   - Color resolution: `--no-color` > `NO_COLOR` env > `--headless` > `sys.stdout.isatty()`
+   - `NonInteractiveError`: Raised when `_prompt()` needs stdin but it's not a TTY. Caught in `main()` as exit code 2.
+   - `--headless`: Composite flag that disables color and skips update check. Does NOT imply `--yes`.
+
+10. **Idempotency and Exit Codes**:
+    - `ToolResult`: Named tuple with `(tool, status, message)`. Statuses: `configured`, `already_ok`, `completed`, `skipped`, `failed`.
+    - `_run_setup(tool_key, func)`: Wraps setup functions with error-counting side-channel via `print_error()`. Legacy functions that don't return `ToolResult` get `completed` or `failed` inferred.
+    - `_print_summary(results)`: Prints human-readable summary and `FUMITM_RESULT:` JSON line for Ansible `changed_when`.
+    - `_compute_changes_made(results)`: Returns `true` if any `configured`, `false` if all `already_ok`, `null` if only legacy `completed`.
+    - Exit codes: 0 (success), 1 (hard failure), 2 (non-interactive input needed), 3 (partial success), 130 (interrupted).
+    - Tool scope: each `tools_registry` entry has a `'scope'` key (`'system'`, `'user'`, `'hybrid'`). User-scoped tools are skipped when running as root without `--run-as-user`.
 
 ## Key Implementation Details
 

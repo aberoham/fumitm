@@ -193,7 +193,11 @@ class FumitmTestCase:
     """Base class providing common test functionality."""
 
     @staticmethod
-    def create_fumitm_instance(mode='status', debug=False, selected_tools=None, provider='warp'):
+    def create_fumitm_instance(mode='status', debug=False,
+                               selected_tools=None, provider='warp',
+                               auto_yes=False, no_color=False,
+                               headless=False, skip_update_check=False,
+                               run_as_user=None, **kwargs):
         """Create a FumitmPython instance with proper mocking.
 
         Defaults to provider='warp' to skip auto-detection, which would
@@ -205,7 +209,13 @@ class FumitmTestCase:
                 mode=mode,
                 debug=debug,
                 selected_tools=selected_tools or [],
-                provider=provider
+                provider=provider,
+                auto_yes=auto_yes,
+                no_color=no_color,
+                headless=headless,
+                skip_update_check=skip_update_check,
+                run_as_user=run_as_user,
+                **kwargs,
             )
 
 

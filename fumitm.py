@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import re
 import sys
 import subprocess
 import tempfile
@@ -15,8 +16,9 @@ import pwd
 import socket
 import urllib.request
 import urllib.error
+from collections import namedtuple
+from datetime import datetime, timezone
 from pathlib import Path
-from datetime import datetime
 
 # Version and metadata
 __description__ = "MITM Proxy Certificate Fixer Upper for macOS and Linux"
@@ -182,8 +184,27 @@ PROVIDERS = {
     },
 }
 
+class NonInteractiveError(Exception):
+    """Raised when interactive input is needed but stdin is not a terminal."""
+
+
+# Status values:
+#   'configured'  - changed (explicit ToolResult return only)
+#   'already_ok'  - no change needed (explicit ToolResult return only)
+#   'completed'   - ran without errors, change status unknown (legacy wrapper)
+#   'skipped'     - tool not installed or no user context
+#   'failed'      - errors occurred
+ToolResult = namedtuple('ToolResult', ['tool', 'status', 'message'])
+
+
 class FumitmPython:
-    def __init__(self, mode='status', debug=False, selected_tools=None, cert_file=None, manual_cert=False, skip_verify=False, provider=None, auto_yes=False):
+    def __init__(self, mode='status', debug=False, selected_tools=None,
+                 cert_file=None, manual_cert=False, skip_verify=False,
+                 provider=None, auto_yes=False, no_color=False,
+                 headless=False, skip_update_check=False,
+                 log_file=None, log_dir=None,
+                 json_log_file=None, json_log_dir=None,
+                 run_as_user=None):
         self.mode = mode
         self.debug = debug
         self.shell_modified = False
@@ -193,18 +214,50 @@ class FumitmPython:
         self.manual_cert = manual_cert
         self.skip_verify = skip_verify
         self.auto_yes = auto_yes
+        self.headless = headless
+        self.skip_update_check = skip_update_check
 
-        # When running under sudo on Linux, $HOME may resolve to /root instead
-        # of the real user's home directory. Correct it before any expanduser calls
-        # so that certificate and bundle paths land in the right place.
-        sudo_user = os.environ.get('SUDO_USER')
-        if os.getuid() == 0 and sudo_user:
-            try:
-                real_home = pwd.getpwnam(sudo_user).pw_dir
-                if os.path.expanduser('~') != real_home:
-                    os.environ['HOME'] = real_home
-            except KeyError:
-                pass
+        # Color resolution: explicit flag > NO_COLOR env > headless > TTY
+        if no_color or os.environ.get('NO_COLOR') is not None or headless:
+            self._use_color = False
+        else:
+            self._use_color = sys.stdout.isatty()
+
+        # Log file handles (opened lazily in _open_log_files, closed in
+        # _close_log_files). Directory mode generates timestamped filenames
+        # and maintains a "latest" symlink.
+        self._log_file_handle = None
+        self._json_log_file_handle = None
+        self._log_file_path = log_file
+        self._log_dir = log_dir
+        self._json_log_file_path = json_log_file
+        self._json_log_dir = json_log_dir
+
+        # Error-counting side-channel for _run_setup()
+        self._in_setup_context = False
+        self._setup_error_count = 0
+
+        # User targeting for JAMF/Ansible/Puppet (Phase 2)
+        self._target_uid = None
+        self._target_gid = None
+        self._run_as_user = run_as_user
+
+        # Apply user targeting before any expanduser calls
+        if run_as_user:
+            self._apply_target_user(run_as_user)
+        elif os.getuid() == 0:
+            # When running under sudo on Linux, $HOME may resolve to /root
+            # instead of the real user's home directory. Correct it before any
+            # expanduser calls so paths land in the right place.
+            sudo_user = os.environ.get('SUDO_USER')
+            if sudo_user:
+                self._apply_target_user(sudo_user)
+            else:
+                # Root without any user context (e.g., JAMF launchd)
+                self.print_warn(
+                    "Running as root without --run-as-user. "
+                    "User-scoped tool configs will be skipped."
+                )
 
         # Resolve which MITM proxy provider to use. When provider is None,
         # auto-detection checks WARP first, then Netskope.
@@ -212,113 +265,130 @@ class FumitmPython:
         self.cert_path = os.path.expanduser(self.provider['cert_path'])
         self.bundle_dir = os.path.expanduser(self.provider['bundle_dir'])
 
-        # Define tool registry with tags and descriptions
+        # Define tool registry with tags, descriptions, and scope. Scope
+        # determines what runs without user context when root runs without
+        # --run-as-user: 'system' tools run always, 'user' tools need $HOME.
         self.tools_registry = {
             'brew-cacerts': {
                 'name': 'Homebrew CA Certificates',
                 'tags': ['brew', 'homebrew', 'ca-certificates', 'cacerts'],
                 'setup_func': self.setup_brew_cacerts,
                 'check_func': self.check_brew_cacerts_status,
-                'description': 'Homebrew ca-certificates bundle (covers all Homebrew OpenSSL tools)'
+                'description': 'Homebrew ca-certificates bundle (covers all Homebrew OpenSSL tools)',
+                'scope': 'system',
             },
             'node': {
                 'name': 'Node.js',
                 'tags': ['node', 'nodejs', 'node-npm', 'javascript', 'js'],
                 'setup_func': self.setup_node_cert,
                 'check_func': self.check_node_status,
-                'description': 'Node.js runtime and npm package manager'
+                'description': 'Node.js runtime and npm package manager',
+                'scope': 'user',
             },
             'python': {
                 'name': 'Python',
                 'tags': ['python', 'python3', 'pip', 'requests'],
                 'setup_func': self.setup_python_cert,
                 'check_func': self.check_python_status,
-                'description': 'Python runtime and pip package manager'
+                'description': 'Python runtime and pip package manager',
+                'scope': 'user',
             },
             'gcloud': {
                 'name': 'Google Cloud SDK',
                 'tags': ['gcloud', 'google-cloud', 'gcp'],
                 'setup_func': self.setup_gcloud_cert,
                 'check_func': self.check_gcloud_status,
-                'description': 'Google Cloud SDK (gcloud CLI)'
+                'description': 'Google Cloud SDK (gcloud CLI)',
+                'scope': 'user',
             },
             'java': {
                 'name': 'Java/JVM',
                 'tags': ['java', 'jvm', 'keytool', 'jdk'],
                 'setup_func': self.setup_java_cert,
                 'check_func': self.check_java_status,
-                'description': 'Java runtime and development kit'
+                'description': 'Java runtime and development kit',
+                'scope': 'user',
             },
             'jenv': {
                 'name': 'jenv (Java Environment Manager)',
                 'tags': ['jenv', 'java', 'jvm', 'jdk'],
                 'setup_func': self.setup_jenv_cert,
                 'check_func': self.check_jenv_status,
-                'description': 'jenv-managed Java installations'
+                'description': 'jenv-managed Java installations',
+                'scope': 'user',
             },
             'gradle': {
                 'name': 'Gradle',
                 'tags': ['gradle'],
                 'setup_func': self.setup_gradle_cert,
                 'check_func': self.check_gradle_status,
-                'description': 'Gradle build tool'
+                'description': 'Gradle build tool',
+                'scope': 'user',
             },
             'dbeaver': {
                 'name': 'DBeaver',
                 'tags': ['dbeaver', 'database', 'db'],
                 'setup_func': self.setup_dbeaver_cert,
                 'check_func': self.check_dbeaver_status,
-                'description': 'DBeaver database client'
+                'description': 'DBeaver database client',
+                'scope': 'user',
             },
             'wget': {
                 'name': 'wget',
                 'tags': ['wget', 'download'],
                 'setup_func': self.setup_wget_cert,
                 'check_func': self.check_wget_status,
-                'description': 'wget download utility'
+                'description': 'wget download utility',
+                'scope': 'user',
             },
             'podman': {
                 'name': 'Podman',
                 'tags': ['podman', 'container', 'docker-alternative'],
                 'setup_func': self.setup_podman_cert,
                 'check_func': self.check_podman_status,
-                'description': 'Podman container runtime'
+                'description': 'Podman container runtime',
+                'scope': 'hybrid',
             },
             'rancher': {
                 'name': 'Rancher Desktop',
                 'tags': ['rancher', 'rancher-desktop', 'kubernetes', 'k8s'],
                 'setup_func': self.setup_rancher_cert,
                 'check_func': self.check_rancher_status,
-                'description': 'Rancher Desktop Kubernetes'
+                'description': 'Rancher Desktop Kubernetes',
+                'scope': 'hybrid',
             },
             'android': {
                 'name': 'Android Emulator',
                 'tags': ['android', 'emulator', 'adb'],
                 'setup_func': self.setup_android_emulator_cert,
                 'check_func': self.check_android_status,
-                'description': 'Android SDK emulator'
+                'description': 'Android SDK emulator',
+                'scope': 'user',
             },
             'colima': {
                 'name': 'Colima',
                 'tags': ['colima', 'docker', 'docker-desktop', 'container', 'vm'],
                 'setup_func': self.setup_colima_cert,
                 'check_func': self.check_colima_status,
-                'description': 'Colima Docker runtime'
+                'description': 'Colima Docker runtime',
+                'scope': 'hybrid',
             },
             'git': {
                 'name': 'Git',
                 'tags': ['git'],
                 'setup_func': self.setup_git_cert,
                 'check_func': self.check_git_status,
-                'description': 'Git version control'
+                'description': 'Git version control',
+                'scope': 'user',
             },
             'curl': {
                 'name': 'curl',
                 'tags': ['curl', 'http'],
                 'setup_func': self.setup_curl_cert,
                 'check_func': self.check_curl_status,
-                'description': 'curl HTTP client'
-            }
+                'description': 'curl HTTP client',
+                'scope': 'user',
+            },
         }
         
         # Add platform check
@@ -468,31 +538,162 @@ class FumitmPython:
         
         return invalid_tools
     
-    # Printing functions
-    def print_info(self, msg):
-        print(f"{GREEN}[INFO]{NC} {msg}")
-    
-    def print_warn(self, msg):
-        print(f"{YELLOW}[WARN]{NC} {msg}")
-    
-    def print_error(self, msg):
-        print(f"{RED}[ERROR]{NC} {msg}")
-    
-    def print_status(self, msg):
-        print(f"{BLUE}[STATUS]{NC} {msg}")
-    
-    def print_action(self, msg):
-        print(f"{YELLOW}[ACTION]{NC} {msg}")
-    
-    def print_debug(self, msg):
+    # Output infrastructure
+
+    @staticmethod
+    def _strip_ansi(text):
+        """Remove ANSI escape sequences from text."""
+        return re.sub(r'\033\[[0-9;]*m', '', text)
+
+    def _open_log_files(self):
+        """Open log file handles for text and JSON logging.
+
+        File mode (--log-file / --json-log-file): writes to the exact path,
+        overwriting each run.
+
+        Directory mode (--log-dir / --json-log-dir): generates timestamped
+        filenames and maintains a 'fumitm-latest' symlink to the most recent.
+        """
+        ts = datetime.now().strftime('%Y%m%d-%H%M%S')
+        pid = os.getpid()
+
+        if self._log_dir:
+            os.makedirs(self._log_dir, exist_ok=True)
+            path = os.path.join(self._log_dir, f"fumitm-{ts}-{pid}.log")
+            self._log_file_handle = open(path, 'w')
+            symlink = os.path.join(self._log_dir, 'fumitm-latest.log')
+            self._update_symlink(symlink, path)
+        elif self._log_file_path:
+            parent = os.path.dirname(self._log_file_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            self._log_file_handle = open(self._log_file_path, 'w')
+
+        if self._json_log_dir:
+            os.makedirs(self._json_log_dir, exist_ok=True)
+            path = os.path.join(self._json_log_dir, f"fumitm-{ts}-{pid}.jsonl")
+            self._json_log_file_handle = open(path, 'w')
+            symlink = os.path.join(self._json_log_dir, 'fumitm-latest.jsonl')
+            self._update_symlink(symlink, path)
+        elif self._json_log_file_path:
+            parent = os.path.dirname(self._json_log_file_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            self._json_log_file_handle = open(self._json_log_file_path, 'w')
+
+    @staticmethod
+    def _update_symlink(symlink_path, target_path):
+        """Atomically update a symlink to point at target_path."""
+        tmp = symlink_path + '.tmp'
+        try:
+            os.symlink(os.path.basename(target_path), tmp)
+            os.replace(tmp, symlink_path)
+        except OSError:
+            # Best-effort: non-fatal if symlink creation fails
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    def _close_log_files(self):
+        """Close any open log file handles."""
+        for handle in (self._log_file_handle, self._json_log_file_handle):
+            if handle:
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+        self._log_file_handle = None
+        self._json_log_file_handle = None
+
+    def _emit(self, message, level='info', file=None, phase=None,
+              tool=None, action=None, result=None, error_code=None):
+        """Central output method. All print_* methods route through here.
+
+        Handles color stripping for non-TTY/--no-color, text log writing,
+        and JSON-lines event emission.
+
+        Args:
+            message: The formatted message (may contain ANSI codes).
+            level: Log level (info, warn, error, debug).
+            file: Output file object (default: stdout, debug uses stderr).
+            phase: JSON log phase (init, detect, cert, tool, verify, summary).
+            tool: Tool key from tools_registry for JSON log.
+            action: What was attempted for JSON log.
+            result: Result status for JSON log (ok, changed, skipped, failed).
+            error_code: Optional error identifier for JSON log.
+        """
+        output_file = file or sys.stdout
+
+        # Console output: strip ANSI if color is disabled
+        if self._use_color:
+            print(message, file=output_file)
+        else:
+            print(self._strip_ansi(message), file=output_file)
+
+        # Text log: always strip ANSI, add timestamp
+        if self._log_file_handle:
+            ts = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+            plain = self._strip_ansi(message)
+            self._log_file_handle.write(
+                f"{ts} [{level.upper()}] {plain}\n"
+            )
+            self._log_file_handle.flush()
+
+        # JSON-lines log
+        if self._json_log_file_handle:
+            event = {
+                'ts': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'level': level,
+                'phase': phase,
+                'tool': tool,
+                'action': action,
+                'result': result,
+                'message': self._strip_ansi(message),
+                'error_code': error_code,
+            }
+            self._json_log_file_handle.write(json.dumps(event) + '\n')
+            self._json_log_file_handle.flush()
+
+    def print_info(self, msg, **kwargs):
+        self._emit(f"{GREEN}[INFO]{NC} {msg}", level='info', **kwargs)
+
+    def print_warn(self, msg, **kwargs):
+        self._emit(f"{YELLOW}[WARN]{NC} {msg}", level='warn', **kwargs)
+
+    def print_error(self, msg, **kwargs):
+        if self._in_setup_context:
+            self._setup_error_count += 1
+        self._emit(f"{RED}[ERROR]{NC} {msg}", level='error', **kwargs)
+
+    def print_status(self, msg, **kwargs):
+        self._emit(f"{BLUE}[STATUS]{NC} {msg}", level='info', **kwargs)
+
+    def print_action(self, msg, **kwargs):
+        self._emit(f"{YELLOW}[ACTION]{NC} {msg}", level='info', **kwargs)
+
+    def print_debug(self, msg, **kwargs):
         if self.is_debug_mode():
-            print(f"{BLUE}[DEBUG]{NC} {msg}", file=sys.stderr)
+            self._emit(
+                f"{BLUE}[DEBUG]{NC} {msg}",
+                level='debug', file=sys.stderr, **kwargs
+            )
 
     def _prompt(self, message):
-        """Prompt the user for input, or return 'y' when --yes is active."""
+        """Prompt the user for input, or return 'y' when --yes is active.
+
+        Raises NonInteractiveError when stdin is not a terminal and --yes
+        was not provided, preventing indefinite hangs under JAMF/Ansible.
+        """
         if self.auto_yes:
-            print(f"{message}y (--yes)")
+            self._emit(f"{message}y (--yes)", level='info')
             return 'y'
+        if not sys.stdin.isatty():
+            raise NonInteractiveError(
+                "Interactive input required but stdin is not a terminal. "
+                "Use --yes for non-interactive runs, or --headless --yes "
+                "for MDM deployments."
+            )
         return input(message)
 
     def check_for_updates(self):
@@ -509,8 +710,6 @@ class FumitmPython:
         Returns:
             bool: True if an update is available, False otherwise
         """
-        import re
-
         try:
             # Use unverified SSL context - WARP might not be configured yet
             context = ssl._create_unverified_context()
@@ -601,14 +800,73 @@ class FumitmPython:
         filename = os.path.basename(original_path)
         return os.path.join(self.bundle_dir, purpose, filename)
 
+    def _apply_target_user(self, username):
+        """Resolve a username and set HOME so all expanduser calls target it.
+
+        Sets _target_uid and _target_gid for ownership correction. When
+        username is 'auto', attempts to detect the console user on macOS.
+
+        Args:
+            username: System username or 'auto' for console-user detection.
+        """
+        if username == 'auto':
+            detected = self._detect_console_user()
+            if not detected:
+                self.print_error(
+                    "Cannot detect console user. "
+                    "Specify --run-as-user USERNAME."
+                )
+                sys.exit(1)
+            username = detected
+
+        try:
+            pw = pwd.getpwnam(username)
+        except KeyError:
+            self.print_error(f"User '{username}' not found.")
+            sys.exit(1)
+
+        self._target_uid = pw.pw_uid
+        self._target_gid = pw.pw_gid
+        os.environ['HOME'] = pw.pw_dir
+
+    @staticmethod
+    def _detect_console_user():
+        """Detect the GUI-session user on macOS via /dev/console ownership.
+
+        Returns the username or None if detection fails (Linux, no user
+        logged in, or /dev/console inaccessible).
+        """
+        if platform.system() != 'Darwin':
+            return None
+        try:
+            st = os.stat('/dev/console')
+            pw = pwd.getpwuid(st.st_uid)
+            if pw.pw_name in ('root', '_windowserver'):
+                return None
+            return pw.pw_name
+        except (OSError, KeyError):
+            return None
+
     def _is_running_as_sudo(self):
-        """True when the process is root via sudo, not actual root login."""
+        """True when root is acting on behalf of a non-root user.
+
+        Covers both traditional sudo (SUDO_UID set) and --run-as-user
+        (JAMF/Ansible context where _target_uid is set explicitly).
+        """
+        if self._target_uid is not None and self._target_uid != 0:
+            return True
         return os.getuid() == 0 and 'SUDO_UID' in os.environ
 
     def _get_real_user_ids(self):
-        """Return (uid, gid) of the real user, even when running under sudo."""
-        if self._is_running_as_sudo():
-            return (int(os.environ['SUDO_UID']), int(os.environ['SUDO_GID']))
+        """Return (uid, gid) of the real user, even when running under sudo.
+
+        Priority: explicit _target_uid > SUDO_UID > current process UID.
+        """
+        if self._target_uid is not None:
+            return (self._target_uid, self._target_gid)
+        if os.getuid() == 0 and 'SUDO_UID' in os.environ:
+            return (int(os.environ['SUDO_UID']),
+                    int(os.environ['SUDO_GID']))
         return (os.getuid(), os.getgid())
 
     def _fix_ownership(self, path):
@@ -644,15 +902,26 @@ class FumitmPython:
         for d in to_create:
             self._fix_ownership(d)
 
+    def _has_user_context(self):
+        """True when a target user is resolved for user-scoped operations.
+
+        Returns False only when running as real root without --run-as-user
+        and without SUDO_USER, meaning there's no user home to write to.
+        """
+        if os.getuid() != 0:
+            return True
+        return self._target_uid is not None
+
     def detect_shell(self):
         """Detect the user's default shell with multiple fallbacks."""
         # Try environment variable first (current session)
         shell_path = os.environ.get('SHELL')
-        
-        # Fallback to pwd module (system configured default)
+
+        # Fallback to pwd module — use target user when running as root
         if not shell_path:
             try:
-                shell_path = pwd.getpwuid(os.getuid()).pw_shell
+                lookup_uid = self._target_uid if self._target_uid is not None else os.getuid()
+                shell_path = pwd.getpwuid(lookup_uid).pw_shell
             except Exception:
                 shell_path = None
         
@@ -719,7 +988,6 @@ class FumitmPython:
         # Special handling for JAVA_OPTS which may contain -Djavax.net.ssl.trustStore=...
         java_opts = os.environ.get('JAVA_OPTS', '')
         if java_opts:
-            import re
             match = re.search(r'-Djavax\.net\.ssl\.trustStore=([^\s]+)', java_opts)
             if match:
                 truststore_path = match.group(1)
@@ -4561,19 +4829,137 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         if temp_warp_cert:
             os.unlink(temp_warp_cert)
     
+    def _run_setup(self, tool_key, func):
+        """Run a setup function and infer its result.
+
+        Uses an error-counting side-channel: print_error() increments
+        _setup_error_count during execution. This lets us detect failures
+        without changing setup function signatures.
+
+        Status accuracy before individual ToolResult retrofit:
+        - 'failed' is reliable (print_error was called or exception raised)
+        - 'completed' means "ran without errors" (could be changed or already_ok)
+        - 'configured' and 'already_ok' require explicit ToolResult returns
+        """
+        self._in_setup_context = True
+        self._setup_error_count = 0
+        try:
+            ret = func()
+            if isinstance(ret, ToolResult):
+                return ret
+            if self._setup_error_count > 0:
+                return ToolResult(tool_key, 'failed', 'Errors during setup')
+            return ToolResult(tool_key, 'completed', 'Ran without errors')
+        except NonInteractiveError:
+            raise
+        except Exception as e:
+            self.print_error(f"{tool_key}: {e}")
+            return ToolResult(tool_key, 'failed', str(e))
+        finally:
+            self._in_setup_context = False
+            self._setup_error_count = 0
+
+    @staticmethod
+    def _compute_changes_made(results):
+        """Determine changes_made from a list of ToolResult values.
+
+        Returns True if any tool returned 'configured', False if all returned
+        'already_ok', or None if only legacy 'completed' statuses exist
+        (change status unknown).
+        """
+        has_configured = any(r.status == 'configured' for r in results)
+        has_already_ok = any(r.status == 'already_ok' for r in results)
+        if has_configured:
+            return True
+        if has_already_ok and not any(r.status == 'completed' for r in results):
+            return False
+        return None
+
+    def _print_summary(self, results):
+        """Print human-readable and machine-parseable summary after install."""
+        counts = {}
+        for r in results:
+            counts[r.status] = counts.get(r.status, 0) + 1
+        configured = counts.get('configured', 0)
+        completed = counts.get('completed', 0)
+        already_ok = counts.get('already_ok', 0)
+        skipped = counts.get('skipped', 0)
+        failed = counts.get('failed', 0)
+
+        parts = []
+        if configured:
+            parts.append(f"{configured} configured")
+        if completed:
+            parts.append(f"{completed} completed")
+        if already_ok:
+            parts.append(f"{already_ok} already OK")
+        if skipped:
+            parts.append(f"{skipped} skipped")
+        if failed:
+            parts.append(f"{failed} failed")
+        summary_text = ', '.join(parts) if parts else 'no tools processed'
+
+        self.print_info(f"Summary: {summary_text}")
+
+        changes_made = self._compute_changes_made(results)
+        succeeded = configured + already_ok + completed
+        if failed > 0 and succeeded == 0:
+            exit_code = 1
+        elif failed > 0:
+            exit_code = 3
+        else:
+            exit_code = 0
+
+        result_obj = {
+            'changes_made': changes_made,
+            'configured': configured,
+            'completed': completed,
+            'already_ok': already_ok,
+            'skipped': skipped,
+            'failed': failed,
+            'exit_code': exit_code,
+        }
+        # Stable machine-parseable line for Ansible changed_when
+        print(f"FUMITM_RESULT: {json.dumps(result_obj)}")
+
+        # JSON-lines summary event
+        if self._json_log_file_handle:
+            event = {
+                'ts': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'level': 'info',
+                'phase': 'summary',
+                'tool': None,
+                'action': None,
+                'result': 'partial' if failed > 0 else 'ok',
+                'message': summary_text,
+                'error_code': None,
+            }
+            self._json_log_file_handle.write(json.dumps(event) + '\n')
+            self._json_log_file_handle.flush()
+
+        return exit_code
+
     def main(self):
-        """Main function."""
+        """Main entry point for the FumitmPython instance."""
+        self._open_log_files()
+        try:
+            return self._main_inner()
+        finally:
+            self._close_log_files()
+
+    def _main_inner(self):
+        """Core logic, separated so main() can wrap it in log-file cleanup."""
         try:
             header = f"{self.provider['name']} Certificate Installation Script (Python)"
             self.print_info(header)
             self.print_info("=" * len(header))
-            
+
             if self.is_debug_mode():
                 self.print_debug(f"Fumitm version: {VERSION_INFO['version']} (commit: {VERSION_INFO['commit']})")
                 self.print_debug(f"Branch: {VERSION_INFO['branch']} | Date: {VERSION_INFO['date']}")
                 if VERSION_INFO['dirty']:
                     self.print_debug("Working directory has uncommitted changes")
-                self.print_debug(f"Script: Python implementation")
+                self.print_debug("Script: Python implementation")
                 self.print_debug(f"Running on: {platform.platform()}")
                 self.print_debug(f"Python version: {sys.version}")
                 self.print_debug(f"Shell: {os.environ.get('SHELL', 'unknown')}")
@@ -4583,13 +4969,16 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 if self._is_running_as_sudo():
                     uid, gid = self._get_real_user_ids()
                     self.print_debug(f"Running as sudo (real user UID={uid}, GID={gid})")
+                if self._run_as_user:
+                    self.print_debug(f"Target user: {self._run_as_user} (UID={self._target_uid})")
                 if not self.is_install_mode():
                     self.print_debug("Status mode: Using fast certificate checks")
                 else:
                     self.print_debug("Install mode: Using thorough certificate checks")
 
-            # Check for updates (uses unverified SSL since WARP might not be configured)
-            self.check_for_updates()
+            # Check for updates (skipped in headless or with --skip-update-check)
+            if not self.skip_update_check:
+                self.check_for_updates()
 
             # Auto-detect devcontainer and adjust behavior
             if self.is_devcontainer():
@@ -4604,7 +4993,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 print()
 
             # Check for broken CA environment variables early
-            # This catches common issues before they cause confusing errors
             self.check_environment_sanity()
 
             # Check for root-owned files that would cause PermissionError
@@ -4617,61 +5005,70 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     self.print_error(f"Invalid tool selection: {', '.join(invalid_tools)}")
                     self.print_info("Use --list-tools to see available tools and their tags")
                     return 1
-                
-                # Show which tools will be processed
+
                 selected_info = self.get_selected_tools_info()
                 if not selected_info:
                     self.print_warn("No tools match your selection")
                     return 1
-            
+
             if not self.is_install_mode():
-                # In status mode, just check current status
                 status_ok = self.check_all_status()
                 if status_ok is False:
                     return 1
             else:
                 self.print_info("Running in FIX mode - changes will be made to your system")
                 print()
-                
-                # Download and verify certificate
+
                 if not self.download_certificate():
                     self.print_error("Failed to download certificate. Exiting.")
                     return 1
-                
-                # Setup for different environments
+
                 if self.selected_tools:
                     self.print_info(f"Processing selected tools: {', '.join(self.get_selected_tools_info())}")
                     print()
-                
+
+                results = []
+                no_user = (os.getuid() == 0 and not self._has_user_context())
                 for tool_key, tool_info in self.tools_registry.items():
-                    if self.should_process_tool(tool_key):
-                        if tool_info.get('setup_func'):
-                            tool_info['setup_func']()
-                
-                # Final message
+                    if not self.should_process_tool(tool_key):
+                        continue
+                    setup_func = tool_info.get('setup_func')
+                    if not setup_func:
+                        continue
+                    # Skip user-scoped tools when running as root without user context
+                    if no_user and tool_info.get('scope') == 'user':
+                        results.append(ToolResult(tool_key, 'skipped', 'No user context'))
+                        self.print_warn(f"Skipping {tool_info['name']} (no user context)")
+                        continue
+                    result = self._run_setup(tool_key, setup_func)
+                    results.append(result)
+
                 print()
-                self.print_info("Installation completed!")
-                
+                exit_code = self._print_summary(results)
+
                 if self.shell_modified:
                     self.print_warn("Shell configuration was modified.")
                     self.print_warn("Please reload your shell configuration:")
-                    
                     shell_type = self.detect_shell()
                     shell_config = self.get_shell_config(shell_type)
-                    
-                    if shell_type in ['bash', 'zsh']:
-                        self.print_info(f"  source {shell_config}")
-                    elif shell_type == 'fish':
+                    if shell_type in ('bash', 'zsh', 'fish'):
                         self.print_info(f"  source {shell_config}")
                     else:
                         self.print_info("  Please restart your shell")
-            
+
+                print()
+                self.print_info(f"Certificate location: {self.cert_path}")
+                self.print_info("For additional applications, please refer to the documentation.")
+                return exit_code
+
             print()
             self.print_info(f"Certificate location: {self.cert_path}")
             self.print_info("For additional applications, please refer to the documentation.")
-            
-            return 0  # Success
-            
+            return 0
+
+        except NonInteractiveError as e:
+            self.print_error(str(e))
+            return 2
         except KeyboardInterrupt:
             print("\nInterrupted by user")
             return 130
@@ -4689,7 +5086,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"Author: {__author__} | Default: status check only (use --fix to make changes)"
     )
-    
+
     parser.add_argument('--fix', action='store_true',
                         help='Actually make changes (default is status check only)')
     parser.add_argument('--tools', '--tool', action='append', dest='tools',
@@ -4712,6 +5109,26 @@ def main():
     parser.add_argument('--version', '-V', action='store_true',
                         help='Show version information and exit')
 
+    # Headless/MDM flags
+    parser.add_argument('--headless', action='store_true',
+                        help='Non-interactive mode: disables color, skips update check. '
+                             'Does NOT imply --yes (consent must be explicit).')
+    parser.add_argument('--no-color', action='store_true',
+                        help='Disable ANSI color output')
+    parser.add_argument('--skip-update-check', action='store_true',
+                        help='Skip checking for updates')
+    parser.add_argument('--log-file', metavar='PATH',
+                        help='Write plain-text log to PATH (overwrites each run)')
+    parser.add_argument('--log-dir', metavar='DIR',
+                        help='Write per-run text logs to DIR with fumitm-latest.log symlink')
+    parser.add_argument('--json-log-file', metavar='PATH',
+                        help='Write JSON-lines event log to PATH (overwrites each run)')
+    parser.add_argument('--json-log-dir', metavar='DIR',
+                        help='Write per-run JSON-lines logs to DIR with fumitm-latest.jsonl symlink')
+    parser.add_argument('--run-as-user', metavar='USERNAME',
+                        help='Configure certs for USERNAME (requires root). '
+                             'Use "auto" to detect console user on macOS.')
+
     args = parser.parse_args()
 
     # Handle --version first
@@ -4725,29 +5142,40 @@ def main():
                 print("  (with local modifications)")
         sys.exit(0)
 
+    # Resolve headless from flag or environment variable
+    headless = args.headless or os.environ.get('FUMITM_HEADLESS') == '1'
+    if headless:
+        args.no_color = True
+        args.skip_update_check = True
+
+    # Respect NO_COLOR environment variable (https://no-color.org/)
+    no_color = args.no_color or os.environ.get('NO_COLOR') is not None
+
+    # Validate --run-as-user requires root
+    if args.run_as_user and os.getuid() != 0:
+        parser.error('--run-as-user requires root privileges')
+
     # Handle --list-tools
     if args.list_tools:
-        # Create a temporary instance just to access the registry
-        temp_fumitm = FumitmPython()
+        temp_fumitm = FumitmPython(no_color=no_color)
         print("Available tools:")
         for tool_key, tool_info in temp_fumitm.tools_registry.items():
             tags_str = ', '.join(tool_info['tags'])
             print(f"  {tool_key:<10} - {tool_info['name']:<20} Tags: {tags_str}")
         print("\nExamples: ./fumitm.py --fix --tools node,python  or  ./fumitm.py --fix --tools node-npm --tools gcp")
         sys.exit(0)
-    
+
     # Process --tools argument
     selected_tools = []
     if args.tools:
         for tool_arg in args.tools:
-            # Split by comma to allow comma-separated lists
-            selected_tools.extend([t.strip() for t in tool_arg.split(',') if t.strip()])
-    
-    # Determine mode
+            selected_tools.extend(
+                [t.strip() for t in tool_arg.split(',') if t.strip()]
+            )
+
     mode = 'install' if args.fix else 'status'
-    
-    # Create and run fumitm instance
-    fumitm = FumitmPython(
+
+    fumitm_instance = FumitmPython(
         mode=mode,
         debug=args.debug,
         selected_tools=selected_tools,
@@ -4755,9 +5183,17 @@ def main():
         manual_cert=args.manual_cert,
         skip_verify=args.skip_verify,
         provider=args.provider,
-        auto_yes=args.yes
+        auto_yes=args.yes,
+        no_color=no_color,
+        headless=headless,
+        skip_update_check=args.skip_update_check,
+        log_file=args.log_file,
+        log_dir=args.log_dir,
+        json_log_file=args.json_log_file,
+        json_log_dir=args.json_log_dir,
+        run_as_user=args.run_as_user,
     )
-    exit_code = fumitm.main()
+    exit_code = fumitm_instance.main()
     sys.exit(exit_code)
 
 

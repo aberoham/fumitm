@@ -142,6 +142,132 @@ If the cert cannot be pulled automatically from inside the container, use one of
 ./fumitm.py --fix --manual-cert --skip-verify
 ```
 
+## Headless / MDM Deployment
+
+fumitm supports JAMF Pro, Ansible, Puppet, and similar headless orchestration tools.
+
+### New Flags
+
+| Flag | Behavior |
+|------|----------|
+| `--headless` | Non-interactive mode: disables color, skips update check. Does NOT imply `--yes`. |
+| `--no-color` | Disable ANSI color output. Also respects `NO_COLOR=1` env var. |
+| `--log-file PATH` | Write plain-text log to exact file (overwrites each run) |
+| `--log-dir DIR` | Write per-run text logs to DIR with `fumitm-latest.log` symlink |
+| `--json-log-file PATH` | Write JSON-lines event log to exact file (overwrites each run) |
+| `--json-log-dir DIR` | Write per-run JSON-lines logs to DIR with `fumitm-latest.jsonl` symlink |
+| `--run-as-user USERNAME` | Configure certs for USERNAME's home directory (requires root). Use `auto` to detect console user on macOS. |
+| `--skip-update-check` | Skip the GitHub update check |
+
+Environment variables: `FUMITM_HEADLESS=1` is equivalent to `--headless`.
+
+### Exit Codes
+
+| Code | Meaning | Use |
+|------|---------|-----|
+| `0` | Success (all configured or already OK) | JAMF: completed. Ansible: check `FUMITM_RESULT:` for `changed_when`. Puppet: converged. |
+| `1` | Hard failure (cert download failed, invalid args, all tools failed) | Retry or investigate. |
+| `2` | Non-interactive input required but unavailable (missing `--yes` or `--cert-file`) | Fix the invocation. |
+| `3` | Partial success (some tools configured, some failed) | Investigate failures; successes are stable. |
+| `130` | Interrupted (Ctrl+C) | Re-run. |
+
+### Machine-Parseable Output
+
+In install mode, fumitm prints a `FUMITM_RESULT:` line with JSON containing `changes_made` (true/false/null), per-status counts, and the exit code. Use this for Ansible `changed_when`.
+
+### JAMF Pro
+
+```bash
+#!/bin/bash
+# JAMF policy script — $3 is the console username
+args=(--fix --yes --headless --provider netskope
+      --log-dir /var/log/fumitm --json-log-dir /var/log/fumitm)
+
+if [ -n "$3" ] && [ "$3" != "loginwindow" ]; then
+    args+=(--run-as-user "$3")
+fi
+
+/usr/bin/python3 /path/to/fumitm.py "${args[@]}"
+```
+
+Without `--run-as-user`, fumitm runs system-scope only (cert download, detection). User-scoped tool configs (Node.js, Python, etc.) are skipped.
+
+Log retention: keep the last 30 log files per host. Add a cleanup policy:
+
+```bash
+#!/bin/bash
+/usr/bin/python3 -c "
+import os, glob
+log_dir = '/var/log/fumitm'
+for ext in ('log', 'jsonl'):
+    files = sorted(glob.glob(os.path.join(log_dir, f'fumitm-*.{ext}')), reverse=True)
+    for f in files[30:]:
+        os.remove(f)
+"
+```
+
+### Ansible
+
+Preferred approach using `become_user`:
+
+```yaml
+- name: Configure MITM proxy certificates
+  command: >
+    /usr/bin/python3 /path/to/fumitm.py
+    --fix --yes --headless --provider netskope
+  become: true
+  become_user: "{{ primary_user }}"
+  register: fumitm_result
+  changed_when: >
+    (fumitm_result.stdout_lines | select('match', '^FUMITM_RESULT:')
+     | first | regex_replace('^FUMITM_RESULT: ', '') | from_json).changes_made != false
+  failed_when: fumitm_result.rc in [1, 2]
+```
+
+Alternative using `--run-as-user`:
+
+```yaml
+- name: Configure MITM proxy certificates
+  command: >
+    /usr/bin/python3 /path/to/fumitm.py
+    --fix --yes --headless
+    --run-as-user {{ primary_user }}
+    --provider netskope
+  register: fumitm_result
+  changed_when: >
+    (fumitm_result.stdout_lines | select('match', '^FUMITM_RESULT:')
+     | first | regex_replace('^FUMITM_RESULT: ', '') | from_json).changes_made != false
+  failed_when: fumitm_result.rc in [1, 2]
+```
+
+`changed_when` uses `!= false` so that `null` (legacy/unknown change status) is treated as changed (conservative).
+
+### Puppet
+
+```puppet
+exec { 'fumitm-fix':
+  command   => '/usr/bin/python3 /path/to/fumitm.py --fix --yes --headless --run-as-user ${user} --provider netskope',
+  unless    => '/usr/bin/python3 /path/to/fumitm.py --headless --run-as-user ${user} --provider netskope',
+  logoutput => on_failure,
+}
+```
+
+`unless` runs status mode — exit 0 means compliant, skip the exec. Puppet retries naturally on exit 1/3.
+
+### Log Retention
+
+For Ansible/Puppet, use standard logrotate:
+
+```
+/var/log/fumitm/*.log /var/log/fumitm/*.jsonl {
+    rotate 30
+    maxsize 5M
+    missingok
+    notifempty
+    compress
+}
+```
+
 ## Troubleshooting
 
 If you encounter issues:

@@ -278,6 +278,13 @@ class TestNetskopeGetCert(FumitmTestCase):
 class TestProviderCLI(FumitmTestCase):
     """Tests for --provider CLI argument."""
 
+    # Default kwargs for new headless/MDM flags
+    _DEFAULT_NEW_KWARGS = dict(
+        no_color=False, headless=False, skip_update_check=False,
+        log_file=None, log_dir=None, json_log_file=None, json_log_dir=None,
+        run_as_user=None,
+    )
+
     @patch('fumitm.sys.argv', ['fumitm.py', '--provider', 'netskope'])
     def test_cli_provider_netskope(self):
         """--provider netskope passes provider='netskope' to constructor."""
@@ -292,7 +299,8 @@ class TestProviderCLI(FumitmTestCase):
             mock_class.assert_called_with(
                 mode='status', debug=False, selected_tools=[],
                 cert_file=None, manual_cert=False, skip_verify=False,
-                provider='netskope', auto_yes=False
+                provider='netskope', auto_yes=False,
+                **self._DEFAULT_NEW_KWARGS
             )
 
     @patch('fumitm.sys.argv', ['fumitm.py', '--provider', 'warp', '--fix'])
@@ -309,7 +317,8 @@ class TestProviderCLI(FumitmTestCase):
             mock_class.assert_called_with(
                 mode='install', debug=False, selected_tools=[],
                 cert_file=None, manual_cert=False, skip_verify=False,
-                provider='warp', auto_yes=False
+                provider='warp', auto_yes=False,
+                **self._DEFAULT_NEW_KWARGS
             )
 
     @patch('fumitm.sys.argv', ['fumitm.py', '--provider', 'invalid'])
