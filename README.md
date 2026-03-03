@@ -1,6 +1,6 @@
 # fumitm (MITM Certificate .. Fixer Upper)
 
-Script to automatically verify and fix MITM TLS distrust issues commonly afflicting corporate device users who are subject to traffic inspection via agents such as Cloudflare Warp, Netskope or ZScaler.
+Script to automatically verify and fix MITM TLS distrust issues commonly afflicting corporate device users who are subject to traffic inspection via agents such as Cloudflare WARP or Netskope.
 
 ## Usage
 
@@ -26,6 +26,21 @@ chmod +x ./fumitm.py
 
 # Run with detailed debug output (useful for troubleshooting)
 ./fumitm.py --debug
+
+# List supported tools + tags (for use with --tools)
+./fumitm.py --list-tools
+
+# Fix only selected tools (keys and tags are both supported)
+./fumitm.py --fix --tools brew-cacerts,node
+./fumitm.py --fix --tools gcp --tools db
+
+# Explicit provider selection (default is auto-detect)
+./fumitm.py --fix --provider warp
+./fumitm.py --fix --provider netskope
+
+# Devcontainer/WSL helpers when provider CLI is unavailable
+./fumitm.py --fix --cert-file ./company-ca.pem --skip-verify
+./fumitm.py --fix --manual-cert --skip-verify
 ```
 
 ### Windows
@@ -60,9 +75,9 @@ The act of toggling your MITM off also seriously hints that you have no clue wha
 ## Requirements
 
 ### General
-- Cloudflare WARP or Netskope Client must be installed and connected
-- `warp-cli` or `nsdiag` command must be available 
-- Python 3 (macOS, Windows/WSL)
+- Cloudflare WARP or Netskope Client should be installed and connected
+- `warp-cli` or `nsdiag` command should be available (unless using `--cert-file` or `--manual-cert`)
+- Python 3 (macOS/Linux, Windows/WSL)
 
 ### Windows-Specific
 - `warp-cli.exe` or `nsdiag.exe` command must be available 
@@ -75,26 +90,30 @@ Something amiss or not quite right? Please post the full output of a run to an i
 ## List of supported fixes
 
 ### Linux/macOS
+`./fumitm.py --list-tools` currently reports these Linux/macOS tool keys:
+`brew-cacerts`, `node`, `python`, `gcloud`, `java`, `jenv`, `gradle`, `dbeaver`, `wget`, `podman`, `rancher`, `android`, `colima`, `git`, `curl`.
+
+- **Homebrew CA Certificates (`brew-cacerts`)**: configures Homebrew's CA bundle (covers Homebrew OpenSSL consumers)
 - **Node.js/npm**: configures `NODE_EXTRA_CA_CERTS` for Node.js and the cafile setting for npm
 - **Python**: sets the `REQUESTS_CA_BUNDLE`, `SSL_CERT_FILE`, and `CURL_CA_BUNDLE` environment variables
 - **gcloud**: configures the `core/custom_ca_certs_file` for the Google Cloud `gcloud` CLI
 - **Git**: configures Git to use the custom certificate bundle via `http.sslCAInfo`
 - **curl**: configures `CURL_CA_BUNDLE` environment variable for curl
-- **Java/JVM**: adds the Cloudflare certificate to any found Java keystore (cacerts)
-- **jenv**: adds the Cloudflare certificate to all jenv-managed Java installations
+- **Java/JVM**: adds the provider certificate to any found Java keystore (cacerts)
+- **jenv**: adds the provider certificate to all jenv-managed Java installations
 - **DBeaver**: targets the bundled JRE and adds the certificate to its keystore
 - **wget**: configures the `ca_certificate` in the `.wgetrc` file
 - **Podman**: installs certificate in `~/.docker/certs.d/` (persistent) and Podman VM's trust store (if running)
 - **Rancher Desktop**: installs certificate in `~/.docker/certs.d/` (persistent) and Rancher VM's trust store (if running)
 - **Colima**: installs certificate in `~/.docker/certs.d/` (persistent, applied on start) and Colima VM's trust store (if running)
 - **Android Emulator**: helps install certificate on running Android emulators
-- **Gradle**: sets `systemProp` entries in `gradle.properties` (respecting `GRADLE_USER_HOME`) for the WARP certificate.
+- **Gradle**: sets `systemProp` entries in `gradle.properties` (respecting `GRADLE_USER_HOME`) for the provider certificate.
  
 ### Windows
 - **Node.js/npm**: configures `NODE_EXTRA_CA_CERTS` for Node.js and the cafile setting for npm
 - **Python**: sets the `REQUESTS_CA_BUNDLE`, `SSL_CERT_FILE`, and `CURL_CA_BUNDLE` environment variables
 - **Google Cloud SDK (gcloud)**: configures the `core/custom_ca_certs_file` for the Google Cloud `gcloud` CLI
-- **Java/JVM**: adds the Cloudflare certificate to any found Java keystore (cacerts)
+- **Java/JVM**: adds the provider certificate to any found Java keystore (cacerts)
 - **wget**: configures the `ca_certificate` in the `.wgetrc` file
 - **Podman**: installs certificate in Podman container runtime
 - **Rancher Desktop**: installs certificate in Rancher Desktop Kubernetes environment
@@ -122,4 +141,3 @@ If you encounter issues:
 2. Run with debug output: `./fumitm.py --debug` (Linux/macOS) or `python fumitm_windows.py --debug` (Windows)
 3. Check that Python 3 is properly installed and in your PATH
 4. Verify you have appropriate permissions for the tools you're trying to fix
-
