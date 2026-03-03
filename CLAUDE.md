@@ -167,7 +167,7 @@ The script follows a modular architecture with these key components:
     - `ToolResult`: Named tuple with `(tool, status, message)`. Statuses: `configured`, `already_ok`, `completed`, `skipped`, `failed`.
     - `_run_setup(tool_key, func)`: Wraps setup functions with error-counting side-channel via `print_error()`. Legacy functions that don't return `ToolResult` get `completed` or `failed` inferred.
     - `_print_summary(results)`: Prints human-readable summary and `FUMITM_RESULT:` JSON line for Ansible `changed_when`.
-    - `_compute_changes_made(results)`: Returns `true` if any `configured`, `false` if all `already_ok`, `null` if only legacy `completed`.
+    - `_compute_changes_made(results)`: Returns `true` if any `configured`; `false` if no changes (all `already_ok`, all `skipped`, or empty); `null` if legacy `completed` makes state unknown.
     - Exit codes: 0 (success), 1 (hard failure), 2 (non-interactive input needed), 3 (partial success), 130 (interrupted).
     - Tool scope: each `tools_registry` entry has a `'scope'` key (`'system'`, `'user'`, `'hybrid'`). User-scoped tools are skipped when running as root without `--run-as-user`.
 

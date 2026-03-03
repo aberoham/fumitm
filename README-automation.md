@@ -38,7 +38,7 @@ FUMITM_RESULT: {"changes_made":true,"configured":2,"completed":5,"already_ok":0,
 ```
 
 Fields:
-- `changes_made`: `true` if any tool returned `configured`, `false` if all returned `already_ok`, `null` if only legacy `completed` statuses exist (change status unknown).
+- `changes_made`: `true` if any tool returned `configured`; `false` if no changes were made (all `already_ok`, all `skipped`, or no results); `null` if legacy `completed` statuses make change state unknown.
 - `configured` / `completed` / `already_ok` / `skipped` / `failed`: per-status counts.
 - `exit_code`: the exit code that will be returned.
 

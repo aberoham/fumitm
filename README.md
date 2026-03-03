@@ -152,6 +152,8 @@ Quick example (JAMF):
 /usr/bin/python3 /path/to/fumitm.py --fix --yes --headless --provider netskope --run-as-user "$3" --log-dir /var/log/fumitm
 ```
 
+For a pre-login/loginwindow-safe wrapper with `$3` guards, see [README-automation.md](README-automation.md#jamf-pro).
+
 ## Troubleshooting
 
 If you encounter issues:
