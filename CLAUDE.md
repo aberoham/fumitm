@@ -57,6 +57,7 @@ uvx pytest test_netskope_provider.py -v
 
 Key test categories in `test_fumitm_integration.py`:
 - **TestCertificateManagement**: Certificate download and validation
+- **TestBrewCacerts**: Homebrew ca-certificates setup and status checking
 - **TestToolSetup**: Tool-specific certificate setup workflows
 - **TestStatusFunctionContracts**: Ensures all `check_*_status()` functions return booleans
 - **TestCodeQuality**: Static analysis tests that enforce code standards:
@@ -100,7 +101,7 @@ The script follows a modular architecture with these key components:
    - Each supported tool has its own `setup_*_cert()` function
    - Functions check current configuration before making changes
    - Handle permission issues by suggesting user-writable alternatives
-   - Support for: Node.js/npm, Python, gcloud, Git, curl, Java/JVM, jenv, Gradle, DBeaver, wget, Podman, Rancher, Colima, Android Emulator
+   - Support for: Homebrew CA Certificates, Node.js/npm, Python, gcloud, Git, curl, Java/JVM, jenv, Gradle, DBeaver, wget, Podman, Rancher, Colima, Android Emulator
    - Tools can be selectively processed using `--tools` option with keys or tags
 
 5. **Certificate Helpers**:

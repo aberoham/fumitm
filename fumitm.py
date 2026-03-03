@@ -214,6 +214,13 @@ class FumitmPython:
 
         # Define tool registry with tags and descriptions
         self.tools_registry = {
+            'brew-cacerts': {
+                'name': 'Homebrew CA Certificates',
+                'tags': ['brew', 'homebrew', 'ca-certificates', 'cacerts'],
+                'setup_func': self.setup_brew_cacerts,
+                'check_func': self.check_brew_cacerts_status,
+                'description': 'Homebrew ca-certificates bundle (covers all Homebrew OpenSSL tools)'
+            },
             'node': {
                 'name': 'Node.js',
                 'tags': ['node', 'nodejs', 'node-npm', 'javascript', 'js'],
@@ -1730,6 +1737,99 @@ class FumitmPython:
         
         return True
     
+    def setup_brew_cacerts(self):
+        """Regenerate Homebrew's ca-certificates bundle to include the proxy CA.
+
+        Homebrew's ca-certificates formula builds its bundle from the macOS
+        system keychain, which already contains the MITM proxy CA. Running
+        `brew postinstall ca-certificates` regenerates the bundle at
+        $(brew --prefix)/etc/ca-certificates/cert.pem, fixing all Homebrew
+        tools that link against Homebrew OpenSSL.
+        """
+        if not self.command_exists('brew'):
+            return
+
+        try:
+            result = subprocess.run(
+                ['brew', 'list', 'ca-certificates'],
+                capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                self.print_debug("Homebrew ca-certificates formula not installed")
+                return
+        except Exception:
+            return
+
+        try:
+            result = subprocess.run(
+                ['brew', '--prefix'],
+                capture_output=True, text=True
+            )
+            brew_prefix = result.stdout.strip()
+        except Exception:
+            brew_prefix = '/opt/homebrew'
+
+        bundle_path = os.path.join(
+            brew_prefix, 'etc', 'ca-certificates', 'cert.pem'
+        )
+
+        if not os.path.exists(bundle_path):
+            self.print_debug(f"Homebrew CA bundle not found at {bundle_path}")
+            if not self.is_install_mode():
+                self.print_info("Configuring Homebrew CA certificates...")
+                self.print_action(
+                    "Would run: brew postinstall ca-certificates"
+                )
+            else:
+                self.print_info("Configuring Homebrew CA certificates...")
+                subprocess.run(
+                    ['brew', 'postinstall', 'ca-certificates'],
+                    capture_output=True, text=True
+                )
+                self.print_info("Ran brew postinstall ca-certificates")
+            return
+
+        if self.certificate_exists_in_file(self.cert_path, bundle_path):
+            self.print_debug(
+                "Proxy certificate already in Homebrew CA bundle"
+            )
+            return
+
+        self.print_info("Configuring Homebrew CA certificates...")
+        if not self.is_install_mode():
+            self.print_action(
+                "Would run: brew postinstall ca-certificates"
+            )
+        else:
+            self.print_info(
+                "Regenerating Homebrew CA bundle to include proxy certificate..."
+            )
+            result = subprocess.run(
+                ['brew', 'postinstall', 'ca-certificates'],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                if self.certificate_exists_in_file(
+                    self.cert_path, bundle_path
+                ):
+                    self.print_info(
+                        "Homebrew CA bundle now includes proxy certificate"
+                    )
+                else:
+                    self.print_warn(
+                        "brew postinstall succeeded but proxy certificate "
+                        "not found in bundle"
+                    )
+                    self.print_warn(
+                        "The proxy CA may not be in the macOS system keychain"
+                    )
+            else:
+                self.print_error(
+                    "brew postinstall ca-certificates failed"
+                )
+                if result.stderr:
+                    self.print_debug(result.stderr.strip())
+
     def setup_node_cert(self):
         """Setup Node.js certificate."""
         if not self.command_exists('node'):
@@ -3507,6 +3607,65 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         self.print_debug(f"Test result for {tool_name}: {result}")
         return result
     
+    def check_brew_cacerts_status(self, temp_warp_cert):
+        """Check whether Homebrew's ca-certificates bundle contains the proxy CA."""
+        has_issues = False
+        if not self.command_exists('brew'):
+            self.print_info("  - Homebrew not installed")
+            return has_issues
+
+        try:
+            result = subprocess.run(
+                ['brew', 'list', 'ca-certificates'],
+                capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                self.print_info(
+                    "  - ca-certificates formula not installed"
+                )
+                return has_issues
+        except Exception:
+            self.print_info(
+                "  - Could not check ca-certificates formula"
+            )
+            return has_issues
+
+        try:
+            result = subprocess.run(
+                ['brew', '--prefix'],
+                capture_output=True, text=True
+            )
+            brew_prefix = result.stdout.strip()
+        except Exception:
+            brew_prefix = '/opt/homebrew'
+
+        bundle_path = os.path.join(
+            brew_prefix, 'etc', 'ca-certificates', 'cert.pem'
+        )
+
+        if not os.path.exists(bundle_path):
+            self.print_warn(f"  ✗ Homebrew CA bundle not found at {bundle_path}")
+            self.print_action(
+                "    Run with --fix to regenerate "
+                "(brew postinstall ca-certificates)"
+            )
+            has_issues = True
+        elif self.certificate_exists_in_file(temp_warp_cert, bundle_path):
+            self.print_info(
+                "  ✓ Homebrew CA bundle contains proxy certificate"
+            )
+        else:
+            self.print_warn(
+                "  ✗ Homebrew CA bundle missing proxy certificate"
+            )
+            self.print_action(
+                "    Run with --fix to regenerate "
+                "(brew postinstall ca-certificates)"
+            )
+            has_issues = True
+
+        return has_issues
+
     def check_node_status(self, temp_warp_cert):
         """Check Node.js configuration status."""
         has_issues = False

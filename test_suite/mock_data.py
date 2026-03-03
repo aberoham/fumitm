@@ -147,6 +147,7 @@ TOOL_PATHS = {
     'emulator': '/Users/test/Library/Android/sdk/emulator/emulator',
     'dbeaver': '/Applications/DBeaver.app/Contents/MacOS/dbeaver',
     'openssl': '/usr/bin/openssl',
+    'brew': '/opt/homebrew/bin/brew',
 }
 
 # Netskope certificate paths
