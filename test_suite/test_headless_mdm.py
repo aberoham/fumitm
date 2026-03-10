@@ -649,6 +649,32 @@ class TestRunAsUser(FumitmTestCase):
         with patch('os.getuid', return_value=0):
             assert instance._has_user_context() is True
 
+    def test_apply_target_user_upn_fallback(self):
+        """UPN like user@domain.com falls back to short name."""
+        instance = self.create_fumitm_instance()
+        mock_pw = MagicMock()
+        mock_pw.pw_uid = 501
+        mock_pw.pw_gid = 20
+        mock_pw.pw_dir = '/Users/wrigglesworthm'
+
+        def getpwnam_side_effect(name):
+            if '@' in name:
+                raise KeyError(name)
+            return mock_pw
+
+        with patch('fumitm.pwd.getpwnam', side_effect=getpwnam_side_effect), \
+             patch.dict(os.environ, {}, clear=False):
+            instance._apply_target_user('wrigglesworthm@thehutgroup.com')
+            assert instance._target_uid == 501
+            assert os.environ['HOME'] == '/Users/wrigglesworthm'
+
+    def test_apply_target_user_upn_both_fail(self):
+        """UPN fallback exits when both full and short name fail."""
+        instance = self.create_fumitm_instance()
+        with patch('fumitm.pwd.getpwnam', side_effect=KeyError('nope')):
+            with pytest.raises(SystemExit):
+                instance._apply_target_user('ghost@domain.com')
+
 
 class TestSkipUpdateCheck(FumitmTestCase):
     """--skip-update-check prevents the GitHub HTTP call."""

@@ -858,8 +858,25 @@ class FumitmPython:
         try:
             pw = pwd.getpwnam(username)
         except KeyError:
-            self.print_error(f"User '{username}' not found.")
-            sys.exit(1)
+            # Entra ID (Azure AD) joined Macs: JAMF may pass the UPN
+            # (e.g. "user@domain.com") instead of the macOS short name.
+            if '@' in username:
+                short_name = username.split('@')[0]
+                try:
+                    pw = pwd.getpwnam(short_name)
+                    self.print_warn(
+                        f"User '{username}' not found, "
+                        f"using short name '{short_name}'"
+                    )
+                except KeyError:
+                    self.print_error(
+                        f"User '{username}' not found "
+                        f"(also tried '{short_name}')."
+                    )
+                    sys.exit(1)
+            else:
+                self.print_error(f"User '{username}' not found.")
+                sys.exit(1)
 
         self._target_uid = pw.pw_uid
         self._target_gid = pw.pw_gid
