@@ -75,7 +75,12 @@ log "Using Python: ${PYTHON} ($("${PYTHON}" --version 2>&1))"
 CONSOLE_USER="${3:-}"
 
 # If Jamf didn't pass a valid user, detect from /dev/console ownership.
-if [[ -z "${CONSOLE_USER}" ]] || [[ "${CONSOLE_USER}" == "loginwindow" ]]; then
+# Also fall back when $3 is a UPN (user@domain.com) — Entra ID joined Macs
+# report the UPN instead of the macOS short name in some enrollment flows.
+if [[ -z "${CONSOLE_USER}" ]] \
+    || [[ "${CONSOLE_USER}" == "loginwindow" ]] \
+    || [[ "${CONSOLE_USER}" == *"@"* ]]; then
+    log "Jamf \$3 is '${CONSOLE_USER:-<empty>}', falling back to /dev/console detection"
     CONSOLE_USER=$(/usr/bin/stat -f "%Su" /dev/console 2>/dev/null || true)
 fi
 
