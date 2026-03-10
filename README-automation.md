@@ -126,6 +126,8 @@ Keep the last 30 log files or 50 MB per host, whichever is smaller.
 
 ## JAMF Pro
 
+A complete, production-ready JAMF Self Service script is available at [`examples/jamf-self-service.sh`](examples/jamf-self-service.sh). It handles downloading, caching, integrity checking, and running fumitm — no pre-deployment of `fumitm.py` required.
+
 ### Wrapper script
 
 ```bash
