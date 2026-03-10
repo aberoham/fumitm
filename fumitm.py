@@ -2614,7 +2614,7 @@ class FumitmPython:
                     else:
                         # REQUESTS_CA_BUNDLE is healthy — ensure SSL_CERT_FILE is also set,
                         # since tools like httpx and Python's ssl module use it independently.
-                        shell_config = self.get_shell_config()
+                        shell_config = self.get_shell_config(shell_type)
                         ssl_cert_file = os.environ.get('SSL_CERT_FILE', '')
                         if not ssl_cert_file:
                             if not self.is_install_mode():
