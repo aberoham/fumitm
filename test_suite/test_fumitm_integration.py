@@ -645,6 +645,7 @@ class TestJavaMultiInstallation(FumitmTestCase):
              patch('os.listdir', return_value=['21.0.2-tem', '17.0.10-tem', '11.0.22-tem', 'current']), \
              patch('subprocess.run') as mock_run:
 
+            os.environ.pop('SDKMAN_DIR', None)
             mock_result = MagicMock()
             mock_result.stdout = ''
             mock_run.return_value = mock_result
@@ -669,6 +670,7 @@ class TestJavaMultiInstallation(FumitmTestCase):
              patch('os.listdir', return_value=['21.0.2-tem', 'current']), \
              patch('subprocess.run') as mock_run:
 
+            os.environ.pop('SDKMAN_DIR', None)
             mock_result = MagicMock()
             mock_result.stdout = ''
             mock_run.return_value = mock_result
@@ -695,6 +697,7 @@ class TestJavaMultiInstallation(FumitmTestCase):
              patch('os.path.isdir', return_value=False), \
              patch('subprocess.run') as mock_run:
 
+            os.environ.pop('SDKMAN_DIR', None)
             mock_result = MagicMock()
             mock_result.stdout = ''
             mock_run.return_value = mock_result
@@ -702,7 +705,7 @@ class TestJavaMultiInstallation(FumitmTestCase):
             instance = fumitm.FumitmPython(mode='status')
             java_homes = instance.find_all_java_homes()
 
-        assert isinstance(java_homes, list)
+        assert java_homes == [], f"Expected empty list when SDKMAN absent, got: {java_homes}"
 
     def test_find_all_java_homes_respects_sdkman_dir_env_var(self):
         """find_all_java_homes uses $SDKMAN_DIR instead of ~/.sdkman when set."""
