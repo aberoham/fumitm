@@ -639,7 +639,7 @@ class TestJavaMultiInstallation(FumitmTestCase):
             return False
 
         with patch('platform.system', return_value='Darwin'), \
-             patch.dict(os.environ, {'JAVA_HOME': ''}, clear=False), \
+             patch.dict(os.environ, {'JAVA_HOME': '', 'SDKMAN_DIR': ''}, clear=False), \
              patch('os.path.exists', side_effect=exists_side_effect), \
              patch('os.path.isdir', side_effect=isdir_side_effect), \
              patch('os.listdir', return_value=['21.0.2-tem', '17.0.10-tem', '11.0.22-tem', 'current']), \
@@ -663,7 +663,7 @@ class TestJavaMultiInstallation(FumitmTestCase):
         sdkman_java_dir = os.path.expanduser('~/.sdkman/candidates/java')
 
         with patch('platform.system', return_value='Darwin'), \
-             patch.dict(os.environ, {'JAVA_HOME': ''}, clear=False), \
+             patch.dict(os.environ, {'JAVA_HOME': '', 'SDKMAN_DIR': ''}, clear=False), \
              patch('os.path.exists', return_value=True), \
              patch('os.path.isdir', return_value=True), \
              patch('os.listdir', return_value=['21.0.2-tem', 'current']), \
@@ -690,7 +690,7 @@ class TestJavaMultiInstallation(FumitmTestCase):
             return False
 
         with patch('platform.system', return_value='Darwin'), \
-             patch.dict(os.environ, {'JAVA_HOME': ''}, clear=False), \
+             patch.dict(os.environ, {'JAVA_HOME': '', 'SDKMAN_DIR': ''}, clear=False), \
              patch('os.path.exists', side_effect=exists_side_effect), \
              patch('os.path.isdir', return_value=False), \
              patch('subprocess.run') as mock_run:
@@ -702,7 +702,52 @@ class TestJavaMultiInstallation(FumitmTestCase):
             instance = fumitm.FumitmPython(mode='status')
             java_homes = instance.find_all_java_homes()
 
-        assert isinstance(java_homes, list)
+        assert java_homes == []
+
+    def test_find_all_java_homes_sdkman_macos_bundle_layout(self):
+        """find_all_java_homes handles vendors that ship a .jdk bundle under the version dir.
+
+        Some SDKMAN distributions (e.g. Azul Zulu on macOS) are extracted as:
+            ~/.sdkman/candidates/java/11.0.18-zulu/zulu-11.jdk/Contents/Home
+        rather than the flat layout:
+            ~/.sdkman/candidates/java/21.0.2-tem/
+        Both must be discovered and produce a valid Java home.
+        """
+        sdkman_java_dir = os.path.expanduser('~/.sdkman/candidates/java')
+        version_dir = os.path.join(sdkman_java_dir, '11.0.18-zulu')
+        bundle_home = os.path.join(version_dir, 'zulu-11.jdk', 'Contents', 'Home')
+        cacerts = os.path.join(bundle_home, 'lib', 'security', 'cacerts')
+
+        def isdir_side_effect(path):
+            return path in {sdkman_java_dir, version_dir, bundle_home,
+                            os.path.join(version_dir, 'zulu-11.jdk')}
+
+        def exists_side_effect(path):
+            return path == cacerts
+
+        def listdir_side_effect(path):
+            if path == sdkman_java_dir:
+                return ['11.0.18-zulu', 'current']
+            if path == version_dir:
+                return ['zulu-11.jdk']
+            return []
+
+        with patch('platform.system', return_value='Darwin'), \
+             patch.dict(os.environ, {'JAVA_HOME': '', 'SDKMAN_DIR': ''}, clear=False), \
+             patch('os.path.exists', side_effect=exists_side_effect), \
+             patch('os.path.isdir', side_effect=isdir_side_effect), \
+             patch('os.listdir', side_effect=listdir_side_effect), \
+             patch('subprocess.run') as mock_run:
+
+            mock_result = MagicMock()
+            mock_result.stdout = ''
+            mock_run.return_value = mock_result
+
+            instance = fumitm.FumitmPython(mode='status')
+            java_homes = instance.find_all_java_homes()
+
+        assert bundle_home in java_homes, \
+            f"Expected bundle-layout SDKMAN JDK {bundle_home} in java_homes, got: {java_homes}"
 
     def test_find_all_java_homes_respects_sdkman_dir_env_var(self):
         """find_all_java_homes uses $SDKMAN_DIR instead of ~/.sdkman when set."""

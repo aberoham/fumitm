@@ -1333,16 +1333,31 @@ class FumitmPython:
         # Works on both macOS and Linux; 'current' is a symlink to the active
         # version and is skipped to avoid duplicating whichever version is active.
         # Respects $SDKMAN_DIR for non-default installation locations.
-        sdkman_root = os.environ.get('SDKMAN_DIR', os.path.expanduser('~/.sdkman'))
+        sdkman_root = os.environ.get('SDKMAN_DIR') or os.path.expanduser('~/.sdkman')
         sdkman_java_dir = os.path.join(sdkman_root, 'candidates', 'java')
         if os.path.isdir(sdkman_java_dir):
             try:
                 for entry in os.listdir(sdkman_java_dir):
                     if entry == 'current':
                         continue
-                    java_home = os.path.join(sdkman_java_dir, entry)
-                    if os.path.isdir(java_home):
-                        java_homes.add(java_home)
+                    version_dir = os.path.join(sdkman_java_dir, entry)
+                    if not os.path.isdir(version_dir):
+                        continue
+                    # Some vendors (e.g. Azul Zulu on macOS) ship a .jdk app
+                    # bundle inside the version directory rather than a flat JDK.
+                    # Descend into <vendor>.jdk/Contents/Home when present,
+                    # mirroring how the /Library/Java/JavaVirtualMachines scan works.
+                    bundle_home = None
+                    try:
+                        for sub in os.listdir(version_dir):
+                            if sub.endswith('.jdk'):
+                                candidate = os.path.join(version_dir, sub, 'Contents', 'Home')
+                                if os.path.isdir(candidate):
+                                    bundle_home = candidate
+                                    break
+                    except (OSError, PermissionError):
+                        pass
+                    java_homes.add(bundle_home if bundle_home else version_dir)
             except (OSError, PermissionError):
                 pass
 
