@@ -645,6 +645,7 @@ class TestJavaMultiInstallation(FumitmTestCase):
              patch('os.listdir', return_value=['21.0.2-tem', '17.0.10-tem', '11.0.22-tem', 'current']), \
              patch('subprocess.run') as mock_run:
 
+            os.environ.pop('SDKMAN_DIR', None)
             mock_result = MagicMock()
             mock_result.stdout = ''
             mock_run.return_value = mock_result
@@ -669,6 +670,7 @@ class TestJavaMultiInstallation(FumitmTestCase):
              patch('os.listdir', return_value=['21.0.2-tem', 'current']), \
              patch('subprocess.run') as mock_run:
 
+            os.environ.pop('SDKMAN_DIR', None)
             mock_result = MagicMock()
             mock_result.stdout = ''
             mock_run.return_value = mock_result
@@ -695,6 +697,7 @@ class TestJavaMultiInstallation(FumitmTestCase):
              patch('os.path.isdir', return_value=False), \
              patch('subprocess.run') as mock_run:
 
+            os.environ.pop('SDKMAN_DIR', None)
             mock_result = MagicMock()
             mock_result.stdout = ''
             mock_run.return_value = mock_result
