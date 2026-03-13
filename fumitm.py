@@ -1329,6 +1329,23 @@ class FumitmPython:
                 except (OSError, PermissionError):
                     pass
 
+        # Strategy 3: SDKMAN-managed installations (~/.sdkman/candidates/java/)
+        # Works on both macOS and Linux; 'current' is a symlink to the active
+        # version and is skipped to avoid duplicating whichever version is active.
+        # Respects $SDKMAN_DIR for non-default installation locations.
+        sdkman_root = os.environ.get('SDKMAN_DIR', os.path.expanduser('~/.sdkman'))
+        sdkman_java_dir = os.path.join(sdkman_root, 'candidates', 'java')
+        if os.path.isdir(sdkman_java_dir):
+            try:
+                for entry in os.listdir(sdkman_java_dir):
+                    if entry == 'current':
+                        continue
+                    java_home = os.path.join(sdkman_java_dir, entry)
+                    if os.path.isdir(java_home):
+                        java_homes.add(java_home)
+            except (OSError, PermissionError):
+                pass
+
         # Validate: only keep paths with valid cacerts
         valid_homes = []
         for home in java_homes:

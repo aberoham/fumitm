@@ -619,6 +619,132 @@ class TestJavaMultiInstallation(FumitmTestCase):
                 # Should return empty because cacerts validation fails
                 assert len(java_homes) == 0
 
+    def test_find_all_java_homes_includes_sdkman_installations(self):
+        """find_all_java_homes discovers all JDKs installed under ~/.sdkman/candidates/java/."""
+        sdkman_java_dir = os.path.expanduser('~/.sdkman/candidates/java')
+        sdkman_versions = ['21.0.2-tem', '17.0.10-tem', '11.0.22-tem']
+
+        def exists_side_effect(path):
+            if path == sdkman_java_dir:
+                return True
+            if 'lib/security/cacerts' in path:
+                return True
+            return False
+
+        def isdir_side_effect(path):
+            if path == sdkman_java_dir:
+                return True
+            if any(v in path for v in sdkman_versions):
+                return True
+            return False
+
+        with patch('platform.system', return_value='Darwin'), \
+             patch.dict(os.environ, {'JAVA_HOME': ''}, clear=False), \
+             patch('os.path.exists', side_effect=exists_side_effect), \
+             patch('os.path.isdir', side_effect=isdir_side_effect), \
+             patch('os.listdir', return_value=['21.0.2-tem', '17.0.10-tem', '11.0.22-tem', 'current']), \
+             patch('subprocess.run') as mock_run:
+
+            mock_result = MagicMock()
+            mock_result.stdout = ''
+            mock_run.return_value = mock_result
+
+            instance = fumitm.FumitmPython(mode='status')
+            java_homes = instance.find_all_java_homes()
+
+        expected_paths = [
+            os.path.join(sdkman_java_dir, v) for v in sdkman_versions
+        ]
+        for path in expected_paths:
+            assert path in java_homes, f"Expected SDKMAN JDK {path} in java_homes, got: {java_homes}"
+
+    def test_find_all_java_homes_sdkman_skips_current_symlink(self):
+        """find_all_java_homes does not add the 'current' symlink as a separate entry."""
+        sdkman_java_dir = os.path.expanduser('~/.sdkman/candidates/java')
+
+        with patch('platform.system', return_value='Darwin'), \
+             patch.dict(os.environ, {'JAVA_HOME': ''}, clear=False), \
+             patch('os.path.exists', return_value=True), \
+             patch('os.path.isdir', return_value=True), \
+             patch('os.listdir', return_value=['21.0.2-tem', 'current']), \
+             patch('subprocess.run') as mock_run:
+
+            mock_result = MagicMock()
+            mock_result.stdout = ''
+            mock_run.return_value = mock_result
+
+            instance = fumitm.FumitmPython(mode='status')
+            java_homes = instance.find_all_java_homes()
+
+        current_path = os.path.join(sdkman_java_dir, 'current')
+        assert current_path not in java_homes, \
+            f"'current' symlink should not appear as a separate entry in java_homes"
+
+    def test_find_all_java_homes_sdkman_absent(self):
+        """find_all_java_homes does not fail when ~/.sdkman/candidates/java does not exist."""
+        sdkman_java_dir = os.path.expanduser('~/.sdkman/candidates/java')
+
+        def exists_side_effect(path):
+            if path == sdkman_java_dir:
+                return False
+            return False
+
+        with patch('platform.system', return_value='Darwin'), \
+             patch.dict(os.environ, {'JAVA_HOME': ''}, clear=False), \
+             patch('os.path.exists', side_effect=exists_side_effect), \
+             patch('os.path.isdir', return_value=False), \
+             patch('subprocess.run') as mock_run:
+
+            mock_result = MagicMock()
+            mock_result.stdout = ''
+            mock_run.return_value = mock_result
+
+            instance = fumitm.FumitmPython(mode='status')
+            java_homes = instance.find_all_java_homes()
+
+        assert isinstance(java_homes, list)
+
+    def test_find_all_java_homes_respects_sdkman_dir_env_var(self):
+        """find_all_java_homes uses $SDKMAN_DIR instead of ~/.sdkman when set."""
+        custom_sdkman_root = '/opt/sdkman'
+        custom_sdkman_java_dir = '/opt/sdkman/candidates/java'
+        default_sdkman_java_dir = os.path.expanduser('~/.sdkman/candidates/java')
+
+        def isdir_side_effect(path):
+            if path == custom_sdkman_java_dir:
+                return True
+            if path == default_sdkman_java_dir:
+                return False
+            if '21.0.2-tem' in path:
+                return True
+            return False
+
+        def exists_side_effect(path):
+            if 'lib/security/cacerts' in path and '21.0.2-tem' in path:
+                return True
+            return False
+
+        env = {'SDKMAN_DIR': custom_sdkman_root, 'JAVA_HOME': ''}
+        with patch('platform.system', return_value='Darwin'), \
+             patch.dict(os.environ, env, clear=False), \
+             patch('os.path.exists', side_effect=exists_side_effect), \
+             patch('os.path.isdir', side_effect=isdir_side_effect), \
+             patch('os.listdir', return_value=['21.0.2-tem', 'current']), \
+             patch('subprocess.run') as mock_run:
+
+            mock_result = MagicMock()
+            mock_result.stdout = ''
+            mock_run.return_value = mock_result
+
+            instance = fumitm.FumitmPython(mode='status')
+            java_homes = instance.find_all_java_homes()
+
+        expected = os.path.join(custom_sdkman_java_dir, '21.0.2-tem')
+        assert expected in java_homes, \
+            f"Expected JDK from custom $SDKMAN_DIR at {expected}, got: {java_homes}"
+        unexpected = os.path.join(default_sdkman_java_dir, '21.0.2-tem')
+        assert unexpected not in java_homes
+
 
 class TestCLIAndWorkflow(FumitmTestCase):
     """Tests for CLI argument parsing and complete workflows."""

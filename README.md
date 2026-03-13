@@ -98,7 +98,7 @@ Something amiss or not quite right? Please post the full output of a run to an i
 - **gcloud**: configures the `core/custom_ca_certs_file` for the Google Cloud `gcloud` CLI
 - **Git**: configures Git to use the custom certificate bundle via `http.sslCAInfo`
 - **curl**: configures `CURL_CA_BUNDLE` environment variable for curl
-- **Java/JVM**: adds the provider certificate to any found Java keystore (cacerts)
+- **Java/JVM**: adds the provider certificate to any found Java keystore (cacerts); detects installations from `/Library/Java/JavaVirtualMachines` (macOS), `/usr/lib/jvm` (Linux), and SDKMAN (`~/.sdkman/candidates/java/`, or `$SDKMAN_DIR` if set)
 - **jenv**: adds the provider certificate to all jenv-managed Java installations
 - **DBeaver**: targets the bundled JRE and adds the certificate to its keystore
 - **wget**: configures the `ca_certificate` in the `.wgetrc` file
