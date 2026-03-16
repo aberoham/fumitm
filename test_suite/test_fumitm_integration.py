@@ -5,6 +5,7 @@ These tests verify the core workflows and functionality of the fumitm script
 by mocking external dependencies and testing realistic scenarios.
 """
 import os
+import subprocess
 import sys
 import urllib.error
 from unittest.mock import patch, MagicMock, call, mock_open
@@ -453,6 +454,7 @@ class TestJavaMultiInstallation(FumitmTestCase):
         with patch('platform.system', return_value='Darwin'), \
              patch.dict(os.environ, {'JAVA_HOME': ''}, clear=False), \
              patch('os.path.exists') as mock_exists, \
+             patch('os.path.isfile') as mock_isfile, \
              patch('os.path.isdir', return_value=True), \
              patch('os.listdir', return_value=[]), \
              patch('subprocess.run') as mock_run:
@@ -467,6 +469,7 @@ class TestJavaMultiInstallation(FumitmTestCase):
                 return False
 
             mock_exists.side_effect = exists_side_effect
+            mock_isfile.side_effect = lambda path: 'lib/security/cacerts' in path
 
             # Mock java_home -V output
             mock_result = MagicMock()
@@ -486,6 +489,7 @@ class TestJavaMultiInstallation(FumitmTestCase):
         with patch('platform.system', return_value='Darwin'), \
              patch.dict(os.environ, {'JAVA_HOME': ''}, clear=False), \
              patch('os.path.exists', return_value=True), \
+             patch('os.path.isfile', return_value=True), \
              patch('os.path.isdir', return_value=True), \
              patch('os.listdir') as mock_listdir, \
              patch('subprocess.run') as mock_run:
@@ -519,6 +523,7 @@ class TestJavaMultiInstallation(FumitmTestCase):
         with patch('platform.system', return_value='Linux'), \
              patch.dict(os.environ, {'JAVA_HOME': ''}, clear=False), \
              patch('os.path.exists', return_value=True), \
+             patch('os.path.isfile', return_value=True), \
              patch('os.path.isdir', return_value=True), \
              patch('subprocess.run') as mock_run:
 
@@ -2363,6 +2368,819 @@ class TestProviderMigration(FumitmTestCase):
             instance = self.create_fumitm_instance(provider='netskope')
             has_issues = instance.check_node_status(cert_path)
             assert has_issues is False
+
+
+class TestToolResultAccuracy(FumitmTestCase):
+    """Tests that setup functions return accurate ToolResult statuses."""
+
+    def test_java_all_fail_returns_failed(self):
+        """setup_java_cert returns failed when all JDKs fail keytool import."""
+        fake_java_homes = [
+            '/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home',
+            '/Library/Java/JavaVirtualMachines/temurin-11.jdk/Contents/Home',
+        ]
+
+        instance = self.create_fumitm_instance(mode='install')
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'find_all_java_homes', return_value=fake_java_homes), \
+             patch.object(instance, 'find_java_cacerts', return_value='/fake/cacerts'), \
+             patch('subprocess.run') as mock_run:
+
+            # keytool -list says not installed, keytool -import fails (permission denied)
+            def run_side_effect(*args, **kwargs):
+                cmd = args[0]
+                result = MagicMock()
+                result.returncode = 1
+                result.stdout = b'Permission denied'
+                return result
+
+            mock_run.side_effect = run_side_effect
+
+            result = instance.setup_java_cert()
+            assert result.status == 'failed'
+            assert result.tool == 'java'
+
+    def test_java_all_already_installed_returns_already_ok(self):
+        """setup_java_cert returns already_ok when all JDKs have the cert."""
+        fake_java_homes = [
+            '/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home',
+            '/Library/Java/JavaVirtualMachines/temurin-11.jdk/Contents/Home',
+        ]
+
+        instance = self.create_fumitm_instance(mode='install')
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'find_all_java_homes', return_value=fake_java_homes), \
+             patch.object(instance, 'find_java_cacerts', return_value='/fake/cacerts'), \
+             patch('subprocess.run') as mock_run:
+
+            # keytool -list returns success with alias present
+            mock_result = MagicMock()
+            mock_result.returncode = 0
+            mock_result.stdout = instance.provider['keytool_alias'].encode()
+            mock_run.return_value = mock_result
+
+            result = instance.setup_java_cert()
+            assert result.status == 'already_ok'
+
+    def test_java_mixed_results_returns_failed(self):
+        """setup_java_cert returns failed when some JDKs succeed but others fail."""
+        fake_java_homes = [
+            '/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home',
+            '/Library/Java/JavaVirtualMachines/temurin-11.jdk/Contents/Home',
+        ]
+
+        instance = self.create_fumitm_instance(mode='install')
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'find_all_java_homes', return_value=fake_java_homes), \
+             patch.object(instance, 'find_java_cacerts', return_value='/fake/cacerts'), \
+             patch('subprocess.run') as mock_run:
+
+            call_count = [0]
+
+            def run_side_effect(*args, **kwargs):
+                call_count[0] += 1
+                result = MagicMock()
+                cmd = args[0]
+                if '-list' in cmd:
+                    # Neither has cert installed yet
+                    result.returncode = 1
+                    result.stdout = b''
+                elif '-import' in cmd:
+                    # First import succeeds, second fails
+                    if call_count[0] == 2:  # first -import
+                        result.returncode = 0
+                        result.stdout = b'Certificate was added'
+                    else:  # second -import
+                        result.returncode = 1
+                        result.stdout = b'Permission denied'
+                return result
+
+            mock_run.side_effect = run_side_effect
+
+            result = instance.setup_java_cert()
+            assert result.status == 'failed'
+            assert '1/2' in result.message
+
+    def test_java_all_succeed_returns_configured(self):
+        """setup_java_cert returns configured when all JDKs are newly configured."""
+        fake_java_homes = [
+            '/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home',
+        ]
+
+        instance = self.create_fumitm_instance(mode='install')
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'find_all_java_homes', return_value=fake_java_homes), \
+             patch.object(instance, 'find_java_cacerts', return_value='/fake/cacerts'), \
+             patch('subprocess.run') as mock_run:
+
+            def run_side_effect(*args, **kwargs):
+                result = MagicMock()
+                cmd = args[0]
+                if '-list' in cmd:
+                    result.returncode = 1
+                    result.stdout = b''
+                else:
+                    result.returncode = 0
+                    result.stdout = b'Certificate was added'
+                return result
+
+            mock_run.side_effect = run_side_effect
+
+            result = instance.setup_java_cert()
+            assert result.status == 'configured'
+
+    def test_java_no_java_returns_skipped(self):
+        """setup_java_cert returns skipped when java/keytool not found."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=False):
+            result = instance.setup_java_cert()
+            assert result.status == 'skipped'
+
+    def test_java_no_installations_returns_skipped(self):
+        """setup_java_cert returns skipped when no Java homes found."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'find_all_java_homes', return_value=[]):
+            result = instance.setup_java_cert()
+            assert result.status == 'skipped'
+
+    def test_find_java_cacerts_skips_directory(self):
+        """find_java_cacerts returns jre path when lib/security/cacerts is a directory."""
+        instance = self.create_fumitm_instance()
+        java_home = '/Library/Java/JavaVirtualMachines/temurin-8.jdk/Contents/Home'
+        modern_path = os.path.join(java_home, 'lib/security/cacerts')
+        legacy_path = os.path.join(java_home, 'jre/lib/security/cacerts')
+
+        def isfile_side_effect(path):
+            if path == modern_path:
+                return False  # it's a directory, not a file
+            if path == legacy_path:
+                return True
+            return False
+
+        with patch('os.path.isfile', side_effect=isfile_side_effect):
+            result = instance.find_java_cacerts(java_home)
+            assert result == legacy_path
+
+    def test_find_java_cacerts_returns_empty_when_both_missing(self):
+        """find_java_cacerts returns empty string when no cacerts file exists."""
+        instance = self.create_fumitm_instance()
+        java_home = '/fake/java/home'
+        with patch('os.path.isfile', return_value=False):
+            result = instance.find_java_cacerts(java_home)
+            assert result == ''
+
+    def test_find_java_cacerts_prefers_modern_path(self):
+        """find_java_cacerts returns lib/security/cacerts when it's a regular file."""
+        instance = self.create_fumitm_instance()
+        java_home = '/Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home'
+        modern_path = os.path.join(java_home, 'lib/security/cacerts')
+
+        with patch('os.path.isfile', return_value=True):
+            result = instance.find_java_cacerts(java_home)
+            assert result == modern_path
+
+    def test_jenv_all_fail_returns_failed(self):
+        """setup_jenv_cert returns failed when all jenv JDKs fail."""
+        instance = self.create_fumitm_instance(mode='install')
+        fake_java_homes = ['/Users/user/.jenv/versions/17.0']
+
+        with patch.object(instance, 'get_jenv_java_homes', return_value=fake_java_homes), \
+             patch.object(instance, 'command_exists', return_value=True), \
+             patch('os.path.exists', return_value=True), \
+             patch('subprocess.run') as mock_run:
+
+            def run_side_effect(*args, **kwargs):
+                result = MagicMock()
+                result.returncode = 1
+                result.stdout = 'Permission denied'
+                return result
+
+            mock_run.side_effect = run_side_effect
+
+            result = instance.setup_jenv_cert()
+            assert result.status == 'failed'
+
+    def test_jenv_no_homes_returns_skipped(self):
+        """setup_jenv_cert returns skipped when no jenv installations found."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'get_jenv_java_homes', return_value=[]):
+            result = instance.setup_jenv_cert()
+            assert result.status == 'skipped'
+
+    def test_jenv_no_keytool_returns_skipped(self):
+        """setup_jenv_cert returns skipped when keytool not found."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'get_jenv_java_homes', return_value=['/fake']), \
+             patch.object(instance, 'command_exists', return_value=False):
+            result = instance.setup_jenv_cert()
+            assert result.status == 'skipped'
+
+    def test_dbeaver_not_installed_returns_skipped(self):
+        """setup_dbeaver_cert returns skipped when DBeaver not found."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch('os.path.exists', return_value=False):
+            result = instance.setup_dbeaver_cert()
+            assert result.status == 'skipped'
+
+    def test_dbeaver_already_installed_returns_already_ok(self):
+        """setup_dbeaver_cert returns already_ok when cert already in keystore."""
+        instance = self.create_fumitm_instance(mode='install')
+
+        def exists_side_effect(path):
+            return True  # both keytool and cacerts exist
+
+        with patch('os.path.exists', side_effect=exists_side_effect), \
+             patch('subprocess.run') as mock_run:
+
+            mock_result = MagicMock()
+            mock_result.returncode = 0
+            mock_result.stdout = instance.provider['keytool_alias'].encode()
+            mock_run.return_value = mock_result
+
+            result = instance.setup_dbeaver_cert()
+            assert result.status == 'already_ok'
+
+    def test_dbeaver_import_fails_returns_failed(self):
+        """setup_dbeaver_cert returns failed when keytool import fails."""
+        instance = self.create_fumitm_instance(mode='install')
+
+        with patch('os.path.exists', return_value=True), \
+             patch('subprocess.run') as mock_run:
+
+            call_count = [0]
+
+            def run_side_effect(*args, **kwargs):
+                call_count[0] += 1
+                result = MagicMock()
+                if call_count[0] == 1:
+                    # keytool -list: cert not found
+                    result.returncode = 1
+                    result.stdout = b''
+                else:
+                    # keytool -import: permission denied
+                    result.returncode = 1
+                    result.stdout = b'Permission denied'
+                return result
+
+            mock_run.side_effect = run_side_effect
+
+            result = instance.setup_dbeaver_cert()
+            assert result.status == 'failed'
+
+    def test_dbeaver_import_succeeds_returns_configured(self):
+        """setup_dbeaver_cert returns configured when keytool import succeeds."""
+        instance = self.create_fumitm_instance(mode='install')
+
+        with patch('os.path.exists', return_value=True), \
+             patch('subprocess.run') as mock_run:
+
+            call_count = [0]
+
+            def run_side_effect(*args, **kwargs):
+                call_count[0] += 1
+                result = MagicMock()
+                if call_count[0] == 1:
+                    # keytool -list: cert not found
+                    result.returncode = 1
+                    result.stdout = b''
+                else:
+                    # keytool -import: success
+                    result.returncode = 0
+                    result.stdout = b'Certificate was added'
+                return result
+
+            mock_run.side_effect = run_side_effect
+
+            result = instance.setup_dbeaver_cert()
+            assert result.status == 'configured'
+
+    def test_java_failures_propagate_through_run_setup(self):
+        """_run_setup passes through ToolResult from setup_java_cert."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=False):
+            result = instance._run_setup('java', instance.setup_java_cert)
+            assert result.status == 'skipped'
+
+    def test_dbeaver_failure_propagates_through_run_setup(self):
+        """_run_setup passes through failed ToolResult from setup_dbeaver_cert."""
+        instance = self.create_fumitm_instance(mode='install')
+
+        with patch('os.path.exists', return_value=True), \
+             patch('subprocess.run') as mock_run:
+
+            # All keytool calls fail
+            mock_result = MagicMock()
+            mock_result.returncode = 1
+            mock_result.stdout = b'Permission denied'
+            mock_run.return_value = mock_result
+
+            result = instance._run_setup('dbeaver', instance.setup_dbeaver_cert)
+            assert result.status == 'failed'
+
+    # --- Rancher Desktop ---
+
+    def test_rancher_not_installed_returns_skipped(self):
+        """setup_rancher_cert returns skipped when rdctl not found."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=False):
+            result = instance.setup_rancher_cert()
+            assert result.status == 'skipped'
+
+    def test_rancher_already_ok(self):
+        """setup_rancher_cert returns already_ok when cert already installed."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch('os.path.exists', return_value=True), \
+             patch.object(instance, 'certificate_likely_exists_in_file', return_value=True), \
+             patch('subprocess.run') as mock_run:
+            # rdctl version succeeds (VM running), cert exists in VM
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout='v1.0'),  # rdctl version
+                MagicMock(returncode=0),  # test -f cert in VM
+            ]
+            result = instance.setup_rancher_cert()
+            assert result.status == 'already_ok'
+
+    def test_rancher_vm_install_fails_returns_configured(self):
+        """setup_rancher_cert returns configured when persistent succeeds but VM fails."""
+        instance = self.create_fumitm_instance(mode='install')
+        instance.cert_path = '/tmp/fake-cert.pem'
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch('os.path.exists', return_value=False), \
+             patch.object(instance, 'certificate_likely_exists_in_file', return_value=False), \
+             patch.object(instance, '_safe_makedirs'), \
+             patch('shutil.copy'), \
+             patch.object(instance, '_fix_ownership'), \
+             patch('builtins.open', mock_open(read_data='CERT')), \
+             patch('subprocess.run') as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout='v1.0'),  # rdctl version (VM running)
+                MagicMock(returncode=1),  # test -f cert in VM (needs cert)
+                MagicMock(returncode=1),  # rdctl shell sudo tee (fails)
+            ]
+            result = instance.setup_rancher_cert()
+            assert result.status == 'configured'
+            assert 'VM install failed' in result.message
+
+    # --- Podman ---
+
+    def test_podman_not_installed_returns_skipped(self):
+        """setup_podman_cert returns skipped when podman not found."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=False):
+            result = instance.setup_podman_cert()
+            assert result.status == 'skipped'
+
+    def test_podman_already_ok(self):
+        """setup_podman_cert returns already_ok when cert already installed."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch('os.path.exists', return_value=True), \
+             patch.object(instance, 'certificate_likely_exists_in_file', return_value=True), \
+             patch('subprocess.run') as mock_run:
+            # podman machine list shows not running
+            mock_run.return_value = MagicMock(returncode=0, stdout='no machines')
+            result = instance.setup_podman_cert()
+            assert result.status == 'already_ok'
+
+    # --- Colima ---
+
+    def test_colima_not_installed_returns_skipped(self):
+        """setup_colima_cert returns skipped when colima not found."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=False):
+            result = instance.setup_colima_cert()
+            assert result.status == 'skipped'
+
+    def test_colima_already_ok(self):
+        """setup_colima_cert returns already_ok when cert already installed."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch('os.path.exists', return_value=True), \
+             patch.object(instance, 'certificate_likely_exists_in_file', return_value=True), \
+             patch('subprocess.run') as mock_run:
+            # colima status shows not running
+            mock_run.return_value = MagicMock(returncode=1)
+            result = instance.setup_colima_cert()
+            assert result.status == 'already_ok'
+
+    def test_colima_vm_install_fails_persistent_ok(self):
+        """setup_colima_cert returns configured when persistent ok but VM fails."""
+        instance = self.create_fumitm_instance(mode='install')
+        instance.cert_path = '/tmp/fake-cert.pem'
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch('os.path.exists', return_value=False), \
+             patch.object(instance, 'certificate_likely_exists_in_file', return_value=False), \
+             patch.object(instance, '_safe_makedirs'), \
+             patch('shutil.copy'), \
+             patch.object(instance, '_fix_ownership'), \
+             patch('builtins.open', mock_open(read_data='CERT')), \
+             patch('subprocess.run') as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0),  # colima status (running)
+                MagicMock(returncode=1),  # test -f cert in VM (needs cert)
+                MagicMock(returncode=1),  # colima ssh tee (fails)
+            ]
+            result = instance.setup_colima_cert()
+            assert result.status == 'configured'
+            assert 'VM install failed' in result.message
+
+    # --- Brew cacerts ---
+
+    def test_brew_not_installed_returns_skipped(self):
+        """setup_brew_cacerts returns skipped when brew not found."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=False):
+            result = instance.setup_brew_cacerts()
+            assert result.status == 'skipped'
+
+    def test_brew_cacerts_already_ok(self):
+        """setup_brew_cacerts returns already_ok when cert already in bundle."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch('subprocess.run', return_value=MagicMock(returncode=0)), \
+             patch.object(instance, '_get_brew_prefix', return_value='/opt/homebrew'), \
+             patch('os.path.exists', return_value=True), \
+             patch.object(instance, 'certificate_exists_in_file', return_value=True):
+            result = instance.setup_brew_cacerts()
+            assert result.status == 'already_ok'
+
+    def test_brew_postinstall_fails_returns_failed(self):
+        """setup_brew_cacerts returns failed when brew postinstall fails."""
+        instance = self.create_fumitm_instance(mode='install')
+
+        call_count = [0]
+
+        def run_side_effect(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # brew list ca-certificates: installed
+                return MagicMock(returncode=0)
+            else:
+                # brew postinstall: fails
+                return MagicMock(returncode=1, stderr='error')
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch('subprocess.run', side_effect=run_side_effect), \
+             patch.object(instance, '_get_brew_prefix', return_value='/opt/homebrew'), \
+             patch('os.path.exists', return_value=True), \
+             patch.object(instance, 'certificate_exists_in_file', return_value=False):
+            result = instance.setup_brew_cacerts()
+            assert result.status == 'failed'
+
+    # --- Android Emulator ---
+
+    def test_android_not_installed_returns_skipped(self):
+        """setup_android_emulator_cert returns skipped when adb/emulator not found."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=False):
+            result = instance.setup_android_emulator_cert()
+            assert result.status == 'skipped'
+
+    def test_android_no_emulator_running_returns_skipped(self):
+        """setup_android_emulator_cert returns skipped when no emulator is running."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch('subprocess.run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout='List of devices attached\n\n')
+            result = instance.setup_android_emulator_cert()
+            assert result.status == 'skipped'
+
+
+class TestAwsVerification(FumitmTestCase):
+    """Tests for AWS CLI verify_connection and status checking."""
+
+    def test_verify_connection_aws_working(self):
+        """verify_connection returns WORKING when aws call succeeds (no SSL error)."""
+        with patch('platform.system', return_value='Darwin'):
+            instance = fumitm.FumitmPython(mode='status')
+
+        with patch('subprocess.run') as mock_run, \
+             patch.object(instance, 'command_exists', return_value=True), \
+             patch('shutil.which', return_value='/usr/local/bin/aws'):
+
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout='{"Account": "123456789012"}',
+                stderr=''
+            )
+
+            result = instance.verify_connection("aws")
+            assert result == "WORKING"
+
+    def test_verify_connection_aws_access_denied_is_working(self):
+        """verify_connection returns WORKING when aws gets access denied (TLS works)."""
+        with patch('platform.system', return_value='Darwin'):
+            instance = fumitm.FumitmPython(mode='status')
+
+        with patch('subprocess.run') as mock_run, \
+             patch.object(instance, 'command_exists', return_value=True), \
+             patch('shutil.which', return_value='/usr/local/bin/aws'):
+
+            mock_run.return_value = MagicMock(
+                returncode=254,
+                stdout='',
+                stderr='An error occurred (AccessDenied) when calling the GetCallerIdentity operation'
+            )
+
+            result = instance.verify_connection("aws")
+            assert result == "WORKING"
+
+    def test_verify_connection_aws_ssl_error(self):
+        """verify_connection returns FAILED when aws gets SSL error."""
+        with patch('platform.system', return_value='Darwin'):
+            instance = fumitm.FumitmPython(mode='status')
+
+        with patch('subprocess.run') as mock_run, \
+             patch.object(instance, 'command_exists', return_value=True), \
+             patch('shutil.which', return_value='/usr/local/bin/aws'):
+
+            mock_run.return_value = MagicMock(
+                returncode=1,
+                stdout='',
+                stderr='SSL validation failed for https://sts.amazonaws.com/ [SSL: CERTIFICATE_VERIFY_FAILED]'
+            )
+
+            result = instance.verify_connection("aws")
+            assert result == "FAILED"
+
+    def test_verify_connection_aws_certificate_error(self):
+        """verify_connection returns FAILED when stderr mentions certificate."""
+        with patch('platform.system', return_value='Darwin'):
+            instance = fumitm.FumitmPython(mode='status')
+
+        with patch('subprocess.run') as mock_run, \
+             patch.object(instance, 'command_exists', return_value=True), \
+             patch('shutil.which', return_value='/usr/local/bin/aws'):
+
+            mock_run.return_value = MagicMock(
+                returncode=1,
+                stdout='',
+                stderr='unable to get local issuer certificate'
+            )
+
+            result = instance.verify_connection("aws")
+            assert result == "FAILED"
+
+    def test_verify_connection_aws_timeout(self):
+        """verify_connection returns FAILED on timeout."""
+        with patch('platform.system', return_value='Darwin'):
+            instance = fumitm.FumitmPython(mode='status')
+
+        with patch('subprocess.run', side_effect=subprocess.TimeoutExpired('aws', 15)), \
+             patch.object(instance, 'command_exists', return_value=True), \
+             patch('shutil.which', return_value='/usr/local/bin/aws'):
+
+            result = instance.verify_connection("aws")
+            assert result == "FAILED"
+
+    def test_verify_connection_aws_not_installed(self):
+        """verify_connection returns NOT_INSTALLED when aws not found."""
+        with patch('platform.system', return_value='Darwin'):
+            instance = fumitm.FumitmPython(mode='status')
+
+        with patch.object(instance, 'command_exists', return_value=False):
+            result = instance.verify_connection("aws")
+            assert result == "NOT_INSTALLED"
+
+    def test_check_aws_status_working_no_bundle(self):
+        """check_aws_status returns no issues when aws works without custom CA."""
+        instance = self.create_fumitm_instance()
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'verify_connection', return_value='WORKING'), \
+             patch.dict(os.environ, {}, clear=True):
+            has_issues = instance.check_aws_status("FAKE_CERT_CONTENT")
+            assert has_issues is False
+
+    def test_check_aws_status_working_with_cross_provider_bundle(self):
+        """check_aws_status flags cross-provider path even when working."""
+        warp_aws_bundle = os.path.expanduser("~/.cloudflare-warp/aws/ca-bundle.pem")
+
+        instance = self.create_fumitm_instance(provider='netskope')
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'verify_connection', return_value='WORKING'), \
+             patch.dict(os.environ, {'AWS_CA_BUNDLE': warp_aws_bundle}):
+            has_issues = instance.check_aws_status("FAKE_CERT_CONTENT")
+            assert has_issues is True
+
+    def test_check_aws_status_failed_no_bundle(self):
+        """check_aws_status returns issues when aws fails and no bundle set."""
+        instance = self.create_fumitm_instance()
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'verify_connection', return_value='FAILED'), \
+             patch.dict(os.environ, {}, clear=True):
+            has_issues = instance.check_aws_status("FAKE_CERT_CONTENT")
+            assert has_issues is True
+
+    def test_check_aws_status_failed_cross_provider_bundle(self):
+        """check_aws_status flags cross-provider path when aws fails."""
+        warp_aws_bundle = os.path.expanduser("~/.cloudflare-warp/aws/ca-bundle.pem")
+
+        instance = self.create_fumitm_instance(provider='netskope')
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'verify_connection', return_value='FAILED'), \
+             patch.dict(os.environ, {'AWS_CA_BUNDLE': warp_aws_bundle}):
+            has_issues = instance.check_aws_status("FAKE_CERT_CONTENT")
+            assert has_issues is True
+
+    def test_check_aws_status_failed_nonexistent_bundle(self):
+        """check_aws_status flags non-existent AWS_CA_BUNDLE file."""
+        instance = self.create_fumitm_instance()
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'verify_connection', return_value='FAILED'), \
+             patch.dict(os.environ, {'AWS_CA_BUNDLE': '/nonexistent/ca-bundle.pem'}), \
+             patch('os.path.exists', return_value=False):
+            has_issues = instance.check_aws_status("FAKE_CERT_CONTENT")
+            assert has_issues is True
+
+    def test_check_aws_status_not_installed(self):
+        """check_aws_status returns no issues when aws not installed."""
+        instance = self.create_fumitm_instance()
+
+        with patch.object(instance, 'command_exists', return_value=False):
+            has_issues = instance.check_aws_status("FAKE_CERT_CONTENT")
+            assert has_issues is False
+
+
+class TestAwsSetup(FumitmTestCase):
+    """Tests for AWS CLI setup_aws_cert function."""
+
+    def test_aws_not_installed_returns_early(self):
+        """setup_aws_cert returns early when aws not found."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=False):
+            result = instance.setup_aws_cert()
+            assert result is None  # bare return
+
+    def test_aws_already_working_skips(self):
+        """setup_aws_cert skips when aws already works via system trust."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'verify_connection', return_value='WORKING'):
+            result = instance.setup_aws_cert()
+            assert result is None  # bare return, no changes needed
+
+    def test_aws_no_bundle_status_mode(self):
+        """setup_aws_cert in status mode prints actions without making changes."""
+        instance = self.create_fumitm_instance(mode='status')
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'verify_connection', return_value='FAILED'), \
+             patch.dict(os.environ, {}, clear=True):
+            result = instance.setup_aws_cert()
+            assert result is None  # returns in status mode
+
+    def test_aws_no_bundle_install_mode_creates_bundle(self):
+        """setup_aws_cert creates bundle and configures env var when no bundle set."""
+        instance = self.create_fumitm_instance(mode='install')
+        expected_bundle = os.path.join(instance.bundle_dir, "aws/ca-bundle.pem")
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'verify_connection', return_value='FAILED'), \
+             patch.dict(os.environ, {}, clear=True), \
+             patch.object(instance, '_safe_makedirs') as mock_makedirs, \
+             patch.object(instance, 'create_bundle_with_system_certs') as mock_create, \
+             patch.object(instance, 'safe_append_certificate') as mock_append, \
+             patch.object(instance, 'detect_shell', return_value='zsh'), \
+             patch.object(instance, 'get_shell_config', return_value='/tmp/.zshrc'), \
+             patch.object(instance, 'add_to_shell_config') as mock_shell:
+
+            instance.setup_aws_cert()
+
+            mock_makedirs.assert_called_once_with(os.path.dirname(expected_bundle))
+            mock_create.assert_called_once_with(expected_bundle)
+            mock_append.assert_called_once_with(instance.cert_path, expected_bundle)
+            mock_shell.assert_called_once_with("AWS_CA_BUNDLE", expected_bundle, '/tmp/.zshrc')
+
+    def test_aws_cross_provider_install_mode_migrates(self):
+        """setup_aws_cert migrates from old provider bundle in install mode."""
+        instance = self.create_fumitm_instance(mode='install', provider='netskope')
+        warp_bundle = os.path.expanduser("~/.cloudflare-warp/aws/ca-bundle.pem")
+        expected_bundle = os.path.join(instance.bundle_dir, "aws/ca-bundle.pem")
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'verify_connection', return_value='FAILED'), \
+             patch.dict(os.environ, {'AWS_CA_BUNDLE': warp_bundle}), \
+             patch.object(instance, '_safe_makedirs'), \
+             patch.object(instance, 'create_bundle_with_system_certs') as mock_create, \
+             patch.object(instance, 'safe_append_certificate') as mock_append, \
+             patch.object(instance, 'detect_shell', return_value='zsh'), \
+             patch.object(instance, 'get_shell_config', return_value='/tmp/.zshrc'), \
+             patch.object(instance, 'add_to_shell_config') as mock_shell:
+
+            instance.setup_aws_cert()
+
+            mock_create.assert_called_once_with(expected_bundle)
+            mock_append.assert_called_once_with(instance.cert_path, expected_bundle)
+            mock_shell.assert_called_once_with("AWS_CA_BUNDLE", expected_bundle, '/tmp/.zshrc')
+
+    def test_aws_nonexistent_bundle_install_mode_fixes(self):
+        """setup_aws_cert fixes when AWS_CA_BUNDLE points to non-existent file."""
+        instance = self.create_fumitm_instance(mode='install')
+        expected_bundle = os.path.join(instance.bundle_dir, "aws/ca-bundle.pem")
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'verify_connection', return_value='FAILED'), \
+             patch.dict(os.environ, {'AWS_CA_BUNDLE': '/gone/ca-bundle.pem'}), \
+             patch('os.path.exists', return_value=False), \
+             patch.object(instance, '_safe_makedirs'), \
+             patch.object(instance, 'create_bundle_with_system_certs') as mock_create, \
+             patch.object(instance, 'safe_append_certificate'), \
+             patch.object(instance, 'detect_shell', return_value='zsh'), \
+             patch.object(instance, 'get_shell_config', return_value='/tmp/.zshrc'), \
+             patch.object(instance, 'add_to_shell_config') as mock_shell:
+
+            instance.setup_aws_cert()
+
+            mock_create.assert_called_once_with(expected_bundle)
+            mock_shell.assert_called_once_with("AWS_CA_BUNDLE", expected_bundle, '/tmp/.zshrc')
+
+    def test_aws_valid_bundle_with_cert_returns_early(self):
+        """setup_aws_cert returns early when bundle looks valid but aws still fails."""
+        instance = self.create_fumitm_instance(mode='install')
+        existing_bundle = '/Users/test/.netskope/aws/ca-bundle.pem'
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'verify_connection', return_value='FAILED'), \
+             patch.dict(os.environ, {'AWS_CA_BUNDLE': existing_bundle}), \
+             patch('os.path.exists', return_value=True), \
+             patch.object(instance, '_path_belongs_to_other_provider', return_value=None), \
+             patch.object(instance, 'is_suspicious_full_bundle', return_value=(False, None)), \
+             patch.object(instance, 'certificate_likely_exists_in_file', return_value=True), \
+             patch.object(instance, 'create_bundle_with_system_certs') as mock_create:
+
+            instance.setup_aws_cert()
+
+            # Should NOT create a new bundle — needs manual investigation
+            mock_create.assert_not_called()
+
+    def test_aws_bundle_missing_cert_install_mode_fixes(self):
+        """setup_aws_cert fixes when bundle exists but is missing the proxy cert."""
+        instance = self.create_fumitm_instance(mode='install')
+        existing_bundle = '/Users/test/.netskope/aws/old-bundle.pem'
+        expected_bundle = os.path.join(instance.bundle_dir, "aws/ca-bundle.pem")
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'verify_connection', return_value='FAILED'), \
+             patch.dict(os.environ, {'AWS_CA_BUNDLE': existing_bundle}), \
+             patch('os.path.exists', return_value=True), \
+             patch.object(instance, '_path_belongs_to_other_provider', return_value=None), \
+             patch.object(instance, 'is_suspicious_full_bundle', return_value=(False, None)), \
+             patch.object(instance, 'certificate_likely_exists_in_file', return_value=False), \
+             patch.object(instance, '_safe_makedirs'), \
+             patch.object(instance, 'create_bundle_with_system_certs') as mock_create, \
+             patch.object(instance, 'safe_append_certificate') as mock_append, \
+             patch.object(instance, 'detect_shell', return_value='zsh'), \
+             patch.object(instance, 'get_shell_config', return_value='/tmp/.zshrc'), \
+             patch.object(instance, 'add_to_shell_config') as mock_shell:
+
+            instance.setup_aws_cert()
+
+            mock_create.assert_called_once_with(expected_bundle)
+            mock_append.assert_called_once_with(instance.cert_path, expected_bundle)
+            mock_shell.assert_called_once_with("AWS_CA_BUNDLE", expected_bundle, '/tmp/.zshrc')
+
+    def test_aws_suspicious_bundle_install_mode_fixes(self):
+        """setup_aws_cert fixes when existing bundle is suspiciously small."""
+        instance = self.create_fumitm_instance(mode='install')
+        existing_bundle = '/Users/test/.netskope/aws/ca-bundle.pem'
+        expected_bundle = os.path.join(instance.bundle_dir, "aws/ca-bundle.pem")
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'verify_connection', return_value='FAILED'), \
+             patch.dict(os.environ, {'AWS_CA_BUNDLE': existing_bundle}), \
+             patch('os.path.exists', return_value=True), \
+             patch.object(instance, '_path_belongs_to_other_provider', return_value=None), \
+             patch.object(instance, 'is_suspicious_full_bundle', return_value=(True, 'only 1 cert')), \
+             patch.object(instance, '_safe_makedirs'), \
+             patch.object(instance, 'create_bundle_with_system_certs') as mock_create, \
+             patch.object(instance, 'safe_append_certificate'), \
+             patch.object(instance, 'detect_shell', return_value='zsh'), \
+             patch.object(instance, 'get_shell_config', return_value='/tmp/.zshrc'), \
+             patch.object(instance, 'add_to_shell_config'):
+
+            instance.setup_aws_cert()
+
+            mock_create.assert_called_once_with(expected_bundle)
+
+    def test_aws_tools_registry_entry_exists(self):
+        """Verify aws is in tools_registry with correct attributes."""
+        instance = self.create_fumitm_instance()
+        assert 'aws' in instance.tools_registry
+        entry = instance.tools_registry['aws']
+        assert entry['name'] == 'AWS CLI'
+        assert entry['scope'] == 'user'
+        assert 'setup_func' in entry
+        assert 'check_func' in entry
 
 
 if __name__ == '__main__':

@@ -10,6 +10,10 @@ Script to automatically verify and fix MITM TLS distrust issues commonly afflict
 # Fix everything in one shot (no prompts, no download needed)
 python3 <(curl -LsSf https://raw.githubusercontent.com/aberoham/fumitm/main/fumitm.py) --fix --yes
 source ~/.zshrc  # or ~/.bashrc
+
+# With sudo (needed for Java keystores, DBeaver, and other system-level fixes)
+sudo python3 <(curl -LsSf https://raw.githubusercontent.com/aberoham/fumitm/main/fumitm.py) --fix --yes --run-as-user $USER
+source ~/.zshrc  # or ~/.bashrc
 ```
 
 For more control, download the script first:
@@ -90,7 +94,7 @@ Something amiss or not quite right? Please post the full output of a run to an i
 
 ### Linux/macOS
 `./fumitm.py --list-tools` currently reports these Linux/macOS tool keys:
-`brew-cacerts`, `node`, `python`, `gcloud`, `java`, `jenv`, `gradle`, `dbeaver`, `wget`, `podman`, `rancher`, `android`, `colima`, `git`, `curl`.
+`brew-cacerts`, `node`, `python`, `gcloud`, `java`, `jenv`, `gradle`, `dbeaver`, `wget`, `podman`, `rancher`, `android`, `colima`, `git`, `curl`, `aws`.
 
 - **Homebrew CA Certificates (`brew-cacerts`)**: configures Homebrew's CA bundle (covers Homebrew OpenSSL consumers)
 - **Node.js/npm**: configures `NODE_EXTRA_CA_CERTS` for Node.js and the cafile setting for npm
@@ -98,6 +102,7 @@ Something amiss or not quite right? Please post the full output of a run to an i
 - **gcloud**: configures the `core/custom_ca_certs_file` for the Google Cloud `gcloud` CLI
 - **Git**: configures Git to use the custom certificate bundle via `http.sslCAInfo`
 - **curl**: configures `CURL_CA_BUNDLE` environment variable for curl
+- **AWS CLI**: configures `AWS_CA_BUNDLE` environment variable for AWS CLI (`aws configure sso`, `aws s3`, etc.)
 - **Java/JVM**: adds the provider certificate to any found Java keystore (cacerts)
 - **jenv**: adds the provider certificate to all jenv-managed Java installations
 - **DBeaver**: targets the bundled JRE and adds the certificate to its keystore
