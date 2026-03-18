@@ -503,6 +503,28 @@ class TestChangesmadeAccuracy(FumitmTestCase):
         """No tools processed at all returns False."""
         assert fumitm.FumitmPython._compute_changes_made([]) is False
 
+    def test_true_when_failed_with_changed_true(self):
+        """Partial failure (some installs succeeded) reports changes_made=True."""
+        results = [
+            ToolResult('java', 'failed', '1/2 configured; 1/2 failed', True),
+        ]
+        assert fumitm.FumitmPython._compute_changes_made(results) is True
+
+    def test_false_when_failed_with_changed_false(self):
+        """Total failure with explicit changed=False reports changes_made=False."""
+        results = [
+            ToolResult('java', 'failed', 'All 2 failed', False),
+        ]
+        assert fumitm.FumitmPython._compute_changes_made(results) is False
+
+    def test_true_when_mixed_changed_true_and_already_ok(self):
+        """Partial failure alongside already_ok still reports changes_made=True."""
+        results = [
+            ToolResult('java', 'failed', '1/2 configured; 1/2 failed', True),
+            ToolResult('node', 'already_ok', ''),
+        ]
+        assert fumitm.FumitmPython._compute_changes_made(results) is True
+
 
 class TestExitCodes(FumitmTestCase):
     """Exit codes: 0 success, 1 hard failure, 2 non-interactive, 3 partial."""
@@ -529,6 +551,16 @@ class TestExitCodes(FumitmTestCase):
         results = [
             ToolResult('a', 'completed', ''),
             ToolResult('b', 'failed', 'err'),
+        ]
+        code = instance._print_summary(results)
+        assert code == 3
+
+    def test_exit_3_partial_with_changed_true(self):
+        """Partial failure (changed=True) yields exit code 3."""
+        instance = self.create_fumitm_instance()
+        results = [
+            ToolResult('java', 'failed', '1/2 configured; 1/2 failed', True),
+            ToolResult('node', 'already_ok', ''),
         ]
         code = instance._print_summary(results)
         assert code == 3

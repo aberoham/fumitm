@@ -2200,7 +2200,7 @@ class FumitmPython:
                     if result.stderr:
                         self.print_debug(result.stderr.strip())
                     return ToolResult('brew-cacerts', 'failed', 'brew postinstall ca-certificates failed')
-            return
+            return ToolResult('brew-cacerts', 'completed', 'Needs brew postinstall ca-certificates')
 
         if self.certificate_exists_in_file(self.cert_path, bundle_path):
             self.print_debug(
@@ -3073,7 +3073,7 @@ class FumitmPython:
         aws cli commands (e.g., aws configure sso, aws s3 ls).
         """
         if not self.command_exists('aws'):
-            return
+            return ToolResult('aws', 'skipped', 'AWS CLI not installed')
 
         aws_bundle = os.path.join(self.bundle_dir, "aws/ca-bundle.pem")
         aws_env = os.environ.get('AWS_CA_BUNDLE', '')
@@ -3088,14 +3088,14 @@ class FumitmPython:
                 if not self.is_install_mode():
                     self.print_action(f"Would create AWS CA bundle at {aws_bundle}")
                     self.print_action(f"Would repoint AWS_CA_BUNDLE to {aws_bundle}")
-                    return
+                    return ToolResult('aws', 'failed', f'AWS_CA_BUNDLE points to previous provider ({other_provider})')
             elif not os.path.exists(aws_env):
                 self.print_info("Configuring AWS CLI certificate bundle...")
                 self.print_warn(f"AWS_CA_BUNDLE points to non-existent file: {aws_env}")
                 if not self.is_install_mode():
                     self.print_action(f"Would create AWS CA bundle at {aws_bundle}")
                     self.print_action(f"Would repoint AWS_CA_BUNDLE to {aws_bundle}")
-                    return
+                    return ToolResult('aws', 'failed', f'AWS_CA_BUNDLE points to non-existent file: {aws_env}')
             else:
                 suspicious, reason = self.is_suspicious_full_bundle(aws_env, self.cert_path)
                 if suspicious:
@@ -3104,7 +3104,7 @@ class FumitmPython:
                     if not self.is_install_mode():
                         self.print_action(f"Would create AWS CA bundle at {aws_bundle}")
                         self.print_action(f"Would repoint AWS_CA_BUNDLE to {aws_bundle}")
-                        return
+                        return ToolResult('aws', 'failed', f'AWS_CA_BUNDLE looks suspiciously small ({reason})')
                 elif not self.certificate_likely_exists_in_file(self.cert_path, aws_env):
                     # Bundle exists and looks OK but doesn't contain our proxy cert
                     self.print_info("Configuring AWS CLI certificate bundle...")
@@ -3112,25 +3112,26 @@ class FumitmPython:
                     if not self.is_install_mode():
                         self.print_action(f"Would create AWS CA bundle at {aws_bundle}")
                         self.print_action(f"Would repoint AWS_CA_BUNDLE to {aws_bundle}")
-                        return
+                        return ToolResult('aws', 'failed', 'AWS_CA_BUNDLE missing proxy certificate')
                 else:
                     if verify_result == "WORKING":
                         self.print_debug("AWS CLI already works with configured bundle, skipping configuration")
+                        return ToolResult('aws', 'already_ok', 'AWS CLI already works with configured bundle')
                     else:
                         # Bundle exists, looks OK, and contains our cert — unclear why it fails
                         self.print_warn("AWS CLI connection failed but AWS_CA_BUNDLE looks valid")
                         self.print_info("This may require manual investigation")
-                    return
+                        return ToolResult('aws', 'failed', 'AWS CLI connection failed but AWS_CA_BUNDLE looks valid')
         else:
             if verify_result == "WORKING":
                 self.print_debug("AWS CLI already works via system trust, skipping configuration")
-                return
+                return ToolResult('aws', 'already_ok', 'AWS CLI works via system trust')
             # Case 2: No AWS_CA_BUNDLE set and aws doesn't work
             self.print_info("Configuring AWS CLI certificate bundle...")
             if not self.is_install_mode():
                 self.print_action(f"Would create AWS CA bundle at {aws_bundle}")
                 self.print_action(f"Would set AWS_CA_BUNDLE={aws_bundle}")
-                return
+                return ToolResult('aws', 'failed', 'AWS_CA_BUNDLE not configured')
 
         # Create the bundle and configure
         self._safe_makedirs(os.path.dirname(aws_bundle))
@@ -3140,6 +3141,7 @@ class FumitmPython:
         shell_config = self.get_shell_config(shell_type)
         self.add_to_shell_config("AWS_CA_BUNDLE", aws_bundle, shell_config)
         self.print_info(f"Configured AWS_CA_BUNDLE to: {aws_bundle}")
+        return ToolResult('aws', 'configured', f'AWS_CA_BUNDLE set to {aws_bundle}')
 
     def check_git_status(self, temp_warp_cert):
         """Check Git configuration status for http.sslCAInfo."""
@@ -5308,7 +5310,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 'phase': 'summary',
                 'tool': None,
                 'action': None,
-                'result': 'partial' if failed > 0 else 'ok',
+                'result': 'partial' if (failed > 0 or partial > 0) else 'ok',
                 'message': summary_text,
                 'error_code': None,
             }

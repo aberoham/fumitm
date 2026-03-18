@@ -1122,12 +1122,13 @@ class TestStatusFunctionContracts(FumitmTestCase):
         status_methods = self.get_all_status_methods(instance)
 
         # Verify we found the expected methods (sanity check)
-        assert len(status_methods) >= 11, f"Expected at least 11 status methods, found {len(status_methods)}: {status_methods}"
+        assert len(status_methods) >= 16, f"Expected at least 16 status methods, found {len(status_methods)}: {status_methods}"
 
         # Expected methods based on the codebase
         expected_methods = [
             'check_brew_cacerts_status',
-            'check_git_status', 'check_node_status', 'check_python_status',
+            'check_git_status', 'check_curl_status', 'check_aws_status',
+            'check_node_status', 'check_python_status',
             'check_gcloud_status', 'check_java_status', 'check_jenv_status',
             'check_gradle_status', 'check_dbeaver_status', 'check_wget_status',
             'check_podman_status', 'check_rancher_status', 'check_android_status',
@@ -3233,21 +3234,23 @@ class TestAwsVerification(FumitmTestCase):
 class TestAwsSetup(FumitmTestCase):
     """Tests for AWS CLI setup_aws_cert function."""
 
-    def test_aws_not_installed_returns_early(self):
-        """setup_aws_cert returns early when aws not found."""
+    def test_aws_not_installed_returns_skipped(self):
+        """setup_aws_cert returns skipped when aws not found."""
         instance = self.create_fumitm_instance(mode='install')
         with patch.object(instance, 'command_exists', return_value=False):
             result = instance.setup_aws_cert()
-            assert result is None  # bare return
+            assert result.status == 'skipped'
+            assert result.tool == 'aws'
 
-    def test_aws_already_working_skips(self):
-        """setup_aws_cert skips when aws already works via system trust."""
+    def test_aws_already_working_returns_already_ok(self):
+        """setup_aws_cert returns already_ok when aws works via system trust."""
         instance = self.create_fumitm_instance(mode='install')
         with patch.object(instance, 'command_exists', return_value=True), \
              patch.object(instance, 'verify_connection', return_value='WORKING'), \
              patch.dict(os.environ, {}, clear=True):
             result = instance.setup_aws_cert()
-            assert result is None  # bare return, no changes needed
+            assert result.status == 'already_ok'
+            assert result.tool == 'aws'
 
     def test_aws_working_cross_provider_bundle_still_migrates(self):
         """setup_aws_cert should fix stale AWS_CA_BUNDLE even when aws still works."""
@@ -3265,20 +3268,22 @@ class TestAwsSetup(FumitmTestCase):
              patch.object(instance, 'get_shell_config', return_value='/tmp/.zshrc'), \
              patch.object(instance, 'add_to_shell_config') as mock_shell:
 
-            instance.setup_aws_cert()
+            result = instance.setup_aws_cert()
 
+            assert result.status == 'configured'
             mock_create.assert_called_once_with(expected_bundle)
             mock_append.assert_called_once_with(instance.cert_path, expected_bundle)
             mock_shell.assert_called_once_with("AWS_CA_BUNDLE", expected_bundle, '/tmp/.zshrc')
 
     def test_aws_no_bundle_status_mode(self):
-        """setup_aws_cert in status mode prints actions without making changes."""
+        """setup_aws_cert in status mode returns failed (needs configuration)."""
         instance = self.create_fumitm_instance(mode='status')
         with patch.object(instance, 'command_exists', return_value=True), \
              patch.object(instance, 'verify_connection', return_value='FAILED'), \
              patch.dict(os.environ, {}, clear=True):
             result = instance.setup_aws_cert()
-            assert result is None  # returns in status mode
+            assert result.status == 'failed'
+            assert result.tool == 'aws'
 
     def test_aws_no_bundle_install_mode_creates_bundle(self):
         """setup_aws_cert creates bundle and configures env var when no bundle set."""
@@ -3295,8 +3300,10 @@ class TestAwsSetup(FumitmTestCase):
              patch.object(instance, 'get_shell_config', return_value='/tmp/.zshrc'), \
              patch.object(instance, 'add_to_shell_config') as mock_shell:
 
-            instance.setup_aws_cert()
+            result = instance.setup_aws_cert()
 
+            assert result.status == 'configured'
+            assert result.tool == 'aws'
             mock_makedirs.assert_called_once_with(os.path.dirname(expected_bundle))
             mock_create.assert_called_once_with(expected_bundle)
             mock_append.assert_called_once_with(instance.cert_path, expected_bundle)
@@ -3318,8 +3325,9 @@ class TestAwsSetup(FumitmTestCase):
              patch.object(instance, 'get_shell_config', return_value='/tmp/.zshrc'), \
              patch.object(instance, 'add_to_shell_config') as mock_shell:
 
-            instance.setup_aws_cert()
+            result = instance.setup_aws_cert()
 
+            assert result.status == 'configured'
             mock_create.assert_called_once_with(expected_bundle)
             mock_append.assert_called_once_with(instance.cert_path, expected_bundle)
             mock_shell.assert_called_once_with("AWS_CA_BUNDLE", expected_bundle, '/tmp/.zshrc')
@@ -3340,8 +3348,9 @@ class TestAwsSetup(FumitmTestCase):
              patch.object(instance, 'get_shell_config', return_value='/tmp/.zshrc'), \
              patch.object(instance, 'add_to_shell_config') as mock_shell:
 
-            instance.setup_aws_cert()
+            result = instance.setup_aws_cert()
 
+            assert result.status == 'configured'
             mock_create.assert_called_once_with(expected_bundle)
             mock_shell.assert_called_once_with("AWS_CA_BUNDLE", expected_bundle, '/tmp/.zshrc')
 
@@ -3359,8 +3368,10 @@ class TestAwsSetup(FumitmTestCase):
              patch.object(instance, 'certificate_likely_exists_in_file', return_value=True), \
              patch.object(instance, 'create_bundle_with_system_certs') as mock_create:
 
-            instance.setup_aws_cert()
+            result = instance.setup_aws_cert()
 
+            assert result.status == 'failed'
+            assert 'AWS_CA_BUNDLE looks valid' in result.message
             # Should NOT create a new bundle — needs manual investigation
             mock_create.assert_not_called()
 
@@ -3384,8 +3395,9 @@ class TestAwsSetup(FumitmTestCase):
              patch.object(instance, 'get_shell_config', return_value='/tmp/.zshrc'), \
              patch.object(instance, 'add_to_shell_config') as mock_shell:
 
-            instance.setup_aws_cert()
+            result = instance.setup_aws_cert()
 
+            assert result.status == 'configured'
             mock_create.assert_called_once_with(expected_bundle)
             mock_append.assert_called_once_with(instance.cert_path, expected_bundle)
             mock_shell.assert_called_once_with("AWS_CA_BUNDLE", expected_bundle, '/tmp/.zshrc')
@@ -3409,8 +3421,9 @@ class TestAwsSetup(FumitmTestCase):
              patch.object(instance, 'get_shell_config', return_value='/tmp/.zshrc'), \
              patch.object(instance, 'add_to_shell_config'):
 
-            instance.setup_aws_cert()
+            result = instance.setup_aws_cert()
 
+            assert result.status == 'configured'
             mock_create.assert_called_once_with(expected_bundle)
 
     def test_aws_tools_registry_entry_exists(self):
