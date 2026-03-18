@@ -629,9 +629,9 @@ class TestJavaMultiInstallation(FumitmTestCase):
         sdkman_java_dir = os.path.expanduser('~/.sdkman/candidates/java')
         sdkman_versions = ['21.0.2-tem', '17.0.10-tem', '11.0.22-tem']
 
-        def exists_side_effect(path):
+        def isfile_side_effect(path):
             if path == sdkman_java_dir:
-                return True
+                return False
             if 'lib/security/cacerts' in path:
                 return True
             return False
@@ -645,7 +645,7 @@ class TestJavaMultiInstallation(FumitmTestCase):
 
         with patch('platform.system', return_value='Darwin'), \
              patch.dict(os.environ, {'JAVA_HOME': '', 'SDKMAN_DIR': ''}, clear=False), \
-             patch('os.path.exists', side_effect=exists_side_effect), \
+             patch('os.path.isfile', side_effect=isfile_side_effect), \
              patch('os.path.isdir', side_effect=isdir_side_effect), \
              patch('os.listdir', return_value=['21.0.2-tem', '17.0.10-tem', '11.0.22-tem', 'current']), \
              patch('subprocess.run') as mock_run:
@@ -730,7 +730,7 @@ class TestJavaMultiInstallation(FumitmTestCase):
             return path in {sdkman_java_dir, version_dir, bundle_home,
                             os.path.join(version_dir, 'zulu-11.jdk')}
 
-        def exists_side_effect(path):
+        def isfile_side_effect(path):
             return path == cacerts
 
         def listdir_side_effect(path):
@@ -742,7 +742,7 @@ class TestJavaMultiInstallation(FumitmTestCase):
 
         with patch('platform.system', return_value='Darwin'), \
              patch.dict(os.environ, {'JAVA_HOME': '', 'SDKMAN_DIR': ''}, clear=False), \
-             patch('os.path.exists', side_effect=exists_side_effect), \
+             patch('os.path.isfile', side_effect=isfile_side_effect), \
              patch('os.path.isdir', side_effect=isdir_side_effect), \
              patch('os.listdir', side_effect=listdir_side_effect), \
              patch('subprocess.run') as mock_run:
@@ -772,7 +772,7 @@ class TestJavaMultiInstallation(FumitmTestCase):
                 return True
             return False
 
-        def exists_side_effect(path):
+        def isfile_side_effect(path):
             if 'lib/security/cacerts' in path and '21.0.2-tem' in path:
                 return True
             return False
@@ -780,7 +780,7 @@ class TestJavaMultiInstallation(FumitmTestCase):
         env = {'SDKMAN_DIR': custom_sdkman_root, 'JAVA_HOME': ''}
         with patch('platform.system', return_value='Darwin'), \
              patch.dict(os.environ, env, clear=False), \
-             patch('os.path.exists', side_effect=exists_side_effect), \
+             patch('os.path.isfile', side_effect=isfile_side_effect), \
              patch('os.path.isdir', side_effect=isdir_side_effect), \
              patch('os.listdir', return_value=['21.0.2-tem', 'current']), \
              patch('subprocess.run') as mock_run:
@@ -2636,7 +2636,9 @@ class TestToolResultAccuracy(FumitmTestCase):
 
             result = instance.setup_java_cert()
             assert result.status == 'failed'
-            assert '1/2' in result.message
+            assert result.changed is True
+            assert '1/2 Java installation(s) configured' in result.message
+            assert '1/2 failed' in result.message
 
     def test_java_all_succeed_returns_configured(self):
         """setup_java_cert returns configured when all JDKs are newly configured."""
@@ -2738,6 +2740,7 @@ class TestToolResultAccuracy(FumitmTestCase):
 
             result = instance.setup_jenv_cert()
             assert result.status == 'failed'
+            assert result.tool == 'jenv'
 
     def test_jenv_no_homes_returns_skipped(self):
         """setup_jenv_cert returns skipped when no jenv installations found."""
@@ -2753,6 +2756,47 @@ class TestToolResultAccuracy(FumitmTestCase):
              patch.object(instance, 'command_exists', return_value=False):
             result = instance.setup_jenv_cert()
             assert result.status == 'skipped'
+            assert result.tool == 'jenv'
+
+    def test_jenv_mixed_results_marks_change_state(self):
+        """setup_jenv_cert preserves partial success when some installs fail."""
+        instance = self.create_fumitm_instance(mode='install')
+        fake_java_homes = [
+            '/Users/user/.jenv/versions/17.0',
+            '/Users/user/.jenv/versions/21.0',
+        ]
+
+        with patch.object(instance, 'get_jenv_java_homes', return_value=fake_java_homes), \
+             patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'find_java_cacerts', return_value='/fake/cacerts'), \
+             patch('subprocess.run') as mock_run:
+
+            call_count = [0]
+
+            def run_side_effect(*args, **kwargs):
+                call_count[0] += 1
+                result = MagicMock()
+                cmd = args[0]
+                if '-list' in cmd:
+                    result.returncode = 1
+                    result.stdout = ''
+                elif '-import' in cmd:
+                    if call_count[0] == 2:
+                        result.returncode = 0
+                        result.stdout = 'Certificate was added'
+                    else:
+                        result.returncode = 1
+                        result.stdout = 'Permission denied'
+                return result
+
+            mock_run.side_effect = run_side_effect
+
+            result = instance.setup_jenv_cert()
+            assert result.status == 'failed'
+            assert result.tool == 'jenv'
+            assert result.changed is True
+            assert '1/2 jenv installation(s) configured' in result.message
+            assert '1/2 failed' in result.message
 
     def test_dbeaver_not_installed_returns_skipped(self):
         """setup_dbeaver_cert returns skipped when DBeaver not found."""
@@ -3200,9 +3244,32 @@ class TestAwsSetup(FumitmTestCase):
         """setup_aws_cert skips when aws already works via system trust."""
         instance = self.create_fumitm_instance(mode='install')
         with patch.object(instance, 'command_exists', return_value=True), \
-             patch.object(instance, 'verify_connection', return_value='WORKING'):
+             patch.object(instance, 'verify_connection', return_value='WORKING'), \
+             patch.dict(os.environ, {}, clear=True):
             result = instance.setup_aws_cert()
             assert result is None  # bare return, no changes needed
+
+    def test_aws_working_cross_provider_bundle_still_migrates(self):
+        """setup_aws_cert should fix stale AWS_CA_BUNDLE even when aws still works."""
+        instance = self.create_fumitm_instance(mode='install', provider='netskope')
+        warp_bundle = os.path.expanduser("~/.cloudflare-warp/aws/ca-bundle.pem")
+        expected_bundle = os.path.join(instance.bundle_dir, "aws/ca-bundle.pem")
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'verify_connection', return_value='WORKING'), \
+             patch.dict(os.environ, {'AWS_CA_BUNDLE': warp_bundle}), \
+             patch.object(instance, '_safe_makedirs'), \
+             patch.object(instance, 'create_bundle_with_system_certs') as mock_create, \
+             patch.object(instance, 'safe_append_certificate') as mock_append, \
+             patch.object(instance, 'detect_shell', return_value='zsh'), \
+             patch.object(instance, 'get_shell_config', return_value='/tmp/.zshrc'), \
+             patch.object(instance, 'add_to_shell_config') as mock_shell:
+
+            instance.setup_aws_cert()
+
+            mock_create.assert_called_once_with(expected_bundle)
+            mock_append.assert_called_once_with(instance.cert_path, expected_bundle)
+            mock_shell.assert_called_once_with("AWS_CA_BUNDLE", expected_bundle, '/tmp/.zshrc')
 
     def test_aws_no_bundle_status_mode(self):
         """setup_aws_cert in status mode prints actions without making changes."""

@@ -194,7 +194,10 @@ class NonInteractiveError(Exception):
 #   'completed'   - ran without errors, change status unknown (legacy wrapper)
 #   'skipped'     - tool not installed or no user context
 #   'failed'      - errors occurred
-ToolResult = namedtuple('ToolResult', ['tool', 'status', 'message'])
+# Optional `changed` flag preserves explicit change state for partial failures.
+ToolResult = namedtuple(
+    'ToolResult', ['tool', 'status', 'message', 'changed'], defaults=[None]
+)
 
 
 class FumitmPython:
@@ -3072,14 +3075,9 @@ class FumitmPython:
         if not self.command_exists('aws'):
             return
 
-        # First check if aws already works (e.g., via system trust store)
-        verify_result = self.verify_connection("aws")
-        if verify_result == "WORKING":
-            self.print_debug("AWS CLI already works via system trust, skipping configuration")
-            return
-
         aws_bundle = os.path.join(self.bundle_dir, "aws/ca-bundle.pem")
         aws_env = os.environ.get('AWS_CA_BUNDLE', '')
+        verify_result = self.verify_connection("aws")
 
         # Case 1: AWS_CA_BUNDLE is set — check for provider mismatch first
         if aws_env:
@@ -3116,11 +3114,17 @@ class FumitmPython:
                         self.print_action(f"Would repoint AWS_CA_BUNDLE to {aws_bundle}")
                         return
                 else:
-                    # Bundle exists, looks OK, and contains our cert — unclear why it fails
-                    self.print_warn("AWS CLI connection failed but AWS_CA_BUNDLE looks valid")
-                    self.print_info("This may require manual investigation")
+                    if verify_result == "WORKING":
+                        self.print_debug("AWS CLI already works with configured bundle, skipping configuration")
+                    else:
+                        # Bundle exists, looks OK, and contains our cert — unclear why it fails
+                        self.print_warn("AWS CLI connection failed but AWS_CA_BUNDLE looks valid")
+                        self.print_info("This may require manual investigation")
                     return
         else:
+            if verify_result == "WORKING":
+                self.print_debug("AWS CLI already works via system trust, skipping configuration")
+                return
             # Case 2: No AWS_CA_BUNDLE set and aws doesn't work
             self.print_info("Configuring AWS CLI certificate bundle...")
             if not self.is_install_mode():
@@ -3395,7 +3399,14 @@ class FumitmPython:
         if failed_count > 0 and configured_count == 0 and already_ok_count == 0:
             return ToolResult('java', 'failed', f'All {failed_count} Java installation(s) failed')
         if failed_count > 0:
-            return ToolResult('java', 'failed', f'{failed_count}/{total} Java installation(s) failed')
+            changed = configured_count > 0
+            message_parts = []
+            if configured_count > 0:
+                message_parts.append(f'{configured_count}/{total} Java installation(s) configured')
+            if already_ok_count > 0:
+                message_parts.append(f'{already_ok_count}/{total} already OK')
+            message_parts.append(f'{failed_count}/{total} failed')
+            return ToolResult('java', 'failed', '; '.join(message_parts), changed)
         if configured_count > 0:
             return ToolResult('java', 'configured', f'{configured_count}/{total} Java installation(s) configured')
         return ToolResult('java', 'already_ok', 'All Java installations already configured')
@@ -3405,11 +3416,11 @@ class FumitmPython:
         java_homes = self.get_jenv_java_homes()
 
         if not java_homes:
-            return ToolResult('java-jenv', 'skipped', 'No jenv installations found')
+            return ToolResult('jenv', 'skipped', 'No jenv installations found')
 
         if not self.command_exists('keytool'):
             self.print_warn("keytool not found, cannot configure jenv Java installations")
-            return ToolResult('java-jenv', 'skipped', 'keytool not found')
+            return ToolResult('jenv', 'skipped', 'keytool not found')
 
         self.print_info(f"Found {len(java_homes)} jenv-managed Java installation(s)")
 
@@ -3469,12 +3480,19 @@ class FumitmPython:
 
         total = len(java_homes)
         if failed_count > 0 and configured_count == 0 and already_ok_count == 0:
-            return ToolResult('java-jenv', 'failed', f'All {failed_count} jenv installation(s) failed')
+            return ToolResult('jenv', 'failed', f'All {failed_count} jenv installation(s) failed')
         if failed_count > 0:
-            return ToolResult('java-jenv', 'failed', f'{failed_count}/{total} jenv installation(s) failed')
+            changed = configured_count > 0
+            message_parts = []
+            if configured_count > 0:
+                message_parts.append(f'{configured_count}/{total} jenv installation(s) configured')
+            if already_ok_count > 0:
+                message_parts.append(f'{already_ok_count}/{total} already OK')
+            message_parts.append(f'{failed_count}/{total} failed')
+            return ToolResult('jenv', 'failed', '; '.join(message_parts), changed)
         if configured_count > 0:
-            return ToolResult('java-jenv', 'configured', f'{configured_count}/{total} jenv installation(s) configured')
-        return ToolResult('java-jenv', 'already_ok', 'All jenv installations already configured')
+            return ToolResult('jenv', 'configured', f'{configured_count}/{total} jenv installation(s) configured')
+        return ToolResult('jenv', 'already_ok', 'All jenv installations already configured')
 
     def setup_gradle_cert(self):
         """Setup Gradle certificate configuration."""
@@ -5211,12 +5229,18 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         """
         if not results:
             return False
+        if any(getattr(r, 'changed', None) is True for r in results):
+            return True
         if all(r.status == 'skipped' for r in results):
             return False
         has_configured = any(r.status == 'configured' for r in results)
         has_already_ok = any(r.status == 'already_ok' for r in results)
         if has_configured:
             return True
+        if any(getattr(r, 'changed', None) is False for r in results) and not any(
+            r.status == 'completed' for r in results
+        ):
+            return False
         if has_already_ok and not any(r.status == 'completed' for r in results):
             return False
         return None
@@ -5226,11 +5250,15 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         counts = {}
         for r in results:
             counts[r.status] = counts.get(r.status, 0) + 1
+        partial = sum(
+            1 for r in results
+            if r.status == 'failed' and getattr(r, 'changed', None) is True
+        )
         configured = counts.get('configured', 0)
         completed = counts.get('completed', 0)
         already_ok = counts.get('already_ok', 0)
         skipped = counts.get('skipped', 0)
-        failed = counts.get('failed', 0)
+        failed = counts.get('failed', 0) - partial
 
         parts = []
         if configured:
@@ -5241,6 +5269,8 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             parts.append(f"{already_ok} already OK")
         if skipped:
             parts.append(f"{skipped} skipped")
+        if partial:
+            parts.append(f"{partial} partially configured")
         if failed:
             parts.append(f"{failed} failed")
         summary_text = ', '.join(parts) if parts else 'no tools processed'
@@ -5248,10 +5278,11 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         self.print_info(f"Summary: {summary_text}")
 
         changes_made = self._compute_changes_made(results)
-        succeeded = configured + already_ok + completed
-        if failed > 0 and succeeded == 0:
+        succeeded = configured + already_ok + completed + partial
+        problems = failed + partial
+        if problems > 0 and succeeded == 0:
             exit_code = 1
-        elif failed > 0:
+        elif problems > 0:
             exit_code = 3
         else:
             exit_code = 0
@@ -5262,6 +5293,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             'completed': completed,
             'already_ok': already_ok,
             'skipped': skipped,
+            'partial': partial,
             'failed': failed,
             'exit_code': exit_code,
         }
