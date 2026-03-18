@@ -194,7 +194,10 @@ class NonInteractiveError(Exception):
 #   'completed'   - ran without errors, change status unknown (legacy wrapper)
 #   'skipped'     - tool not installed or no user context
 #   'failed'      - errors occurred
-ToolResult = namedtuple('ToolResult', ['tool', 'status', 'message'])
+# Optional `changed` flag preserves explicit change state for partial failures.
+ToolResult = namedtuple(
+    'ToolResult', ['tool', 'status', 'message', 'changed'], defaults=[None]
+)
 
 
 class FumitmPython:
@@ -388,6 +391,14 @@ class FumitmPython:
                 'setup_func': self.setup_curl_cert,
                 'check_func': self.check_curl_status,
                 'description': 'curl HTTP client',
+                'scope': 'user',
+            },
+            'aws': {
+                'name': 'AWS CLI',
+                'tags': ['aws', 'aws-cli', 'amazon', 'cloud'],
+                'setup_func': self.setup_aws_cert,
+                'check_func': self.check_aws_status,
+                'description': 'AWS CLI (aws command)',
                 'scope': 'user',
             },
         }
@@ -1243,9 +1254,9 @@ class FumitmPython:
         if not java_home:
             return ''
         cacerts = os.path.join(java_home, 'lib/security/cacerts')
-        if not os.path.exists(cacerts):
+        if not os.path.isfile(cacerts):
             cacerts = os.path.join(java_home, 'jre/lib/security/cacerts')
-        return cacerts if os.path.exists(cacerts) else ''
+        return cacerts if os.path.isfile(cacerts) else ''
 
     def java_version_label(self, java_home):
         """Derive a human-readable label from a Java home path, e.g. 'temurin-21'."""
@@ -2132,7 +2143,7 @@ class FumitmPython:
         tools that link against Homebrew OpenSSL.
         """
         if not self.command_exists('brew'):
-            return
+            return ToolResult('brew-cacerts', 'skipped', 'Homebrew not installed')
 
         try:
             result = subprocess.run(
@@ -2141,9 +2152,9 @@ class FumitmPython:
             )
             if result.returncode != 0:
                 self.print_debug("Homebrew ca-certificates formula not installed")
-                return
+                return ToolResult('brew-cacerts', 'skipped', 'ca-certificates formula not installed')
         except Exception:
-            return
+            return ToolResult('brew-cacerts', 'skipped', 'Failed to check brew')
 
         brew_prefix = self._get_brew_prefix()
         bundle_path = os.path.join(
@@ -2171,6 +2182,7 @@ class FumitmPython:
                             "Homebrew CA bundle now includes "
                             "proxy certificate"
                         )
+                        return ToolResult('brew-cacerts', 'configured', 'Bundle regenerated with proxy certificate')
                     else:
                         self.print_warn(
                             "brew postinstall succeeded but proxy "
@@ -2180,19 +2192,21 @@ class FumitmPython:
                             "The proxy CA may not be in the "
                             "macOS system keychain"
                         )
+                        return ToolResult('brew-cacerts', 'failed', 'Proxy certificate not found in bundle after postinstall')
                 else:
                     self.print_error(
                         "brew postinstall ca-certificates failed"
                     )
                     if result.stderr:
                         self.print_debug(result.stderr.strip())
+                    return ToolResult('brew-cacerts', 'failed', 'brew postinstall ca-certificates failed')
             return
 
         if self.certificate_exists_in_file(self.cert_path, bundle_path):
             self.print_debug(
                 "Proxy certificate already in Homebrew CA bundle"
             )
-            return
+            return ToolResult('brew-cacerts', 'already_ok', 'Proxy certificate already in Homebrew CA bundle')
 
         self.print_info("Configuring Homebrew CA certificates...")
         if not self.is_install_mode():
@@ -2214,6 +2228,7 @@ class FumitmPython:
                     self.print_info(
                         "Homebrew CA bundle now includes proxy certificate"
                     )
+                    return ToolResult('brew-cacerts', 'configured', 'Bundle regenerated with proxy certificate')
                 else:
                     self.print_warn(
                         "brew postinstall succeeded but proxy certificate "
@@ -2222,12 +2237,14 @@ class FumitmPython:
                     self.print_warn(
                         "The proxy CA may not be in the macOS system keychain"
                     )
+                    return ToolResult('brew-cacerts', 'failed', 'Proxy certificate not found in bundle after postinstall')
             else:
                 self.print_error(
                     "brew postinstall ca-certificates failed"
                 )
                 if result.stderr:
                     self.print_debug(result.stderr.strip())
+                return ToolResult('brew-cacerts', 'failed', 'brew postinstall ca-certificates failed')
 
     def setup_node_cert(self):
         """Setup Node.js certificate."""
@@ -3048,6 +3065,82 @@ class FumitmPython:
         self.add_to_shell_config("CURL_CA_BUNDLE", curl_bundle, shell_config)
         self.print_info(f"Configured CURL_CA_BUNDLE to: {curl_bundle}")
 
+    def setup_aws_cert(self):
+        """Setup AWS CLI certificate configuration.
+
+        Configures AWS_CA_BUNDLE environment variable to point to a CA bundle
+        that includes the proxy's certificate. This fixes SSL errors when using
+        aws cli commands (e.g., aws configure sso, aws s3 ls).
+        """
+        if not self.command_exists('aws'):
+            return
+
+        aws_bundle = os.path.join(self.bundle_dir, "aws/ca-bundle.pem")
+        aws_env = os.environ.get('AWS_CA_BUNDLE', '')
+        verify_result = self.verify_connection("aws")
+
+        # Case 1: AWS_CA_BUNDLE is set — check for provider mismatch first
+        if aws_env:
+            other_provider = self._path_belongs_to_other_provider(aws_env)
+            if other_provider:
+                self.print_info("Configuring AWS CLI certificate bundle...")
+                self.print_info(f"AWS_CA_BUNDLE points to previous provider ({other_provider}): {aws_env}")
+                if not self.is_install_mode():
+                    self.print_action(f"Would create AWS CA bundle at {aws_bundle}")
+                    self.print_action(f"Would repoint AWS_CA_BUNDLE to {aws_bundle}")
+                    return
+            elif not os.path.exists(aws_env):
+                self.print_info("Configuring AWS CLI certificate bundle...")
+                self.print_warn(f"AWS_CA_BUNDLE points to non-existent file: {aws_env}")
+                if not self.is_install_mode():
+                    self.print_action(f"Would create AWS CA bundle at {aws_bundle}")
+                    self.print_action(f"Would repoint AWS_CA_BUNDLE to {aws_bundle}")
+                    return
+            else:
+                suspicious, reason = self.is_suspicious_full_bundle(aws_env, self.cert_path)
+                if suspicious:
+                    self.print_info("Configuring AWS CLI certificate bundle...")
+                    self.print_warn(f"Existing AWS_CA_BUNDLE looks suspiciously small ({reason})")
+                    if not self.is_install_mode():
+                        self.print_action(f"Would create AWS CA bundle at {aws_bundle}")
+                        self.print_action(f"Would repoint AWS_CA_BUNDLE to {aws_bundle}")
+                        return
+                elif not self.certificate_likely_exists_in_file(self.cert_path, aws_env):
+                    # Bundle exists and looks OK but doesn't contain our proxy cert
+                    self.print_info("Configuring AWS CLI certificate bundle...")
+                    self.print_info(f"AWS_CA_BUNDLE bundle is missing the {self.provider['name']} proxy certificate")
+                    if not self.is_install_mode():
+                        self.print_action(f"Would create AWS CA bundle at {aws_bundle}")
+                        self.print_action(f"Would repoint AWS_CA_BUNDLE to {aws_bundle}")
+                        return
+                else:
+                    if verify_result == "WORKING":
+                        self.print_debug("AWS CLI already works with configured bundle, skipping configuration")
+                    else:
+                        # Bundle exists, looks OK, and contains our cert — unclear why it fails
+                        self.print_warn("AWS CLI connection failed but AWS_CA_BUNDLE looks valid")
+                        self.print_info("This may require manual investigation")
+                    return
+        else:
+            if verify_result == "WORKING":
+                self.print_debug("AWS CLI already works via system trust, skipping configuration")
+                return
+            # Case 2: No AWS_CA_BUNDLE set and aws doesn't work
+            self.print_info("Configuring AWS CLI certificate bundle...")
+            if not self.is_install_mode():
+                self.print_action(f"Would create AWS CA bundle at {aws_bundle}")
+                self.print_action(f"Would set AWS_CA_BUNDLE={aws_bundle}")
+                return
+
+        # Create the bundle and configure
+        self._safe_makedirs(os.path.dirname(aws_bundle))
+        self.create_bundle_with_system_certs(aws_bundle)
+        self.safe_append_certificate(self.cert_path, aws_bundle)
+        shell_type = self.detect_shell()
+        shell_config = self.get_shell_config(shell_type)
+        self.add_to_shell_config("AWS_CA_BUNDLE", aws_bundle, shell_config)
+        self.print_info(f"Configured AWS_CA_BUNDLE to: {aws_bundle}")
+
     def check_git_status(self, temp_warp_cert):
         """Check Git configuration status for http.sslCAInfo."""
         has_issues = False
@@ -3141,6 +3234,59 @@ class FumitmPython:
             self.print_info("  - curl not installed")
         return has_issues
 
+    def check_aws_status(self, temp_warp_cert):
+        """Check AWS CLI configuration status."""
+        has_issues = False
+        if self.command_exists('aws'):
+            # First, verify if aws can actually connect
+            verify_result = self.verify_connection("aws")
+
+            if verify_result == "WORKING":
+                self.print_info("  ✓ AWS CLI can connect through proxy")
+
+                # Check env var status (informational only)
+                aws_bundle = os.environ.get('AWS_CA_BUNDLE', '')
+                if aws_bundle:
+                    self.print_info(f"  - AWS_CA_BUNDLE is set to: {aws_bundle}")
+                    other_provider = self._path_belongs_to_other_provider(aws_bundle)
+                    if other_provider:
+                        self.print_warn(f"  ⚠ AWS_CA_BUNDLE points to a previous provider's path ({other_provider})")
+                        self.print_action("    Run with --fix to migrate to the current provider's bundle")
+                        has_issues = True
+                    elif os.path.exists(aws_bundle):
+                        suspicious, reason = self.is_suspicious_full_bundle(aws_bundle, temp_warp_cert)
+                        if suspicious:
+                            self.print_warn(f"  ⚠ AWS_CA_BUNDLE looks suspiciously small ({reason})")
+                            self.print_action("    Run with --fix to repoint to a full CA bundle")
+                            has_issues = True
+                else:
+                    self.print_info("  - Using system certificate trust (no custom CA needed)")
+            else:
+                # aws doesn't work, check configuration
+                aws_bundle = os.environ.get('AWS_CA_BUNDLE', '')
+                if aws_bundle:
+                    other_provider = self._path_belongs_to_other_provider(aws_bundle)
+                    if other_provider:
+                        self.print_warn(f"  ✗ AWS_CA_BUNDLE points to a previous provider's path ({other_provider})")
+                        self.print_action("    Run with --fix to migrate to the current provider's bundle")
+                    elif os.path.exists(aws_bundle):
+                        suspicious, reason = self.is_suspicious_full_bundle(aws_bundle, temp_warp_cert)
+                        if suspicious:
+                            self.print_warn(f"  ✗ AWS_CA_BUNDLE points to suspicious bundle ({reason})")
+                            self.print_action("    Run with --fix to create a full CA bundle")
+                        else:
+                            self.print_warn("  ✗ AWS CLI configured but connection test failed")
+                    else:
+                        self.print_warn(f"  ✗ AWS_CA_BUNDLE points to non-existent file: {aws_bundle}")
+                    has_issues = True
+                else:
+                    self.print_warn("  ✗ AWS CLI connection test failed")
+                    self.print_action("    Run with --fix to configure AWS_CA_BUNDLE")
+                    has_issues = True
+        else:
+            self.print_info("  - AWS CLI not installed")
+        return has_issues
+
     def get_jenv_java_homes(self):
         """Get unique Java home directories from jenv.
 
@@ -3185,18 +3331,22 @@ class FumitmPython:
     def setup_java_cert(self):
         """Setup Java certificate for all detected installations."""
         if not self.command_exists('java') and not self.command_exists('keytool'):
-            return
+            return ToolResult('java', 'skipped', 'Java/keytool not found')
 
         # Find all Java installations
         java_homes = self.find_all_java_homes()
 
         if not java_homes:
             self.print_warn("No Java installations found")
-            return
+            return ToolResult('java', 'skipped', 'No Java installations found')
 
         # Show count if multiple installations found
         if len(java_homes) > 1:
             self.print_info(f"Found {len(java_homes)} Java installation(s)")
+
+        configured_count = 0
+        already_ok_count = 0
+        failed_count = 0
 
         # Process each Java installation
         for java_home in java_homes:
@@ -3205,6 +3355,7 @@ class FumitmPython:
             cacerts = self.find_java_cacerts(java_home)
             if not cacerts:
                 self.print_warn(f"  ✗ {version_name}: Could not find cacerts file")
+                failed_count += 1
                 continue
 
             # Check if certificate already exists
@@ -3216,6 +3367,7 @@ class FumitmPython:
                 )
                 if result.returncode == 0 and self.provider['keytool_alias'] in result.stdout.decode():
                     self.print_info(f"  ✓ {version_name}: Certificate already installed")
+                    already_ok_count += 1
                     continue
             except Exception:
                 pass
@@ -3232,6 +3384,7 @@ class FumitmPython:
                 )
                 if result.returncode == 0:
                     self.print_info(f"    ✓ {version_name}: Certificate added successfully")
+                    configured_count += 1
                 else:
                     self.print_warn(f"    ✗ {version_name}: Failed to add certificate (may require sudo)")
                     self.print_info( "      Fix with:")
@@ -3240,29 +3393,48 @@ class FumitmPython:
                     print(f"          -file {self.cert_path} \\")
                     print(f"          -keystore {cacerts} \\")
                     print( "          -storepass changeit -noprompt")
+                    failed_count += 1
+
+        total = len(java_homes)
+        if failed_count > 0 and configured_count == 0 and already_ok_count == 0:
+            return ToolResult('java', 'failed', f'All {failed_count} Java installation(s) failed')
+        if failed_count > 0:
+            changed = configured_count > 0
+            message_parts = []
+            if configured_count > 0:
+                message_parts.append(f'{configured_count}/{total} Java installation(s) configured')
+            if already_ok_count > 0:
+                message_parts.append(f'{already_ok_count}/{total} already OK')
+            message_parts.append(f'{failed_count}/{total} failed')
+            return ToolResult('java', 'failed', '; '.join(message_parts), changed)
+        if configured_count > 0:
+            return ToolResult('java', 'configured', f'{configured_count}/{total} Java installation(s) configured')
+        return ToolResult('java', 'already_ok', 'All Java installations already configured')
 
     def setup_jenv_cert(self):
         """Setup Java certificates for all jenv-managed Java installations."""
         java_homes = self.get_jenv_java_homes()
 
         if not java_homes:
-            return
+            return ToolResult('jenv', 'skipped', 'No jenv installations found')
 
         if not self.command_exists('keytool'):
             self.print_warn("keytool not found, cannot configure jenv Java installations")
-            return
+            return ToolResult('jenv', 'skipped', 'keytool not found')
 
         self.print_info(f"Found {len(java_homes)} jenv-managed Java installation(s)")
+
+        configured_count = 0
+        already_ok_count = 0
+        failed_count = 0
 
         for java_home in java_homes:
             version_name = self.java_version_label(java_home)
 
-            cacerts = os.path.join(java_home, "lib/security/cacerts")
-            if not os.path.exists(cacerts):
-                cacerts = os.path.join(java_home, "jre/lib/security/cacerts")
-
-            if not os.path.exists(cacerts):
-                self.print_warn(f"  Skipping {version_name}: cacerts file not found at {cacerts}")
+            cacerts = self.find_java_cacerts(java_home)
+            if not cacerts:
+                self.print_warn(f"  Skipping {version_name}: cacerts file not found")
+                failed_count += 1
                 continue
 
             # Check if certificate already exists
@@ -3275,6 +3447,7 @@ class FumitmPython:
                 if result.returncode == 0 and self.provider['keytool_alias'] in result.stdout.decode():
                     # Certificate already exists
                     self.print_info(f"  ✓ {version_name}: Certificate already installed")
+                    already_ok_count += 1
                     continue
             except Exception:
                 pass
@@ -3292,6 +3465,7 @@ class FumitmPython:
                 )
                 if result.returncode == 0:
                     self.print_info(f"    ✓ {version_name}: Certificate added successfully")
+                    configured_count += 1
                 else:
                     self.print_warn(f"    ✗ {version_name}: Failed to add certificate (may require sudo)")
                     self.print_info( "      Fix with:")
@@ -3302,6 +3476,23 @@ class FumitmPython:
                     print( "          -storepass changeit -noprompt")
                     if len(result.stdout) > 0:
                         self.print_warn(f"      Keytool response: {result.stdout}")
+                    failed_count += 1
+
+        total = len(java_homes)
+        if failed_count > 0 and configured_count == 0 and already_ok_count == 0:
+            return ToolResult('jenv', 'failed', f'All {failed_count} jenv installation(s) failed')
+        if failed_count > 0:
+            changed = configured_count > 0
+            message_parts = []
+            if configured_count > 0:
+                message_parts.append(f'{configured_count}/{total} jenv installation(s) configured')
+            if already_ok_count > 0:
+                message_parts.append(f'{already_ok_count}/{total} already OK')
+            message_parts.append(f'{failed_count}/{total} failed')
+            return ToolResult('jenv', 'failed', '; '.join(message_parts), changed)
+        if configured_count > 0:
+            return ToolResult('jenv', 'configured', f'{configured_count}/{total} jenv installation(s) configured')
+        return ToolResult('jenv', 'already_ok', 'All jenv installations already configured')
 
     def setup_gradle_cert(self):
         """Setup Gradle certificate configuration."""
@@ -3327,32 +3518,32 @@ class FumitmPython:
         """Setup DBeaver certificate."""
         dbeaver_keytool = "/Applications/DBeaver.app/Contents/Eclipse/jre/Contents/Home/bin/keytool"
         dbeaver_cacerts = "/Applications/DBeaver.app/Contents/Eclipse/jre/Contents/Home/lib/security/cacerts"
-        
+
         # Check if DBeaver is installed at the default location
         if not os.path.exists(dbeaver_keytool):
-            return
-        
+            return ToolResult('dbeaver', 'skipped', 'DBeaver not installed')
+
         # Check if the cacerts file exists
         if not os.path.exists(dbeaver_cacerts):
             self.print_error(f"DBeaver cacerts file not found at: {dbeaver_cacerts}")
-            return
-        
+            return ToolResult('dbeaver', 'failed', 'DBeaver cacerts file not found')
+
         # Check if certificate already exists
         try:
             result = subprocess.run(
-                [dbeaver_keytool, '-list', '-alias', self.provider['keytool_alias'], 
+                [dbeaver_keytool, '-list', '-alias', self.provider['keytool_alias'],
                  '-keystore', dbeaver_cacerts, '-storepass', 'changeit'],
                 capture_output=True
             )
             if result.returncode == 0 and self.provider['keytool_alias'] in result.stdout.decode():
                 # Certificate already exists, nothing to do
-                return
+                return ToolResult('dbeaver', 'already_ok', 'Certificate already installed')
         except Exception:
             pass
-        
+
         self.print_info("Configuring DBeaver certificate...")
         self.print_info("Found DBeaver at default install location")
-        
+
         if not self.is_install_mode():
             self.print_action(f"Would import certificate to DBeaver keystore: {dbeaver_cacerts}")
             self.print_action(f"Would run: {dbeaver_keytool} -import -trustcacerts -alias {self.provider['keytool_alias']} -file {self.cert_path} -keystore {dbeaver_cacerts} -storepass changeit -noprompt")
@@ -3365,6 +3556,7 @@ class FumitmPython:
             )
             if result.returncode == 0:
                 self.print_info("Certificate added to DBeaver keystore successfully")
+                return ToolResult('dbeaver', 'configured', 'Certificate added to DBeaver keystore')
             else:
                 self.print_warn("Failed to add certificate to DBeaver keystore (may require sudo)")
                 self.print_info( "      Fix with:")
@@ -3375,6 +3567,7 @@ class FumitmPython:
                 print( "          -storepass changeit -noprompt")
                 if len(result.stdout) > 0:
                     self.print_warn(f"Keytool response: {result.stdout.decode('utf-8')}")
+                return ToolResult('dbeaver', 'failed', 'Failed to add certificate (may require sudo)')
     
     def setup_wget_cert(self):
         """Setup wget certificate."""
@@ -3455,7 +3648,7 @@ class FumitmPython:
         2. If Podman machine is running, also installs into VM for immediate effect
         """
         if not self.command_exists('podman'):
-            return
+            return ToolResult('podman', 'skipped', 'Podman not installed')
 
         # Primary method: Install to ~/.docker/certs.d/ (shared with other container tools)
         docker_certs_dir = os.path.expanduser("~/.docker/certs.d")
@@ -3483,7 +3676,7 @@ class FumitmPython:
         # If everything is already configured, skip
         if persistent_installed and (not vm_is_running or not vm_needs_cert):
             self.print_debug("Podman certificate already installed, skipping configuration")
-            return
+            return ToolResult('podman', 'already_ok', 'Certificate already installed')
 
         self.print_info("Configuring Podman certificate...")
 
@@ -3493,12 +3686,16 @@ class FumitmPython:
             if vm_is_running and vm_needs_cert:
                 self.print_action("Would install certificate into running Podman VM for immediate effect")
         else:
+            persistent_changed = False
+            vm_failed = False
+
             # Install to persistent location if needed
             if not persistent_installed:
                 self._safe_makedirs(docker_certs_dir)
                 shutil.copy(self.cert_path, cert_dest)
                 self._fix_ownership(cert_dest)
                 self.print_info(f"Certificate installed to {cert_dest}")
+                persistent_changed = True
 
             # If VM is running and needs cert, install for immediate effect
             if vm_is_running and vm_needs_cert:
@@ -3523,14 +3720,24 @@ class FumitmPython:
                     else:
                         self.print_warn("Certificate copied to VM but failed to update CA trust")
                         self.print_info("Try: podman machine ssh 'sudo update-ca-trust'")
+                        vm_failed = True
                 else:
                     self.print_warn("Failed to install certificate into running VM")
                     self.print_info("Certificate in ~/.docker/certs.d/ will be available for future use")
+                    vm_failed = True
             elif vm_is_running and not vm_needs_cert:
                 self.print_info("Certificate already installed in VM")
             elif not vm_is_running:
                 self.print_info("Podman machine is not running")
                 self.print_info("Run 'podman machine start' then re-run fumitm to install into VM")
+
+            if vm_failed and not persistent_changed:
+                return ToolResult('podman', 'failed', 'Failed to install certificate into VM')
+            if vm_failed:
+                return ToolResult('podman', 'configured', 'Persistent cert installed but VM install failed')
+            if persistent_changed:
+                return ToolResult('podman', 'configured', 'Certificate installed')
+            return ToolResult('podman', 'already_ok', 'Certificate already installed')
     
     def setup_rancher_cert(self):
         """Setup Rancher Desktop certificate.
@@ -3540,7 +3747,7 @@ class FumitmPython:
         2. If Rancher Desktop is running, also installs into VM for immediate effect
         """
         if not self.command_exists('rdctl'):
-            return
+            return ToolResult('rancher', 'skipped', 'Rancher Desktop not installed')
 
         # Primary method: Install to ~/.docker/certs.d/ (shared with other container tools)
         docker_certs_dir = os.path.expanduser("~/.docker/certs.d")
@@ -3568,7 +3775,7 @@ class FumitmPython:
         # If everything is already configured, skip
         if persistent_installed and (not vm_is_running or not vm_needs_cert):
             self.print_debug("Rancher Desktop certificate already installed, skipping configuration")
-            return
+            return ToolResult('rancher', 'already_ok', 'Certificate already installed')
 
         self.print_info("Configuring Rancher Desktop certificate...")
 
@@ -3578,12 +3785,16 @@ class FumitmPython:
             if vm_is_running and vm_needs_cert:
                 self.print_action("Would install certificate into running Rancher Desktop VM for immediate effect")
         else:
+            persistent_changed = False
+            vm_failed = False
+
             # Install to persistent location if needed
             if not persistent_installed:
                 self._safe_makedirs(docker_certs_dir)
                 shutil.copy(self.cert_path, cert_dest)
                 self._fix_ownership(cert_dest)
                 self.print_info(f"Certificate installed to {cert_dest}")
+                persistent_changed = True
 
             # If VM is running and needs cert, install for immediate effect
             if vm_is_running and vm_needs_cert:
@@ -3608,38 +3819,48 @@ class FumitmPython:
                     else:
                         self.print_warn("Certificate copied to VM but failed to update CA certificates")
                         self.print_info("Try: rdctl shell sudo update-ca-certificates")
+                        vm_failed = True
                 else:
                     self.print_warn("Failed to install certificate into running VM")
                     self.print_info("Certificate in ~/.docker/certs.d/ will be available for future use")
+                    vm_failed = True
             elif vm_is_running and not vm_needs_cert:
                 self.print_info("Certificate already installed in VM")
             elif not vm_is_running:
                 self.print_info("Rancher Desktop is not running")
                 self.print_info("Start Rancher Desktop then re-run fumitm to install into VM")
+
+            if vm_failed and not persistent_changed:
+                return ToolResult('rancher', 'failed', 'Failed to install certificate into VM')
+            if vm_failed:
+                return ToolResult('rancher', 'configured', 'Persistent cert installed but VM install failed')
+            if persistent_changed:
+                return ToolResult('rancher', 'configured', 'Certificate installed')
+            return ToolResult('rancher', 'already_ok', 'Certificate already installed')
     
     def setup_android_emulator_cert(self):
         """Setup Android Emulator certificate."""
         if not self.command_exists('adb') or not self.command_exists('emulator'):
             self.print_info("Android SDK tools not found, skipping Android Emulator setup")
-            return
-        
+            return ToolResult('android', 'skipped', 'Android SDK tools not found')
+
         self.print_info("Checking for Android Emulator setup...")
-        
+
         # Check if any emulator is running
         try:
             result = subprocess.run(['adb', 'devices'], capture_output=True, text=True)
             running_devices = sum(1 for line in result.stdout.splitlines() if 'emulator-' in line)
-            
+
             if running_devices == 0:
                 self.print_info("No Android emulator is currently running")
                 self.print_info("Please start an emulator with: emulator -avd <your_avd_id> -writable-system -selinux permissive")
-                return
+                return ToolResult('android', 'skipped', 'No emulator running')
         except Exception:
-            return
-        
+            return ToolResult('android', 'skipped', 'Failed to check for emulators')
+
         self.print_warn("Android Emulator certificate installation requires a writable system partition")
         self.print_warn("Make sure your emulator was started with -writable-system flag")
-        
+
         if not self.is_install_mode():
             self.print_action("Would restart ADB with root permissions: adb root")
             self.print_action("Would remount system partition: adb remount")
@@ -3650,21 +3871,21 @@ class FumitmPython:
             response = self._prompt("Do you want to install the certificate on the running Android emulator? (y/N) ")
             if response.lower() == 'y':
                 self.print_info("Installing certificate on Android emulator...")
-                
+
                 # Restart ADB with root
                 result = subprocess.run(['adb', 'root'], capture_output=True)
                 if result.returncode != 0:
                     self.print_error("Failed to restart ADB with root permissions")
                     self.print_info("Make sure your emulator doesn't have Google Play Store")
-                    return
-                
+                    return ToolResult('android', 'failed', 'Failed to restart ADB with root permissions')
+
                 # Remount system partition
                 result = subprocess.run(['adb', 'remount'], capture_output=True)
                 if result.returncode != 0:
                     self.print_error("Failed to remount system partition")
                     self.print_info("Make sure emulator was started with -writable-system flag")
-                    return
-                
+                    return ToolResult('android', 'failed', 'Failed to remount system partition')
+
                 # Push certificate
                 result = subprocess.run(
                     ['adb', 'push', self.cert_path, f'/system/etc/security/cacerts/{self.provider["container_cert_name"]}.pem'],
@@ -3679,8 +3900,12 @@ class FumitmPython:
                     self.print_info("Certificate installed. Rebooting emulator...")
                     subprocess.run(['adb', 'reboot'], capture_output=True)
                     self.print_info("Android emulator certificate installed successfully")
+                    return ToolResult('android', 'configured', 'Certificate installed on emulator')
                 else:
                     self.print_error("Failed to push certificate to emulator")
+                    return ToolResult('android', 'failed', 'Failed to push certificate to emulator')
+            else:
+                return ToolResult('android', 'skipped', 'User declined installation')
     
     def setup_colima_cert(self):
         """Setup Colima certificate.
@@ -3693,7 +3918,7 @@ class FumitmPython:
         and certificates there are applied on VM startup.
         """
         if not self.command_exists('colima'):
-            return
+            return ToolResult('colima', 'skipped', 'Colima not installed')
 
         # Primary method: Install to ~/.docker/certs.d/ (persistent, works offline)
         # Colima automatically mounts this directory and applies certs on startup
@@ -3722,7 +3947,7 @@ class FumitmPython:
         # If everything is already configured, skip
         if persistent_installed and (not vm_is_running or not vm_needs_cert):
             self.print_debug("Colima certificate already installed, skipping configuration")
-            return
+            return ToolResult('colima', 'already_ok', 'Certificate already installed')
 
         self.print_info("Configuring Colima certificate...")
 
@@ -3732,6 +3957,9 @@ class FumitmPython:
             if vm_is_running and vm_needs_cert:
                 self.print_action("Would install certificate into running VM for immediate effect")
         else:
+            persistent_changed = False
+            vm_failed = False
+
             # Install to persistent location if needed
             if not persistent_installed:
                 self._safe_makedirs(docker_certs_dir)
@@ -3739,6 +3967,7 @@ class FumitmPython:
                 self._fix_ownership(cert_dest)
                 self.print_info(f"Certificate installed to {cert_dest}")
                 self.print_info("This certificate will be automatically loaded on Colima start")
+                persistent_changed = True
 
             # If VM is running and needs cert, install for immediate effect
             if vm_is_running and vm_needs_cert:
@@ -3770,16 +3999,27 @@ class FumitmPython:
                         else:
                             self.print_warn("Certificate installed but failed to restart Docker daemon")
                             self.print_info("Restart Colima or run: colima ssh -- sudo systemctl restart docker")
+                            vm_failed = True
                     else:
                         self.print_warn("Failed to update CA certificates in VM")
                         self.print_info("Certificate in ~/.docker/certs.d/ will be applied on next Colima restart")
+                        vm_failed = True
                 else:
                     self.print_warn("Failed to install certificate into running VM")
                     self.print_info("Certificate in ~/.docker/certs.d/ will be applied on next Colima restart")
+                    vm_failed = True
             elif vm_is_running and not vm_needs_cert:
                 self.print_info("Certificate already installed in VM")
             elif not vm_is_running:
                 self.print_info("Colima is not running - certificate will be applied on next start")
+
+            if vm_failed and not persistent_changed:
+                return ToolResult('colima', 'failed', 'Failed to install certificate into VM')
+            if vm_failed:
+                return ToolResult('colima', 'configured', 'Persistent cert installed but VM install failed')
+            if persistent_changed:
+                return ToolResult('colima', 'configured', 'Certificate installed')
+            return ToolResult('colima', 'already_ok', 'Certificate already installed')
     
     def verify_connection(self, tool_name):
         """Verify if a tool can connect through proxy."""
@@ -3962,6 +4202,42 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                                 self.print_debug(f"wget: {line}")
                 except Exception as e:
                     self.print_debug(f"wget test error: {e}")
+                    result = "FAILED"
+            else:
+                result = "NOT_INSTALLED"
+
+        elif tool_name == "aws":
+            if self.command_exists('aws'):
+                self.print_debug(f"aws found at: {shutil.which('aws')}")
+
+                try:
+                    # Use --no-sign-request to force an actual HTTPS call without
+                    # needing credentials. Without it, aws may fail with "Unable to
+                    # locate credentials" before making any network call, masking
+                    # SSL issues.
+                    aws_result = subprocess.run(
+                        ['aws', '--no-sign-request', 'sts', 'get-caller-identity'],
+                        capture_output=True, text=True, timeout=15
+                    )
+
+                    stderr_lower = aws_result.stderr.lower()
+                    if 'ssl' in stderr_lower or 'certificate' in stderr_lower:
+                        result = "FAILED"
+                        self.print_debug(f"AWS SSL error: {aws_result.stderr}")
+                    else:
+                        # Any response (success, not configured, access denied)
+                        # means TLS connectivity is working
+                        result = "WORKING"
+                        if aws_result.returncode == 0:
+                            self.print_debug("AWS API call succeeded")
+                        else:
+                            self.print_debug("AWS API call returned error (but TLS works)")
+                            self.print_debug(f"aws stderr: {aws_result.stderr.strip()[:100]}")
+                except subprocess.TimeoutExpired:
+                    self.print_debug("AWS test timed out")
+                    result = "FAILED"
+                except Exception as e:
+                    self.print_debug(f"AWS test error: {e}")
                     result = "FAILED"
             else:
                 result = "NOT_INSTALLED"
@@ -4393,11 +4669,8 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         for java_home in java_homes:
             version_name = self.java_version_label(java_home)
 
-            cacerts = os.path.join(java_home, "lib/security/cacerts")
-            if not os.path.exists(cacerts):
-                cacerts = os.path.join(java_home, "jre/lib/security/cacerts")
-
-            if not os.path.exists(cacerts):
+            cacerts = self.find_java_cacerts(java_home)
+            if not cacerts:
                 self.print_warn(f"    ✗ {version_name}: cacerts file not found")
                 has_issues = True
                 continue
@@ -4956,12 +5229,18 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         """
         if not results:
             return False
+        if any(getattr(r, 'changed', None) is True for r in results):
+            return True
         if all(r.status == 'skipped' for r in results):
             return False
         has_configured = any(r.status == 'configured' for r in results)
         has_already_ok = any(r.status == 'already_ok' for r in results)
         if has_configured:
             return True
+        if any(getattr(r, 'changed', None) is False for r in results) and not any(
+            r.status == 'completed' for r in results
+        ):
+            return False
         if has_already_ok and not any(r.status == 'completed' for r in results):
             return False
         return None
@@ -4971,11 +5250,15 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         counts = {}
         for r in results:
             counts[r.status] = counts.get(r.status, 0) + 1
+        partial = sum(
+            1 for r in results
+            if r.status == 'failed' and getattr(r, 'changed', None) is True
+        )
         configured = counts.get('configured', 0)
         completed = counts.get('completed', 0)
         already_ok = counts.get('already_ok', 0)
         skipped = counts.get('skipped', 0)
-        failed = counts.get('failed', 0)
+        failed = counts.get('failed', 0) - partial
 
         parts = []
         if configured:
@@ -4986,6 +5269,8 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             parts.append(f"{already_ok} already OK")
         if skipped:
             parts.append(f"{skipped} skipped")
+        if partial:
+            parts.append(f"{partial} partially configured")
         if failed:
             parts.append(f"{failed} failed")
         summary_text = ', '.join(parts) if parts else 'no tools processed'
@@ -4993,10 +5278,11 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         self.print_info(f"Summary: {summary_text}")
 
         changes_made = self._compute_changes_made(results)
-        succeeded = configured + already_ok + completed
-        if failed > 0 and succeeded == 0:
+        succeeded = configured + already_ok + completed + partial
+        problems = failed + partial
+        if problems > 0 and succeeded == 0:
             exit_code = 1
-        elif failed > 0:
+        elif problems > 0:
             exit_code = 3
         else:
             exit_code = 0
@@ -5007,6 +5293,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             'completed': completed,
             'already_ok': already_ok,
             'skipped': skipped,
+            'partial': partial,
             'failed': failed,
             'exit_code': exit_code,
         }
