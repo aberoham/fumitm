@@ -2937,6 +2937,36 @@ class TestToolResultAccuracy(FumitmTestCase):
             assert result.status == 'configured'
             assert 'VM install failed' in result.message
 
+    def test_rancher_installs_via_rdctl_when_docker_absent(self):
+        """Regression: rdctl present + VM running + docker absent must not
+        touch _install_cert_in_docker_vm or _check_cert_in_docker_vm.
+
+        Before the fix, setup_rancher_cert delegated to the shared Docker
+        nsenter helpers, which require the docker CLI. When rdctl was
+        available but docker was not, the VM install path failed even
+        though rdctl shell would have worked.
+        """
+        instance = self.create_fumitm_instance(mode='install')
+        instance.cert_path = '/tmp/fake-cert.pem'
+
+        def selective_command_exists(cmd):
+            return cmd in ('rdctl',)  # docker is absent
+
+        with patch.object(instance, 'command_exists', side_effect=selective_command_exists), \
+             patch('os.path.exists', return_value=False), \
+             patch.object(instance, 'certificate_likely_exists_in_file', return_value=False), \
+             patch.object(instance, '_safe_makedirs'), \
+             patch('shutil.copy'), \
+             patch.object(instance, '_fix_ownership'), \
+             patch('subprocess.run', return_value=MagicMock(returncode=0, stdout='v1.0')), \
+             patch.object(instance, '_check_cert_in_rancher_vm', return_value=False), \
+             patch.object(instance, '_install_cert_via_rdctl_shell', return_value=(True, 'ok')) as mock_rdctl, \
+             patch.object(instance, '_install_cert_in_docker_vm') as mock_nsenter:
+            result = instance.setup_rancher_cert()
+            assert result.status == 'configured'
+            mock_rdctl.assert_called_once()
+            mock_nsenter.assert_not_called()
+
     # --- Podman ---
 
     def test_podman_not_installed_returns_skipped(self):
@@ -2995,6 +3025,37 @@ class TestToolResultAccuracy(FumitmTestCase):
             result = instance.setup_colima_cert()
             assert result.status == 'configured'
             assert 'VM install failed' in result.message
+
+    def test_colima_installs_via_ssh_when_docker_absent(self):
+        """Regression: colima present + VM running + docker absent must not
+        touch _install_cert_in_docker_vm or _check_cert_in_docker_vm.
+
+        Before the fix, setup_colima_cert delegated to the shared Docker
+        nsenter helpers, which require the docker CLI. When colima was
+        available but docker was not, the VM install path failed even
+        though colima ssh would have worked.
+        """
+        instance = self.create_fumitm_instance(mode='install')
+        instance.cert_path = '/tmp/fake-cert.pem'
+
+        def selective_command_exists(cmd):
+            return cmd in ('colima',)  # docker is absent
+
+        with patch.object(instance, 'command_exists', side_effect=selective_command_exists), \
+             patch('os.path.exists', return_value=False), \
+             patch.object(instance, 'certificate_likely_exists_in_file', return_value=False), \
+             patch.object(instance, '_safe_makedirs'), \
+             patch('shutil.copy'), \
+             patch.object(instance, '_fix_ownership'), \
+             patch('subprocess.run', return_value=MagicMock(returncode=0)), \
+             patch.object(instance, '_check_cert_in_colima_vm', return_value=False), \
+             patch.object(instance, '_install_cert_via_colima_ssh', return_value=(True, 'ok')) as mock_ssh, \
+             patch.object(instance, '_install_cert_in_docker_vm') as mock_nsenter, \
+             patch.object(instance, '_restart_docker_in_vm'):
+            result = instance.setup_colima_cert()
+            assert result.status == 'configured'
+            mock_ssh.assert_called_once()
+            mock_nsenter.assert_not_called()
 
     # --- Docker (generic) ---
 
