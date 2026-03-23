@@ -3774,11 +3774,53 @@ class FumitmPython:
                 return ToolResult('podman', 'configured', 'Certificate installed')
             return ToolResult('podman', 'already_ok', 'Certificate already installed')
     
+    def _check_cert_in_rancher_vm(self):
+        """Check whether the CA cert exists in the Rancher Desktop VM."""
+        cert_name = self.provider['container_cert_name']
+        try:
+            result = subprocess.run(
+                ['rdctl', 'shell', 'test', '-f',
+                 f'/usr/local/share/ca-certificates/{cert_name}.crt'],
+                capture_output=True
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _install_cert_via_rdctl_shell(self):
+        """Install cert into Rancher Desktop VM via rdctl shell.
+
+        Returns:
+            tuple: (success: bool, message: str)
+        """
+        cert_name = self.provider['container_cert_name']
+        try:
+            with open(self.cert_path, 'r') as f:
+                cert_content = f.read()
+
+            result = subprocess.run(
+                ['rdctl', 'shell', 'sudo', 'tee',
+                 f'/usr/local/share/ca-certificates/{cert_name}.crt'],
+                input=cert_content, text=True, capture_output=True
+            )
+            if result.returncode != 0:
+                return False, 'Failed to copy certificate into VM'
+
+            result = subprocess.run(
+                ['rdctl', 'shell', 'sudo', 'update-ca-certificates'],
+                capture_output=True
+            )
+            if result.returncode == 0:
+                return True, 'Certificate installed in Rancher Desktop VM'
+            return False, 'Certificate copied but update-ca-certificates failed'
+        except Exception as e:
+            return False, str(e)
+
     def setup_rancher_cert(self):
         """Setup Rancher Desktop certificate.
 
         Installs to ~/.docker/certs.d/ for registry trust and into the VM
-        for daemon-level trust via the shared Docker nsenter method.
+        via rdctl shell (native), falling back to Docker nsenter.
         """
         if not self.command_exists('rdctl'):
             return ToolResult('rancher', 'skipped', 'Rancher Desktop not installed')
@@ -3797,7 +3839,7 @@ class FumitmPython:
             result = subprocess.run(['rdctl', 'version'], capture_output=True, text=True)
             vm_is_running = result.returncode == 0
             if vm_is_running:
-                vm_needs_cert = not self._check_cert_in_docker_vm()
+                vm_needs_cert = not self._check_cert_in_rancher_vm()
         except Exception:
             pass
 
@@ -3825,7 +3867,11 @@ class FumitmPython:
 
             if vm_is_running and vm_needs_cert:
                 self.print_info("Installing certificate into Rancher Desktop VM...")
-                success, msg = self._install_cert_in_docker_vm()
+                # Use native rdctl shell, fall back to Docker nsenter
+                success, msg = self._install_cert_via_rdctl_shell()
+                if not success and self.command_exists('docker'):
+                    self.print_debug(f"rdctl shell failed ({msg}), trying nsenter")
+                    success, msg = self._install_cert_in_docker_vm()
                 if success:
                     self.print_info(msg)
                 else:
@@ -3913,12 +3959,54 @@ class FumitmPython:
             else:
                 return ToolResult('android', 'skipped', 'User declined installation')
     
+    def _check_cert_in_colima_vm(self):
+        """Check whether the CA cert exists in the Colima VM."""
+        cert_name = self.provider['container_cert_name']
+        try:
+            result = subprocess.run(
+                ['colima', 'ssh', '--', 'test', '-f',
+                 f'/usr/local/share/ca-certificates/{cert_name}.crt'],
+                capture_output=True
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _install_cert_via_colima_ssh(self):
+        """Install cert into Colima VM via colima ssh.
+
+        Returns:
+            tuple: (success: bool, message: str)
+        """
+        cert_name = self.provider['container_cert_name']
+        try:
+            with open(self.cert_path, 'r') as f:
+                cert_content = f.read()
+
+            result = subprocess.run(
+                ['colima', 'ssh', '--', 'sudo', 'tee',
+                 f'/usr/local/share/ca-certificates/{cert_name}.crt'],
+                input=cert_content, text=True, capture_output=True
+            )
+            if result.returncode != 0:
+                return False, 'Failed to copy certificate into VM'
+
+            result = subprocess.run(
+                ['colima', 'ssh', '--', 'sudo', 'update-ca-certificates'],
+                capture_output=True
+            )
+            if result.returncode == 0:
+                return True, 'Certificate installed in Colima VM'
+            return False, 'Certificate copied but update-ca-certificates failed'
+        except Exception as e:
+            return False, str(e)
+
     def setup_colima_cert(self):
         """Setup Colima certificate.
 
         Installs to ~/.docker/certs.d/ (persistent, auto-mounted by Colima)
-        and into the VM for immediate effect via the shared Docker nsenter
-        method. Restarts Docker in the VM after installation.
+        and into the VM via colima ssh (native), falling back to Docker
+        nsenter. Restarts Docker in the VM after installation.
         """
         if not self.command_exists('colima'):
             return ToolResult('colima', 'skipped', 'Colima not installed')
@@ -3937,7 +4025,7 @@ class FumitmPython:
             status_result = subprocess.run(['colima', 'status'], capture_output=True)
             vm_is_running = (status_result.returncode == 0)
             if vm_is_running:
-                vm_needs_cert = not self._check_cert_in_docker_vm()
+                vm_needs_cert = not self._check_cert_in_colima_vm()
         except Exception:
             pass
 
@@ -3965,7 +4053,11 @@ class FumitmPython:
 
             if vm_is_running and vm_needs_cert:
                 self.print_info("Installing certificate into Colima VM...")
-                success, msg = self._install_cert_in_docker_vm()
+                # Use native colima ssh, fall back to Docker nsenter
+                success, msg = self._install_cert_via_colima_ssh()
+                if not success and self.command_exists('docker'):
+                    self.print_debug(f"colima ssh failed ({msg}), trying nsenter")
+                    success, msg = self._install_cert_in_docker_vm()
                 if success:
                     self.print_info(msg)
                     self._restart_docker_in_vm()
@@ -5087,7 +5179,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             try:
                 version_result = subprocess.run(['rdctl', 'version'], capture_output=True, text=True)
                 if version_result.returncode == 0:
-                    if self._check_cert_in_docker_vm():
+                    if self._check_cert_in_rancher_vm():
                         self.print_info("  ✓ Certificate installed in running VM")
                     else:
                         self.print_info("  - Certificate not in VM (run fumitm --fix to install)")
@@ -5177,7 +5269,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             try:
                 status_result = subprocess.run(['colima', 'status'], capture_output=True)
                 if status_result.returncode == 0:
-                    if self._check_cert_in_docker_vm():
+                    if self._check_cert_in_colima_vm():
                         self.print_info("  ✓ Certificate installed in running VM")
                     else:
                         self.print_info("  - Certificate not in VM (will be applied on restart)")

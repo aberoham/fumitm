@@ -2916,7 +2916,7 @@ class TestToolResultAccuracy(FumitmTestCase):
              patch('os.path.exists', return_value=True), \
              patch.object(instance, 'certificate_likely_exists_in_file', return_value=True), \
              patch('subprocess.run', return_value=MagicMock(returncode=0, stdout='v1.0')), \
-             patch.object(instance, '_check_cert_in_docker_vm', return_value=True):
+             patch.object(instance, '_check_cert_in_rancher_vm', return_value=True):
             result = instance.setup_rancher_cert()
             assert result.status == 'already_ok'
 
@@ -2931,8 +2931,8 @@ class TestToolResultAccuracy(FumitmTestCase):
              patch('shutil.copy'), \
              patch.object(instance, '_fix_ownership'), \
              patch('subprocess.run', return_value=MagicMock(returncode=0, stdout='v1.0')), \
-             patch.object(instance, '_check_cert_in_docker_vm', return_value=False), \
-             patch.object(instance, '_install_cert_in_docker_vm', return_value=(False, 'test error')):
+             patch.object(instance, '_check_cert_in_rancher_vm', return_value=False), \
+             patch.object(instance, '_install_cert_via_rdctl_shell', return_value=(False, 'test error')):
             result = instance.setup_rancher_cert()
             assert result.status == 'configured'
             assert 'VM install failed' in result.message
@@ -2990,8 +2990,8 @@ class TestToolResultAccuracy(FumitmTestCase):
              patch('shutil.copy'), \
              patch.object(instance, '_fix_ownership'), \
              patch('subprocess.run', return_value=MagicMock(returncode=0)), \
-             patch.object(instance, '_check_cert_in_docker_vm', return_value=False), \
-             patch.object(instance, '_install_cert_in_docker_vm', return_value=(False, 'test error')):
+             patch.object(instance, '_check_cert_in_colima_vm', return_value=False), \
+             patch.object(instance, '_install_cert_via_colima_ssh', return_value=(False, 'test error')):
             result = instance.setup_colima_cert()
             assert result.status == 'configured'
             assert 'VM install failed' in result.message
