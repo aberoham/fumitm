@@ -1122,7 +1122,7 @@ class TestStatusFunctionContracts(FumitmTestCase):
         status_methods = self.get_all_status_methods(instance)
 
         # Verify we found the expected methods (sanity check)
-        assert len(status_methods) >= 11, f"Expected at least 11 status methods, found {len(status_methods)}: {status_methods}"
+        assert len(status_methods) >= 12, f"Expected at least 12 status methods, found {len(status_methods)}: {status_methods}"
 
         # Expected methods based on the codebase
         expected_methods = [
@@ -1131,7 +1131,7 @@ class TestStatusFunctionContracts(FumitmTestCase):
             'check_gcloud_status', 'check_java_status', 'check_jenv_status',
             'check_gradle_status', 'check_dbeaver_status', 'check_wget_status',
             'check_podman_status', 'check_rancher_status', 'check_android_status',
-            'check_colima_status'
+            'check_colima_status', 'check_docker_status'
         ]
         for expected in expected_methods:
             assert expected in status_methods, f"Expected method {expected} not found"
@@ -2915,12 +2915,8 @@ class TestToolResultAccuracy(FumitmTestCase):
         with patch.object(instance, 'command_exists', return_value=True), \
              patch('os.path.exists', return_value=True), \
              patch.object(instance, 'certificate_likely_exists_in_file', return_value=True), \
-             patch('subprocess.run') as mock_run:
-            # rdctl version succeeds (VM running), cert exists in VM
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout='v1.0'),  # rdctl version
-                MagicMock(returncode=0),  # test -f cert in VM
-            ]
+             patch('subprocess.run', return_value=MagicMock(returncode=0, stdout='v1.0')), \
+             patch.object(instance, '_check_cert_in_rancher_vm', return_value=True):
             result = instance.setup_rancher_cert()
             assert result.status == 'already_ok'
 
@@ -2934,16 +2930,42 @@ class TestToolResultAccuracy(FumitmTestCase):
              patch.object(instance, '_safe_makedirs'), \
              patch('shutil.copy'), \
              patch.object(instance, '_fix_ownership'), \
-             patch('builtins.open', mock_open(read_data='CERT')), \
-             patch('subprocess.run') as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout='v1.0'),  # rdctl version (VM running)
-                MagicMock(returncode=1),  # test -f cert in VM (needs cert)
-                MagicMock(returncode=1),  # rdctl shell sudo tee (fails)
-            ]
+             patch('subprocess.run', return_value=MagicMock(returncode=0, stdout='v1.0')), \
+             patch.object(instance, '_check_cert_in_rancher_vm', return_value=False), \
+             patch.object(instance, '_install_cert_via_rdctl_shell', return_value=(False, 'test error')):
             result = instance.setup_rancher_cert()
             assert result.status == 'configured'
             assert 'VM install failed' in result.message
+
+    def test_rancher_installs_via_rdctl_when_docker_absent(self):
+        """Regression: rdctl present + VM running + docker absent must not
+        touch _install_cert_in_docker_vm or _check_cert_in_docker_vm.
+
+        Before the fix, setup_rancher_cert delegated to the shared Docker
+        nsenter helpers, which require the docker CLI. When rdctl was
+        available but docker was not, the VM install path failed even
+        though rdctl shell would have worked.
+        """
+        instance = self.create_fumitm_instance(mode='install')
+        instance.cert_path = '/tmp/fake-cert.pem'
+
+        def selective_command_exists(cmd):
+            return cmd in ('rdctl',)  # docker is absent
+
+        with patch.object(instance, 'command_exists', side_effect=selective_command_exists), \
+             patch('os.path.exists', return_value=False), \
+             patch.object(instance, 'certificate_likely_exists_in_file', return_value=False), \
+             patch.object(instance, '_safe_makedirs'), \
+             patch('shutil.copy'), \
+             patch.object(instance, '_fix_ownership'), \
+             patch('subprocess.run', return_value=MagicMock(returncode=0, stdout='v1.0')), \
+             patch.object(instance, '_check_cert_in_rancher_vm', return_value=False), \
+             patch.object(instance, '_install_cert_via_rdctl_shell', return_value=(True, 'ok')) as mock_rdctl, \
+             patch.object(instance, '_install_cert_in_docker_vm') as mock_nsenter:
+            result = instance.setup_rancher_cert()
+            assert result.status == 'configured'
+            mock_rdctl.assert_called_once()
+            mock_nsenter.assert_not_called()
 
     # --- Podman ---
 
@@ -2997,16 +3019,93 @@ class TestToolResultAccuracy(FumitmTestCase):
              patch.object(instance, '_safe_makedirs'), \
              patch('shutil.copy'), \
              patch.object(instance, '_fix_ownership'), \
-             patch('builtins.open', mock_open(read_data='CERT')), \
-             patch('subprocess.run') as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0),  # colima status (running)
-                MagicMock(returncode=1),  # test -f cert in VM (needs cert)
-                MagicMock(returncode=1),  # colima ssh tee (fails)
-            ]
+             patch('subprocess.run', return_value=MagicMock(returncode=0)), \
+             patch.object(instance, '_check_cert_in_colima_vm', return_value=False), \
+             patch.object(instance, '_install_cert_via_colima_ssh', return_value=(False, 'test error')):
             result = instance.setup_colima_cert()
             assert result.status == 'configured'
             assert 'VM install failed' in result.message
+
+    def test_colima_installs_via_ssh_when_docker_absent(self):
+        """Regression: colima present + VM running + docker absent must not
+        touch _install_cert_in_docker_vm or _check_cert_in_docker_vm.
+
+        Before the fix, setup_colima_cert delegated to the shared Docker
+        nsenter helpers, which require the docker CLI. When colima was
+        available but docker was not, the VM install path failed even
+        though colima ssh would have worked.
+        """
+        instance = self.create_fumitm_instance(mode='install')
+        instance.cert_path = '/tmp/fake-cert.pem'
+
+        def selective_command_exists(cmd):
+            return cmd in ('colima',)  # docker is absent
+
+        with patch.object(instance, 'command_exists', side_effect=selective_command_exists), \
+             patch('os.path.exists', return_value=False), \
+             patch.object(instance, 'certificate_likely_exists_in_file', return_value=False), \
+             patch.object(instance, '_safe_makedirs'), \
+             patch('shutil.copy'), \
+             patch.object(instance, '_fix_ownership'), \
+             patch('subprocess.run', return_value=MagicMock(returncode=0)), \
+             patch.object(instance, '_check_cert_in_colima_vm', return_value=False), \
+             patch.object(instance, '_install_cert_via_colima_ssh', return_value=(True, 'ok')) as mock_ssh, \
+             patch.object(instance, '_install_cert_in_docker_vm') as mock_nsenter, \
+             patch.object(instance, '_restart_docker_in_vm'):
+            result = instance.setup_colima_cert()
+            assert result.status == 'configured'
+            mock_ssh.assert_called_once()
+            mock_nsenter.assert_not_called()
+
+    # --- Docker (generic) ---
+
+    def test_docker_not_installed_returns_skipped(self):
+        """setup_docker_cert returns skipped when docker not found."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=False):
+            result = instance.setup_docker_cert()
+            assert result.status == 'skipped'
+
+    def test_docker_already_ok(self):
+        """setup_docker_cert returns already_ok when cert already installed."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch('os.path.exists', return_value=True), \
+             patch.object(instance, 'certificate_likely_exists_in_file', return_value=True), \
+             patch.object(instance, '_docker_is_running', return_value=False):
+            result = instance.setup_docker_cert()
+            assert result.status == 'already_ok'
+
+    def test_docker_vm_install_fails_persistent_ok(self):
+        """setup_docker_cert returns configured when persistent ok but VM fails."""
+        instance = self.create_fumitm_instance(mode='install')
+        instance.cert_path = '/tmp/fake-cert.pem'
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch('os.path.exists', return_value=False), \
+             patch.object(instance, 'certificate_likely_exists_in_file', return_value=False), \
+             patch.object(instance, '_safe_makedirs'), \
+             patch('shutil.copy'), \
+             patch.object(instance, '_fix_ownership'), \
+             patch.object(instance, '_docker_is_running', return_value=True), \
+             patch.object(instance, '_check_cert_in_docker_vm', return_value=False), \
+             patch.object(instance, '_install_cert_in_docker_vm', return_value=(False, 'test error')):
+            result = instance.setup_docker_cert()
+            assert result.status == 'configured'
+            assert 'VM install failed' in result.message
+
+    def test_container_tool_keys_returns_tagged_tools(self):
+        """_container_tool_keys includes all tools with 'container' tag."""
+        instance = self.create_fumitm_instance()
+        keys = instance._container_tool_keys()
+        assert 'docker' in keys
+        assert 'colima' in keys
+        assert 'podman' in keys
+        assert 'rancher' in keys
+
+    def test_rancher_has_container_tag(self):
+        """Rancher Desktop must have the 'container' tag."""
+        instance = self.create_fumitm_instance()
+        assert 'container' in instance.tools_registry['rancher']['tags']
 
     # --- Brew cacerts ---
 
