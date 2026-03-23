@@ -4319,7 +4319,7 @@ class FumitmPython:
             return ToolResult('docker', 'already_ok', 'Certificate already installed')
 
     def _print_docker_build_hint(self):
-        """Print guidance for trusting the CA certificate during Docker builds.
+        """Print required Dockerfile changes for Docker build trust.
 
         Docker build containers use the base image's CA store, not the host
         VM's trust store. The proxy cert must be injected into the Dockerfile
@@ -4330,16 +4330,19 @@ class FumitmPython:
         cert_src = os.path.expanduser(f"~/.docker/certs.d/{cert_name}")
         short = self.provider['short_name']
         print()
-        self.print_info(f"Docker builds need the {short} CA cert inside the container.")
-        self.print_info("Add these lines to your Dockerfile BEFORE any HTTPS commands:")
+        self.print_warn(f"Docker builds require a Dockerfile change to trust the {short} CA.")
+        self.print_warn("Without this, pip install / npm install / curl will fail with SSL errors.")
+        print()
+        self.print_info("Step 1: Copy the cert into your build context:")
+        self.print_info(f"  cp {cert_src} .")
+        print()
+        self.print_info("Step 2: Add these lines to your Dockerfile BEFORE any HTTPS commands")
+        self.print_info("        (pip install, npm install, apt-get, curl, wget, etc.):")
         print()
         self.print_info(f"  COPY {cert_name} /usr/local/share/ca-certificates/{cert_name}")
         self.print_info("  RUN update-ca-certificates")
         print()
-        self.print_info(f"Copy the cert into your build context:")
-        self.print_info(f"  cp {cert_src} .")
-        print()
-        self.print_info("Or use a BuildKit named context (no copy needed):")
+        self.print_info("Alternative: use a BuildKit named context (no copy needed):")
         self.print_info(f"  docker build --build-context certs={os.path.dirname(cert_src)} .")
         self.print_info("  # Dockerfile: COPY --from=certs"
                         f" {cert_name} /usr/local/share/ca-certificates/{cert_name}")
