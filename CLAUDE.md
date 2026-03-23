@@ -125,8 +125,9 @@ The script follows a modular architecture with these key components:
    - Each supported tool has its own `setup_*_cert()` function
    - Functions check current configuration before making changes
    - Handle permission issues by suggesting user-writable alternatives
-   - Support for: Homebrew CA Certificates, Node.js/npm, Python, gcloud, Git, curl, Java/JVM, jenv, Gradle, DBeaver, wget, Podman, Rancher, Colima, Android Emulator
+   - Support for: Homebrew CA Certificates, Node.js/npm, Python, gcloud, Git, curl, Java/JVM, jenv, Gradle, DBeaver, wget, Docker (any backend), Podman, Rancher, Colima, Android Emulator
    - Tools can be selectively processed using `--tools` option with keys or tags
+   - Container tools share a universal Docker VM cert installation method via nsenter (framework-agnostic)
 
 5. **Certificate Helpers**:
    - `create_bundle_with_system_certs(path)`: Creates a CA bundle initialized with system certificates from `/etc/ssl/cert.pem` (macOS) or `/etc/ssl/certs/ca-certificates.crt` (Linux)
@@ -134,7 +135,14 @@ The script follows a modular architecture with these key components:
    - `certificate_exists_in_file()`: Checks if certificate already exists in bundle files (uses pure-Python string matching for O(1) performance)
    - `verify_connection()`: Tests if tools can connect through the proxy (supports node, python, curl, wget, gcloud)
 
-6. **Ownership Protection and User Targeting** (sudo/JAMF/Ansible safety):
+6. **Docker VM Certificate Installation** (shared across all container tools):
+   - `_install_cert_in_docker_vm()`: Installs the CA cert into the Docker VM's OS trust store via nsenter. Works with any Docker backend (OrbStack, Colima, Docker Desktop, Lima, etc.). Auto-detects Debian-style (`/usr/local/share/ca-certificates/` + `update-ca-certificates`) vs Fedora-style (`/etc/pki/ca-trust/source/anchors/` + `update-ca-trust`) cert paths inside the VM.
+   - `_check_cert_in_docker_vm()`: Checks whether the cert exists in the VM (both Debian and Fedora paths).
+   - `_restart_docker_in_vm()`: Restarts the Docker daemon, detecting the framework for the appropriate restart command (`orb restart docker`, `colima ssh -- sudo systemctl restart docker`, or generic nsenter fallback).
+   - `_print_docker_build_hint()`: Prints Dockerfile guidance for build-time trust. Docker build containers use the base image's CA store (not the VM's), so users must inject the cert in their Dockerfile. Printed once after all container tools, not per-tool.
+   - Podman keeps its own `podman machine ssh` fallback since Podman VMs don't always have Docker available.
+
+7. **Ownership Protection and User Targeting** (sudo/JAMF/Ansible safety):
    - `_apply_target_user(username)`: Resolves username via `pwd.getpwnam()`, sets `_target_uid`/`_target_gid`, corrects `$HOME`. Supports `'auto'` for macOS console-user detection via `/dev/console` ownership.
    - `_detect_console_user()`: Static method that reads `/dev/console` ownership on macOS to find the GUI-session user.
    - `_is_running_as_sudo()` / `_get_real_user_ids()`: Detect sudo or `--run-as-user` context. Priority: `_target_uid` > `SUDO_UID` > current UID.
@@ -144,18 +152,18 @@ The script follows a modular architecture with these key components:
    - `check_ownership_sanity()`: Called early in `main()` — warns non-root users about root-owned files and proactively fixes ownership when running as sudo
    - User resolution priority: `--run-as-user` > `--run-as-user auto` > `SUDO_USER` > root-without-context (warn, system-only) > current user
 
-7. **Status Checking**:
+8. **Status Checking**:
    - `check_all_status()`: Comprehensive status report of all configurations
    - Shows what needs fixing without making changes
    - Verifies actual connectivity before flagging issues (e.g., gcloud may work via system trust store without custom CA)
 
-8. **Update Checking**:
+9. **Update Checking**:
    - `check_for_updates()`: Compares local file hash against GitHub main branch
    - Uses unverified SSL context (since WARP certificate trust might not be configured yet)
    - Warns users to update before running `--fix` if a newer version is available
    - Skipped when `--headless` or `--skip-update-check` is active
 
-9. **Output Infrastructure** (headless/MDM support):
+10. **Output Infrastructure** (headless/MDM support):
    - `_emit(message, level, ...)`: Central output method. All `print_*` methods route through it. Handles color stripping, text log writing, and JSON-lines event emission.
    - `_strip_ansi(text)`: Static method to remove ANSI escape codes.
    - `_open_log_files()` / `_close_log_files()`: Manage log file handles. File mode overwrites; directory mode generates timestamped filenames with `fumitm-latest.*` symlinks.
@@ -163,7 +171,7 @@ The script follows a modular architecture with these key components:
    - `NonInteractiveError`: Raised when `_prompt()` needs stdin but it's not a TTY. Caught in `main()` as exit code 2.
    - `--headless`: Composite flag that disables color and skips update check. Does NOT imply `--yes`.
 
-10. **Idempotency and Exit Codes**:
+11. **Idempotency and Exit Codes**:
     - `ToolResult`: Named tuple with `(tool, status, message)`. Statuses: `configured`, `already_ok`, `completed`, `skipped`, `failed`.
     - `_run_setup(tool_key, func)`: Wraps setup functions with error-counting side-channel via `print_error()`. Legacy functions that don't return `ToolResult` get `completed` or `failed` inferred.
     - `_print_summary(results)`: Prints human-readable summary and `FUMITM_RESULT:` JSON line for Ansible `changed_when`.
