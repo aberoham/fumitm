@@ -3702,8 +3702,9 @@ class FumitmPython:
         """Setup Podman certificate.
 
         Installs to ~/.docker/certs.d/ for registry trust and into the Podman
-        VM for daemon-level trust. Uses the shared Docker nsenter method first,
-        falling back to podman machine ssh for Podman-only environments.
+        VM via podman machine ssh. Always uses Podman-native SSH rather than
+        Docker nsenter to avoid cross-installing into a different runtime's VM
+        when both Podman and Docker are present.
         """
         if not self.command_exists('podman'):
             return ToolResult('podman', 'skipped', 'Podman not installed')
@@ -3753,11 +3754,7 @@ class FumitmPython:
 
             if vm_is_running and vm_needs_cert:
                 self.print_info("Installing certificate into Podman VM...")
-                # Try shared Docker nsenter first, fall back to podman machine ssh
-                if self.command_exists('docker') and self._docker_is_running():
-                    success, msg = self._install_cert_in_docker_vm()
-                else:
-                    success, msg = self._install_cert_via_podman_ssh()
+                success, msg = self._install_cert_via_podman_ssh()
 
                 if success:
                     self.print_info(msg)
@@ -3999,24 +3996,81 @@ class FumitmPython:
         except Exception:
             return False
 
+    def _find_nsenter_image(self):
+        """Find a locally cached Docker image that has nsenter.
+
+        Tries common lightweight images with --pull=never to avoid network
+        requests. This prevents a bootstrap failure when the Docker daemon
+        can't pull images because the MITM CA isn't trusted yet.
+
+        Returns:
+            str or None: Image name if found locally, None otherwise.
+        """
+        candidates = ['alpine:latest', 'alpine', 'busybox:latest', 'busybox',
+                       'debian:latest', 'ubuntu:latest']
+        for image in candidates:
+            try:
+                result = subprocess.run(
+                    ['docker', 'image', 'inspect', image],
+                    capture_output=True, timeout=5
+                )
+                if result.returncode == 0:
+                    self.print_debug(f"Using locally cached image: {image}")
+                    return image
+            except Exception:
+                continue
+        return None
+
+    def _run_nsenter(self, script, stdin_data=None, timeout=30):
+        """Run a command in the Docker VM's namespace via nsenter.
+
+        Finds a locally cached image first (no network pull), then falls
+        back to pulling alpine:latest as a last resort.
+
+        Returns:
+            subprocess.CompletedProcess or None on failure to find an image.
+        """
+        image = self._find_nsenter_image()
+        if not image:
+            # Last resort: try pulling alpine (may fail behind MITM proxy)
+            self.print_debug("No local image found, attempting to pull alpine")
+            try:
+                pull = subprocess.run(
+                    ['docker', 'pull', 'alpine:latest'],
+                    capture_output=True, timeout=30
+                )
+                if pull.returncode == 0:
+                    image = 'alpine:latest'
+            except Exception:
+                pass
+        if not image:
+            return None
+
+        cmd = ['docker', 'run', '--rm', '--privileged', '--pid=host']
+        if stdin_data is not None:
+            cmd.append('-i')
+        cmd += [image, 'nsenter', '-t', '1', '-m', '--', 'sh', '-c', script]
+
+        kwargs = {'capture_output': True, 'text': True, 'timeout': timeout}
+        if stdin_data is not None:
+            kwargs['input'] = stdin_data
+        return subprocess.run(cmd, **kwargs)
+
     def _check_cert_in_docker_vm(self):
         """Check whether the proxy CA cert exists in the Docker VM.
 
-        Uses nsenter via a privileged container to probe the VM's filesystem.
-        Checks both Debian-style and Fedora-style cert paths.
+        Uses nsenter via a locally cached container image to probe the VM's
+        filesystem. Checks both Debian-style and Fedora-style cert paths.
         """
         cert_name = self.provider['container_cert_name']
         check_script = (
             f'test -f /usr/local/share/ca-certificates/{cert_name}.crt'
-            f' || test -f /etc/pki/ca-trust/source/anchors/{cert_name}.crt'
+            f' || test -f /etc/pki/ca-trust/source/anchors/{cert_name}.pem'
         )
         try:
-            result = subprocess.run(
-                ['docker', 'run', '--rm', '--privileged', '--pid=host',
-                 'alpine:latest', 'nsenter', '-t', '1', '-m', '--',
-                 'sh', '-c', check_script],
-                capture_output=True, text=True, timeout=30
-            )
+            result = self._run_nsenter(check_script)
+            if result is None:
+                return False
             return result.returncode == 0
         except Exception:
             return False
@@ -4026,18 +4080,22 @@ class FumitmPython:
 
         Uses Docker nsenter to access the VM regardless of which framework
         (OrbStack, Colima, Docker Desktop, Lima, etc.) manages it. Detects
-        Debian-style vs Fedora-style CA paths automatically.
+        Debian-style vs Fedora-style CA paths automatically. Uses locally
+        cached images to avoid bootstrap failures when the daemon cannot
+        pull from registries.
 
         Returns:
             tuple: (success: bool, message: str)
         """
         cert_name = self.provider['container_cert_name']
+        # Debian/Alpine use .crt in /usr/local/share/ca-certificates/
+        # Fedora/RHEL use .pem in /etc/pki/ca-trust/source/anchors/
         install_script = (
             f'if [ -d /usr/local/share/ca-certificates ]; then'
             f'  cat > /usr/local/share/ca-certificates/{cert_name}.crt'
             f'  && update-ca-certificates 2>/dev/null;'
             f' elif [ -d /etc/pki/ca-trust/source/anchors ]; then'
-            f'  cat > /etc/pki/ca-trust/source/anchors/{cert_name}.crt'
+            f'  cat > /etc/pki/ca-trust/source/anchors/{cert_name}.pem'
             f'  && update-ca-trust 2>/dev/null;'
             f' else exit 1; fi'
         )
@@ -4045,14 +4103,10 @@ class FumitmPython:
             with open(self.cert_path, 'r') as f:
                 cert_content = f.read()
 
-            result = subprocess.run(
-                ['docker', 'run', '--rm', '--privileged', '--pid=host',
-                 '-i', 'alpine:latest', 'nsenter', '-t', '1', '-m', '--',
-                 'sh', '-c', install_script],
-                input=cert_content, text=True,
-                capture_output=True, timeout=60
-            )
-
+            result = self._run_nsenter(install_script, stdin_data=cert_content,
+                                       timeout=60)
+            if result is None:
+                return False, 'No Docker image available for nsenter (try: docker pull alpine)'
             if result.returncode == 0:
                 return True, 'Certificate installed in Docker VM'
             self.print_debug(f"nsenter stderr: {result.stderr.strip()}")
@@ -4085,16 +4139,12 @@ class FumitmPython:
 
         # Generic fallback: restart via nsenter
         try:
-            result = subprocess.run(
-                ['docker', 'run', '--rm', '--privileged', '--pid=host',
-                 'alpine:latest', 'nsenter', '-t', '1', '-m', '--',
-                 'sh', '-c',
-                 'command -v systemctl >/dev/null'
-                 ' && systemctl restart docker 2>/dev/null'
-                 ' || kill -HUP 1 2>/dev/null'],
-                capture_output=True, timeout=30
+            result = self._run_nsenter(
+                'command -v systemctl >/dev/null'
+                ' && systemctl restart docker 2>/dev/null'
+                ' || kill -HUP 1 2>/dev/null'
             )
-            if result.returncode == 0:
+            if result is not None and result.returncode == 0:
                 self.print_info("Docker engine restarted")
                 return True
         except Exception:
