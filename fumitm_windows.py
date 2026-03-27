@@ -19,7 +19,7 @@ from pathlib import Path
 from datetime import datetime
 
 # Version and metadata
-__description__ = "Cloudflare WARP Certificate Fixer Upper for Windows"
+__description__ = "MITM Certificate Fixer Upper for Windows"
 __author__ = "Ingersoll & Claude"
 __version__ = "2026.3.23"  # CalVer: YYYY.MM.DD (auto-updated on release)
 
@@ -147,26 +147,100 @@ YELLOW = "\033[1;33m"
 BLUE = "\033[0;34m"
 NC = "\033[0m"  # No Color
 
-# Certificate details
+# Provider-specific certificate details
+PROVIDERS = {
+    "warp": {
+        "name": "Cloudflare WARP",
+        "short_name": "WARP",
+        "bundle_dir": "~/.cloudflare-warp",
+        "cert_filename": "THG-CloudflareCert.pem",
+        "keytool_alias": "cloudflare-zerotrust",
+        "container_cert_name": "THG-CloudflareCert.pem",
+    },
+    "netskope": {
+        "name": "Netskope",
+        "short_name": "Netskope",
+        "bundle_dir": "~/.netskope",
+        "cert_filename": "netskope-ca.pem",
+        "keytool_alias": "netskope-zerotrust",
+        "container_cert_name": "netskope.pem",
+        "cert_sources": [
+            os.path.join(
+                os.environ.get("ProgramData", r"C:\ProgramData"),
+                "Netskope",
+                "stagent",
+                "data",
+                "nscacert_combined.pem",
+            ),
+            os.path.join(
+                os.environ.get("ProgramData", r"C:\ProgramData"),
+                "Netskope",
+                "stagent",
+                "data",
+                "nscacert.pem",
+            ),
+            os.path.join(
+                os.environ.get("ProgramData", r"C:\ProgramData"),
+                "Netskope",
+                "STAgent",
+                "data",
+                "nscacert_combined.pem",
+            ),
+            os.path.join(
+                os.environ.get("ProgramData", r"C:\ProgramData"),
+                "Netskope",
+                "STAgent",
+                "data",
+                "nscacert.pem",
+            ),
+        ],
+    },
+}
+
+ACTIVE_PROVIDER_KEY = "warp"
+ACTIVE_PROVIDER = PROVIDERS[ACTIVE_PROVIDER_KEY]
 # Base directory for tool-specific certificate bundles
-CLOUDFLARE_WARP_DIR = os.path.join(os.path.expanduser("~"), ".cloudflare-warp")
-CERT_PATH = os.path.join(CLOUDFLARE_WARP_DIR, "THG-CloudflareCert.pem")
+CLOUDFLARE_WARP_DIR = os.path.join(
+    os.path.expanduser("~"), ACTIVE_PROVIDER["bundle_dir"].replace("~/", "")
+)
+CERT_PATH = os.path.join(CLOUDFLARE_WARP_DIR, ACTIVE_PROVIDER["cert_filename"])
 # No alternative certificate file names - we generate our own specific cert
 ALT_CERT_NAMES = []
 SHELL_MODIFIED = False
 CERT_FINGERPRINT = ""  # Cache for certificate fingerprint
 
 
+def set_active_provider(provider_key):
+    """Update global certificate paths for the selected provider."""
+    global ACTIVE_PROVIDER_KEY, ACTIVE_PROVIDER, CLOUDFLARE_WARP_DIR, CERT_PATH
+
+    if provider_key not in PROVIDERS:
+        raise ValueError(f"Unknown provider: {provider_key}")
+
+    ACTIVE_PROVIDER_KEY = provider_key
+    ACTIVE_PROVIDER = PROVIDERS[provider_key]
+    CLOUDFLARE_WARP_DIR = os.path.expanduser(ACTIVE_PROVIDER["bundle_dir"])
+    CERT_PATH = os.path.join(CLOUDFLARE_WARP_DIR, ACTIVE_PROVIDER["cert_filename"])
+
+
 class FumitmWindows:
     def __init__(
-        self, mode="status", debug=False, selected_tools=None, use_warp_cli=False
+        self,
+        mode="status",
+        debug=False,
+        selected_tools=None,
+        use_warp_cli=False,
+        provider="warp",
     ):
+        set_active_provider(provider)
         self.mode = mode
         self.debug = debug
         self.shell_modified = False
         self.cert_fingerprint = ""
         self.selected_tools = selected_tools or []
         self.use_warp_cli = use_warp_cli
+        self.provider_key = provider
+        self.provider = PROVIDERS[provider]
 
         # Define tool registry with tags and descriptions
         self.tools_registry = {
@@ -241,6 +315,18 @@ class FumitmWindows:
                 "This script is designed for Windows. Most features will not work correctly."
             )
 
+    def get_provider_name(self):
+        return self.provider["name"]
+
+    def get_provider_short_name(self):
+        return self.provider["short_name"]
+
+    def get_keytool_alias(self):
+        return self.provider["keytool_alias"]
+
+    def get_container_cert_name(self):
+        return self.provider["container_cert_name"]
+
     def is_install_mode(self):
         return self.mode == "install"
 
@@ -306,24 +392,50 @@ class FumitmWindows:
         return invalid_tools
 
     # Printing functions
+    def _safe_console_text(self, msg):
+        """Return text that won't crash on legacy Windows console encodings."""
+        replacements = {
+            "✓": "[OK]",
+            "✗": "[X]",
+            "⚠": "[!]",
+            "—": "-",
+            "–": "-",
+        }
+
+        safe_msg = msg
+        for src, dst in replacements.items():
+            safe_msg = safe_msg.replace(src, dst)
+
+        return safe_msg
+
+    def _emit(self, text, stream=None):
+        """Print text with a fallback for consoles that reject Unicode."""
+        if stream is None:
+            stream = sys.stdout
+
+        try:
+            print(text, file=stream)
+        except UnicodeEncodeError:
+            print(self._safe_console_text(text), file=stream)
+
     def print_info(self, msg):
-        print(f"{GREEN}[INFO]{NC} {msg}")
+        self._emit(f"{GREEN}[INFO]{NC} {msg}")
 
     def print_warn(self, msg):
-        print(f"{YELLOW}[WARN]{NC} {msg}")
+        self._emit(f"{YELLOW}[WARN]{NC} {msg}")
 
     def print_error(self, msg):
-        print(f"{RED}[ERROR]{NC} {msg}")
+        self._emit(f"{RED}[ERROR]{NC} {msg}")
 
     def print_status(self, msg):
-        print(f"{BLUE}[STATUS]{NC} {msg}")
+        self._emit(f"{BLUE}[STATUS]{NC} {msg}")
 
     def print_action(self, msg):
-        print(f"{YELLOW}[ACTION]{NC} {msg}")
+        self._emit(f"{YELLOW}[ACTION]{NC} {msg}")
 
     def print_debug(self, msg):
         if self.is_debug_mode():
-            print(f"{BLUE}[DEBUG]{NC} {msg}", file=sys.stderr)
+            self._emit(f"{BLUE}[DEBUG]{NC} {msg}", stream=sys.stderr)
 
     def command_exists(self, cmd):
         """Check if a command exists."""
@@ -353,6 +465,166 @@ class FumitmWindows:
         except Exception as e:
             self.print_debug(f"Error running as admin: {e}")
             return False
+
+    def get_netskope_cert_sources(self):
+        """Return known Windows Netskope certificate locations."""
+        return self.provider.get("cert_sources", [])
+
+    def _get_warp_cert(self):
+        """Retrieve the active WARP certificate from warp-cli."""
+        if not self.command_exists("warp-cli"):
+            self.print_error(
+                "warp-cli command not found. Please ensure Cloudflare WARP is installed."
+            )
+            return None
+
+        try:
+            if self.use_warp_cli:
+                self.print_debug(
+                    "Using --use-warp-cli: generating fresh WARP certificate"
+                )
+
+            result = subprocess.run(
+                ["warp-cli", "certs", "--no-paginate"],
+                capture_output=True,
+                text=True,
+                shell=True,
+            )
+
+            if result.returncode != 0 or not result.stdout.strip():
+                self.print_error("Failed to get certificate from warp-cli")
+                self.print_error("Make sure you are connected to Cloudflare WARP")
+                return None
+
+            return result.stdout.strip()
+        except Exception as e:
+            self.print_error(f"Error running warp-cli: {e}")
+            return None
+
+    def _get_netskope_cert(self):
+        """Retrieve the Netskope CA certificate from known Windows locations."""
+        found_encrypted = []
+
+        if os.path.exists(CERT_PATH):
+            try:
+                with open(CERT_PATH, "r", encoding="utf-8") as f:
+                    cert_content = f.read().strip()
+
+                if "-----BEGIN CERTIFICATE-----" in cert_content:
+                    self.print_info(f"Using Netskope certificate from {CERT_PATH}")
+                    return cert_content
+            except Exception as e:
+                self.print_debug(
+                    f"Could not read manual Netskope certificate at {CERT_PATH}: {e}"
+                )
+
+        for path in self.get_netskope_cert_sources():
+            if not os.path.exists(path):
+                continue
+
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    cert_content = f.read().strip()
+
+                if "-----BEGIN CERTIFICATE-----" in cert_content:
+                    self.print_info(f"Using Netskope certificate from {path}")
+                    return cert_content
+            except Exception as e:
+                self.print_debug(f"Could not read Netskope certificate at {path}: {e}")
+
+        for path in self.get_netskope_cert_sources():
+            enc_path = f"{path}.enc"
+            if os.path.exists(enc_path):
+                found_encrypted.append(enc_path)
+
+        if found_encrypted:
+            self.print_error("Found encrypted Netskope certificate file(s):")
+            for enc_path in found_encrypted:
+                self.print_error(f"  {enc_path}")
+            self.print_error(
+                "Netskope appears to be storing the certificate in encrypted form."
+            )
+            self.print_error(
+                "Export the Netskope root certificate as PEM and place it at:"
+            )
+            self.print_error(f"  {CERT_PATH}")
+            self.print_error(
+                "Then rerun fumitm_windows.py with --provider netskope."
+            )
+            return None
+
+        self.print_error("Could not find Netskope certificate")
+        self.print_error("Checked:")
+        for path in self.get_netskope_cert_sources():
+            self.print_error(f"  {path}")
+        return None
+
+    def get_provider_cert(self):
+        """Retrieve the current provider certificate as PEM text."""
+        if self.provider_key == "netskope":
+            return self._get_netskope_cert()
+        return self._get_warp_cert()
+
+    def get_status_cert_file(self):
+        """Retrieve the current provider certificate into a temporary file."""
+        cert_content = self.get_provider_cert()
+        if not cert_content:
+            return None
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".pem", delete=False) as tf:
+            tf.write(cert_content)
+            return tf.name
+
+    def check_provider_connection(self):
+        """Check whether the selected provider is available and connected."""
+        provider_name = self.get_provider_name()
+        short_name = self.get_provider_short_name()
+        self.print_status(f"{provider_name} Connection:")
+
+        if self.provider_key == "warp":
+            if self.command_exists("warp-cli"):
+                try:
+                    result = subprocess.run(
+                        ["warp-cli", "status"],
+                        capture_output=True,
+                        text=True,
+                        shell=True,
+                    )
+                    warp_status = result.stdout if result.returncode == 0 else "unknown"
+                    if "Connected" in warp_status:
+                        self.print_info(f"  ✓ {short_name} is connected")
+                        return False
+
+                    self.print_warn(f"  ✗ {short_name} is not connected")
+                    self.print_action("  Run: warp-cli connect")
+                    return True
+                except Exception:
+                    self.print_error(f"  ✗ Failed to check {short_name} status")
+                    return True
+
+            self.print_error("  ✗ warp-cli not found")
+            self.print_action(f"  Install {provider_name} client")
+            return True
+
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq STAgent.exe"],
+                capture_output=True,
+                text=True,
+                shell=True,
+            )
+            if result.returncode == 0 and "STAgent.exe" in result.stdout:
+                self.print_info("  ✓ STAgent is running")
+                return False
+        except Exception as e:
+            self.print_debug(f"Failed to query Netskope process status: {e}")
+
+        if any(os.path.exists(path) for path in self.get_netskope_cert_sources()):
+            self.print_info("  ✓ Netskope certificate file found")
+            return False
+
+        self.print_warn("  ✗ Could not verify Netskope status")
+        return True
 
     def find_certificate_file(self):
         """Find the THG-CloudflareCert.pem certificate file."""
@@ -847,51 +1119,26 @@ class FumitmWindows:
             return False
 
     def download_certificate(self):
-        """Download and verify THG Cloudflare WARP certificate."""
-        if self.use_warp_cli:
+        """Retrieve and verify the selected provider certificate."""
+        provider_name = self.get_provider_name()
+        short_name = self.get_provider_short_name()
+
+        if self.provider_key == "warp" and self.use_warp_cli:
             self.print_info(
-                "Generating THG Cloudflare certificate directly from WARP client..."
+                f"Generating {provider_name} certificate directly from the client..."
             )
         else:
-            self.print_info("Retrieving THG Cloudflare WARP certificate...")
+            self.print_info(f"Retrieving {provider_name} certificate...")
 
-        # Check if warp-cli is available
-        if not self.command_exists("warp-cli"):
-            self.print_error(
-                "warp-cli command not found. Please ensure Cloudflare WARP is installed."
-            )
+        provider_cert = self.get_provider_cert()
+        if not provider_cert:
             return False
 
-        # Get current certificate from warp-cli
-        try:
-            if self.use_warp_cli:
-                # Force generation from WARP client
-                self.print_debug(
-                    "Using --use-warp-cli: generating fresh THG certificate"
-                )
-
-            result = subprocess.run(
-                ["warp-cli", "certs", "--no-paginate"],
-                capture_output=True,
-                text=True,
-                shell=True,
-            )
-
-            if result.returncode != 0 or not result.stdout.strip():
-                self.print_error("Failed to get certificate from warp-cli")
-                self.print_error("Make sure you are connected to Cloudflare WARP")
-                return False
-
-            warp_cert = result.stdout.strip()
-        except Exception as e:
-            self.print_error(f"Error running warp-cli: {e}")
-            return False
-
-        # Create a temp file for the WARP certificate
+        # Create a temp file for the provider certificate
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".pem", delete=False
         ) as temp_cert:
-            temp_cert.write(warp_cert)
+            temp_cert.write(provider_cert)
             temp_cert_path = temp_cert.name
 
         # Verify it's a valid PEM certificate
@@ -944,41 +1191,41 @@ class FumitmWindows:
                 os.unlink(temp_cert_path)
                 return False
 
-        self.print_info("THG Cloudflare WARP certificate retrieved successfully")
+        self.print_info(f"{provider_name} certificate retrieved successfully")
 
         # Check if certificate needs to be saved to CERT_PATH
         needs_save = False
         if os.path.exists(CERT_PATH):
-            # Check if existing cert matches WARP cert
+            # Check if existing cert matches the current provider cert
             with open(CERT_PATH, "r") as f:
                 existing_cert = f.read()
 
-            if existing_cert != warp_cert:
-                self.print_info(f"THG certificate at {CERT_PATH} needs updating")
+            if existing_cert != provider_cert:
+                self.print_info(f"{short_name} certificate at {CERT_PATH} needs updating")
                 needs_save = True
             else:
-                self.print_info(f"THG certificate at {CERT_PATH} is up to date")
+                self.print_info(f"{short_name} certificate at {CERT_PATH} is up to date")
         else:
-            self.print_info(f"THG certificate will be saved to {CERT_PATH}")
+            self.print_info(f"{short_name} certificate will be saved to {CERT_PATH}")
             needs_save = True
 
         # Save certificate if needed
         if needs_save:
             if not self.is_install_mode():
-                self.print_action(f"Would save THG certificate to {CERT_PATH}")
+                self.print_action(f"Would save {short_name} certificate to {CERT_PATH}")
                 self.print_action(
-                    f"Would create .cloudflare-warp directory at {CLOUDFLARE_WARP_DIR}"
+                    f"Would create provider bundle directory at {CLOUDFLARE_WARP_DIR}"
                 )
             else:
-                # Ensure .cloudflare-warp directory exists
+                # Ensure provider bundle directory exists
                 os.makedirs(CLOUDFLARE_WARP_DIR, exist_ok=True)
                 self.print_info(
-                    f"Created .cloudflare-warp directory at {CLOUDFLARE_WARP_DIR}"
+                    f"Created provider bundle directory at {CLOUDFLARE_WARP_DIR}"
                 )
 
                 # Save certificate
                 shutil.copy(temp_cert_path, CERT_PATH)
-                self.print_info(f"THG Cloudflare certificate saved to {CERT_PATH}")
+                self.print_info(f"{provider_name} certificate saved to {CERT_PATH}")
                 self.print_info("Certificate is available for custom use by users")
 
         # Clean up temporary file (but keep the saved certificate)
@@ -1336,7 +1583,7 @@ class FumitmWindows:
                     "keytool",
                     "-list",
                     "-alias",
-                    "cloudflare-zerotrust",
+                    self.get_keytool_alias(),
                     "-cacerts",
                     "-storepass",
                     "changeit",
@@ -1346,7 +1593,7 @@ class FumitmWindows:
             )
             if (
                 result.returncode == 0
-                and "cloudflare-zerotrust" in result.stdout.decode()
+                and self.get_keytool_alias() in result.stdout.decode()
             ):
                 # Certificate already exists, nothing to do
                 return
@@ -1359,7 +1606,7 @@ class FumitmWindows:
         if not self.is_install_mode():
             self.print_action(f"Would import certificate to Java keystore: {cacerts}")
             self.print_action(
-                f"Would run: keytool -import -trustcacerts -alias cloudflare-zerotrust -file {CERT_PATH} -cacerts -storepass changeit -noprompt"
+                f"Would run: keytool -import -trustcacerts -alias {self.get_keytool_alias()} -file {CERT_PATH} -cacerts -storepass changeit -noprompt"
             )
         else:
             result = subprocess.run(
@@ -1368,7 +1615,7 @@ class FumitmWindows:
                     "-import",
                     "-trustcacerts",
                     "-alias",
-                    "cloudflare-zerotrust",
+                    self.get_keytool_alias(),
                     "-file",
                     CERT_PATH,
                     "-cacerts",
@@ -1483,7 +1730,7 @@ class FumitmWindows:
         if not self.is_install_mode():
             self.print_action("Would copy certificate to Podman VM")
             self.print_action(
-                f"Would run: podman machine ssh 'sudo tee /etc/pki/ca-trust/source/anchors/THG-CloudflareCert.pem' < {CERT_PATH}"
+                f"Would run: podman machine ssh 'sudo tee /etc/pki/ca-trust/source/anchors/{self.get_container_cert_name()}' < {CERT_PATH}"
             )
             self.print_action("Would run: podman machine ssh 'sudo update-ca-trust'")
         else:
@@ -1498,7 +1745,7 @@ class FumitmWindows:
                     "podman",
                     "machine",
                     "ssh",
-                    "sudo tee /etc/pki/ca-trust/source/anchors/THG-CloudflareCert.pem",
+                    f"sudo tee /etc/pki/ca-trust/source/anchors/{self.get_container_cert_name()}",
                 ],
                 input=cert_content,
                 text=True,
@@ -1530,7 +1777,7 @@ class FumitmWindows:
         if not self.is_install_mode():
             self.print_action("Would copy certificate to Rancher VM")
             self.print_action(
-                f"Would run: rdctl shell sudo tee /usr/local/share/ca-certificates/THG-CloudflareCert.pem < {CERT_PATH}"
+                f"Would run: rdctl shell sudo tee /usr/local/share/ca-certificates/{self.get_container_cert_name()} < {CERT_PATH}"
             )
             self.print_action("Would run: rdctl shell sudo update-ca-certificates")
         else:
@@ -1544,7 +1791,7 @@ class FumitmWindows:
                 [
                     "rdctl",
                     "shell",
-                    "sudo tee /usr/local/share/ca-certificates/THG-CloudflareCert.pem",
+                    f"sudo tee /usr/local/share/ca-certificates/{self.get_container_cert_name()}",
                 ],
                 input=cert_content,
                 text=True,
@@ -2120,7 +2367,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                             "keytool",
                             "-list",
                             "-alias",
-                            "cloudflare-zerotrust",
+                            self.get_keytool_alias(),
                             "-cacerts",
                             "-storepass",
                             "changeit",
@@ -2130,7 +2377,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     )
                     if (
                         result.returncode == 0
-                        and "cloudflare-zerotrust" in result.stdout.decode()
+                        and self.get_keytool_alias() in result.stdout.decode()
                     ):
                         self.print_info(
                             "  ✓ Java keystore contains Cloudflare certificate"
@@ -2190,7 +2437,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                             "podman",
                             "machine",
                             "ssh",
-                            "test -f /etc/pki/ca-trust/source/anchors/THG-CloudflareCert.pem",
+                            f"test -f /etc/pki/ca-trust/source/anchors/{self.get_container_cert_name()}",
                         ],
                         capture_output=True,
                         shell=True,
@@ -2226,7 +2473,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                         [
                             "rdctl",
                             "shell",
-                            "test -f /usr/local/share/ca-certificates/THG-CloudflareCert.pem",
+                            f"test -f /usr/local/share/ca-certificates/{self.get_container_cert_name()}",
                         ],
                         capture_output=True,
                         shell=True,
@@ -2300,8 +2547,11 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         has_issues = False
         temp_warp_cert = None
 
-        self.print_info("Checking Cloudflare WARP Certificate Status")
-        self.print_info("===========================================")
+        provider_name = self.get_provider_name()
+        short_name = self.get_provider_short_name()
+
+        self.print_info(f"Checking {provider_name} Certificate Status")
+        self.print_info("=" * len(f"Checking {provider_name} Certificate Status"))
         print()
 
         # First, get the current WARP certificate to use for all comparisons
@@ -2395,7 +2645,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     $now = Get-Date
                     $expiry = $cert.NotAfter
                     $daysUntilExpiry = ($expiry - $now).Days
-                    
+
                     if ($daysUntilExpiry -gt 1) {{
                         Write-Output "Valid"
                         exit 0
@@ -2535,11 +2785,199 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         if temp_warp_cert:
             os.unlink(temp_warp_cert)
 
+    def check_all_status(self):
+        """Check status of all configurations."""
+        has_issues = False
+        temp_warp_cert = None
+        provider_name = self.get_provider_name()
+        short_name = self.get_provider_short_name()
+
+        self.print_info(f"Checking {provider_name} Certificate Status")
+        self.print_info("=" * len(f"Checking {provider_name} Certificate Status"))
+        print()
+
+        temp_warp_cert = self.get_status_cert_file()
+        if not temp_warp_cert:
+            return
+
+        self.print_debug(f"Retrieved {short_name} certificate for comparison")
+        self.cert_fingerprint = self.get_cert_fingerprint(temp_warp_cert)
+        self.print_debug(
+            f"{short_name} certificate fingerprint: {self.cert_fingerprint}"
+        )
+
+        if self.check_provider_connection():
+            has_issues = True
+        print()
+
+        self.print_status("Certificate Status:")
+
+        try:
+            result = subprocess.run(
+                [
+                    "openssl",
+                    "x509",
+                    "-noout",
+                    "-checkend",
+                    "86400",
+                    "-in",
+                    temp_warp_cert,
+                ],
+                capture_output=True,
+            )
+            if result.returncode == 0:
+                self.print_info(f"  ✓ {short_name} certificate is valid")
+            else:
+                raise Exception("OpenSSL validation failed")
+        except Exception as e:
+            self.print_debug(
+                f"OpenSSL not available, trying PowerShell validation: {e}"
+            )
+            try:
+                ps_command = f"""
+                try {{
+                    $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('{temp_warp_cert}')
+                    $now = Get-Date
+                    $expiry = $cert.NotAfter
+                    $daysUntilExpiry = ($expiry - $now).Days
+
+                    if ($daysUntilExpiry -gt 1) {{
+                        Write-Output "Valid"
+                        exit 0
+                    }} else {{
+                        Write-Output "Expiring"
+                        exit 1
+                    }}
+                }} catch {{
+                    Write-Output "Invalid"
+                    exit 2
+                }}
+                """
+
+                result = subprocess.run(
+                    ["powershell", "-Command", ps_command],
+                    capture_output=True,
+                    text=True,
+                )
+
+                if result.returncode == 0:
+                    self.print_info(f"  ✓ {short_name} certificate is valid")
+                elif result.returncode == 1:
+                    self.print_warn(
+                        f"  ✗ {short_name} certificate is expired or expiring soon"
+                    )
+                    has_issues = True
+                else:
+                    self.print_error(f"  ✗ {short_name} certificate is invalid")
+                    has_issues = True
+            except Exception as ps_e:
+                self.print_error("  ✗ Failed to check certificate validity")
+                self.print_debug(f"PowerShell validation error: {ps_e}")
+                has_issues = True
+
+        cert_locations = []
+        cert_found = False
+
+        if os.path.exists(CERT_PATH):
+            with open(CERT_PATH, "r") as f:
+                existing_cert = f.read()
+            with open(temp_warp_cert, "r") as f:
+                current_cert_content = f.read()
+            if existing_cert == current_cert_content:
+                cert_locations.append(f"    - {CERT_PATH}")
+                cert_found = True
+
+        if self.check_certificate_in_store(temp_warp_cert, "Root"):
+            cert_locations.append("    - Windows Root certificate store")
+            cert_found = True
+
+        for env_var in [
+            "NODE_EXTRA_CA_CERTS",
+            "REQUESTS_CA_BUNDLE",
+            "SSL_CERT_FILE",
+        ]:
+            env_value = self.get_environment_variable(env_var)
+            if env_value and os.path.exists(env_value):
+                if self.certificate_exists_in_file(temp_warp_cert, env_value):
+                    cert_locations.append(f"    - {env_value} ({env_var})")
+                    cert_found = True
+
+        if cert_found:
+            self.print_info(f"  ✓ {short_name} certificate found in:")
+            for loc in cert_locations:
+                print(loc)
+        else:
+            self.print_warn(
+                f"  ✗ {short_name} certificate not found in any configured location"
+            )
+            self.print_action("    Run with --fix to install the certificate")
+            has_issues = True
+        print()
+
+        if self.selected_tools:
+            selected_tools_info = self.get_selected_tools_info()
+            self.print_info(f"Selected tools: {', '.join(selected_tools_info)}")
+            print()
+
+        for tool_key, tool_info in self.tools_registry.items():
+            if not self.should_process_tool(tool_key):
+                continue
+
+            self.print_status(f"{tool_info['name']} Configuration:")
+            if tool_info.get("check_func"):
+                tool_has_issues = tool_info["check_func"](temp_warp_cert)
+                if tool_has_issues:
+                    has_issues = True
+            print()
+
+        if not self.selected_tools:
+            self.print_status("curl Configuration:")
+            if self.command_exists("curl"):
+                verify_result = self.verify_connection("curl")
+                if verify_result == "WORKING":
+                    self.print_info(f"  ✓ curl can connect through {short_name}")
+                    if os.environ.get("CURL_CA_BUNDLE"):
+                        self.print_info(
+                            f"  ✓ CURL_CA_BUNDLE is set to: {os.environ['CURL_CA_BUNDLE']}"
+                        )
+                    else:
+                        self.print_info("  ✓ Using Windows certificate store")
+                else:
+                    if os.environ.get("CURL_CA_BUNDLE"):
+                        self.print_info("  ✓ CURL_CA_BUNDLE is set")
+                    else:
+                        self.print_warn(
+                            "  ✗ curl failed due to Windows certificate revocation check issue"
+                        )
+                        self.print_info(
+                            "    This is a common Windows networking issue, not a certificate problem"
+                        )
+                        self.print_action(
+                            "    Fix: Run with --fix to set CURL_CA_BUNDLE environment variable"
+                        )
+                        has_issues = True
+            else:
+                self.print_info("  - curl not installed")
+            print()
+
+        self.print_info("Summary:")
+        self.print_info("========")
+        if has_issues:
+            self.print_warn("Some configurations need attention.")
+            self.print_action("Run 'python fumitm_windows.py --fix' to fix the issues")
+        else:
+            self.print_info(f"✓ All configured tools are properly set up for {provider_name}")
+        print()
+
+        if temp_warp_cert:
+            os.unlink(temp_warp_cert)
+
     def main(self):
         """Main function."""
         try:
-            self.print_info("Cloudflare Certificate Installation Script (Windows)")
-            self.print_info("==================================================")
+            header = f"{self.get_provider_name()} Certificate Installation Script (Windows)"
+            self.print_info(header)
+            self.print_info("=" * len(header))
 
             if self.is_debug_mode():
                 self.print_debug(
@@ -2650,12 +3088,13 @@ def main():
         version_str += " [modified]"
 
     parser = argparse.ArgumentParser(
-        description="Cloudflare WARP Certificate Fixer Upper for Windows",
+        description="MITM Certificate Fixer Upper for Windows",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
 Examples:
   python fumitm_windows.py                    # Check status of all tools
   python fumitm_windows.py --fix              # Fix all detected issues
+  python fumitm_windows.py --provider netskope --fix
   python fumitm_windows.py --tools node       # Check only Node.js
   python fumitm_windows.py --fix --tools python,git  # Fix Python and Git only
   python fumitm_windows.py --list-tools       # Show available tools
@@ -2691,6 +3130,12 @@ Examples:
 
     # Certificate options
     cert_group = parser.add_argument_group("Certificate Options")
+    cert_group.add_argument(
+        "--provider",
+        choices=list(PROVIDERS.keys()),
+        default="warp",
+        help="MITM proxy provider to use (default: warp)",
+    )
     cert_group.add_argument(
         "--use-warp-cli",
         action="store_true",
@@ -2739,6 +3184,7 @@ Examples:
         debug=args.debug,
         selected_tools=selected_tools,
         use_warp_cli=args.use_warp_cli,
+        provider=args.provider,
     )
     exit_code = fumitm.main()
     sys.exit(exit_code)
