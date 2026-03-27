@@ -9,9 +9,7 @@ import argparse
 import platform
 import json
 import ssl
-import base64
 import hashlib
-import socket
 import urllib.request
 import urllib.error
 import winreg
@@ -197,30 +195,21 @@ PROVIDERS = {
     },
 }
 
-ACTIVE_PROVIDER_KEY = "warp"
-ACTIVE_PROVIDER = PROVIDERS[ACTIVE_PROVIDER_KEY]
-# Base directory for tool-specific certificate bundles
-CLOUDFLARE_WARP_DIR = os.path.join(
-    os.path.expanduser("~"), ACTIVE_PROVIDER["bundle_dir"].replace("~/", "")
-)
-CERT_PATH = os.path.join(CLOUDFLARE_WARP_DIR, ACTIVE_PROVIDER["cert_filename"])
-# No alternative certificate file names - we generate our own specific cert
-ALT_CERT_NAMES = []
-SHELL_MODIFIED = False
-CERT_FINGERPRINT = ""  # Cache for certificate fingerprint
+# Base directory for tool-specific certificate bundles (defaults to WARP, updated by set_active_provider)
+CLOUDFLARE_WARP_DIR = os.path.expanduser(PROVIDERS["warp"]["bundle_dir"])
+CERT_PATH = os.path.join(CLOUDFLARE_WARP_DIR, PROVIDERS["warp"]["cert_filename"])
 
 
 def set_active_provider(provider_key):
     """Update global certificate paths for the selected provider."""
-    global ACTIVE_PROVIDER_KEY, ACTIVE_PROVIDER, CLOUDFLARE_WARP_DIR, CERT_PATH
+    global CLOUDFLARE_WARP_DIR, CERT_PATH
 
     if provider_key not in PROVIDERS:
         raise ValueError(f"Unknown provider: {provider_key}")
 
-    ACTIVE_PROVIDER_KEY = provider_key
-    ACTIVE_PROVIDER = PROVIDERS[provider_key]
-    CLOUDFLARE_WARP_DIR = os.path.expanduser(ACTIVE_PROVIDER["bundle_dir"])
-    CERT_PATH = os.path.join(CLOUDFLARE_WARP_DIR, ACTIVE_PROVIDER["cert_filename"])
+    provider = PROVIDERS[provider_key]
+    CLOUDFLARE_WARP_DIR = os.path.expanduser(provider["bundle_dir"])
+    CERT_PATH = os.path.join(CLOUDFLARE_WARP_DIR, provider["cert_filename"])
 
 
 class FumitmWindows:
@@ -230,11 +219,13 @@ class FumitmWindows:
         debug=False,
         selected_tools=None,
         use_warp_cli=False,
-        provider="warp",
+        provider=None,
     ):
+        self.debug = debug
+        if provider is None:
+            provider = self._resolve_provider()
         set_active_provider(provider)
         self.mode = mode
-        self.debug = debug
         self.shell_modified = False
         self.cert_fingerprint = ""
         self.selected_tools = selected_tools or []
@@ -326,6 +317,44 @@ class FumitmWindows:
 
     def get_container_cert_name(self):
         return self.provider["container_cert_name"]
+
+    def _detect_warp(self):
+        """Check if Cloudflare WARP is available."""
+        return self.command_exists("warp-cli")
+
+    def _detect_netskope(self):
+        """Check if Netskope is available on Windows."""
+        # Check for certificate files
+        for path in PROVIDERS["netskope"].get("cert_sources", []):
+            if os.path.exists(path):
+                return True
+            # Check for encrypted variant
+            if os.path.exists(f"{path}.enc"):
+                return True
+        # Check for running STAgent process
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq STAgent.exe"],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0 and "STAgent.exe" in result.stdout:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _resolve_provider(self):
+        """Auto-detect the MITM proxy provider. Prefers WARP when both are found."""
+        if self._detect_warp():
+            self.print_debug("Auto-detected Cloudflare WARP")
+            return "warp"
+        if self._detect_netskope():
+            self.print_debug("Auto-detected Netskope")
+            return "netskope"
+        # Default to WARP if nothing detected
+        self.print_debug("No provider detected, defaulting to WARP")
+        return "warp"
 
     def is_install_mode(self):
         return self.mode == "install"
@@ -447,7 +476,7 @@ class FumitmWindows:
             import ctypes
 
             return ctypes.windll.shell32.IsUserAnAdmin()
-        except:
+        except Exception:
             return False
 
     def run_as_admin(self, command):
@@ -465,6 +494,11 @@ class FumitmWindows:
         except Exception as e:
             self.print_debug(f"Error running as admin: {e}")
             return False
+
+    @staticmethod
+    def _ps_escape(path):
+        """Escape a path for safe use inside a PowerShell single-quoted string."""
+        return str(path).replace("'", "''")
 
     def get_netskope_cert_sources(self):
         """Return known Windows Netskope certificate locations."""
@@ -488,7 +522,6 @@ class FumitmWindows:
                 ["warp-cli", "certs", "--no-paginate"],
                 capture_output=True,
                 text=True,
-                shell=True,
             )
 
             if result.returncode != 0 or not result.stdout.strip():
@@ -588,7 +621,6 @@ class FumitmWindows:
                         ["warp-cli", "status"],
                         capture_output=True,
                         text=True,
-                        shell=True,
                     )
                     warp_status = result.stdout if result.returncode == 0 else "unknown"
                     if "Connected" in warp_status:
@@ -611,7 +643,6 @@ class FumitmWindows:
                 ["tasklist", "/FI", "IMAGENAME eq STAgent.exe"],
                 capture_output=True,
                 text=True,
-                shell=True,
             )
             if result.returncode == 0 and "STAgent.exe" in result.stdout:
                 self.print_info("  ✓ STAgent is running")
@@ -627,13 +658,13 @@ class FumitmWindows:
         return True
 
     def find_certificate_file(self):
-        """Find the THG-CloudflareCert.pem certificate file."""
+        """Find the provider certificate file."""
         # Only use our specific certificate file
         if os.path.exists(CERT_PATH):
-            self.print_debug(f"Found THG Cloudflare certificate at: {CERT_PATH}")
+            self.print_debug(f"Found {self.get_provider_short_name()} certificate at: {CERT_PATH}")
             return CERT_PATH
 
-        self.print_debug(f"THG Cloudflare certificate not found at: {CERT_PATH}")
+        self.print_debug(f"{self.get_provider_short_name()} certificate not found at: {CERT_PATH}")
         return CERT_PATH  # Return path even if not found for creation
 
     def get_cert_fingerprint(self, cert_path=None):
@@ -676,7 +707,7 @@ class FumitmWindows:
             try:
                 # Fallback to PowerShell method
                 ps_command = f"""
-                $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('{cert_path}')
+                $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('{self._ps_escape(cert_path)}')
                 $hash = $cert.GetCertHashString('SHA256')
                 $formatted = ($hash -replace '(..)','$1:').TrimEnd(':')
                 Write-Output $formatted
@@ -763,11 +794,11 @@ class FumitmWindows:
                     f"Found existing {tool_name} certificate bundle at {existing_bundle}"
                 )
                 self.print_action(
-                    f"Would copy to {bundle_path} and append Cloudflare cert"
+                    f"Would copy to {bundle_path} and append {self.get_provider_short_name()} cert"
                 )
             else:
                 response = input(
-                    f"Found existing {tool_name} certificate bundle at {existing_bundle}. Copy to {bundle_path} and append Cloudflare cert? (Y/n) "
+                    f"Found existing {tool_name} certificate bundle at {existing_bundle}. Copy to {bundle_path} and append {self.get_provider_short_name()} cert? (Y/n) "
                 )
                 if response.lower() != "n":
                     # Create directory
@@ -786,7 +817,7 @@ class FumitmWindows:
 
                     # Check if the copied bundle already contains the certificate
                     if not self.certificate_exists_in_file(CERT_PATH, bundle_path):
-                        # Append Cloudflare cert if not already present
+                        # Append provider cert if not already present
                         self.append_certificate_if_missing(CERT_PATH, bundle_path)
                     else:
                         self.print_debug(
@@ -810,11 +841,11 @@ class FumitmWindows:
                 else:
                     Path(bundle_path).touch()
 
-                # Append Cloudflare certificate (with duplicate detection)
+                # Append provider certificate (with duplicate detection)
                 self.append_certificate_if_missing(CERT_PATH, bundle_path)
 
                 self.print_info(
-                    f"Created {tool_name} CA bundle with Cloudflare certificate"
+                    f"Created {tool_name} CA bundle with {self.get_provider_short_name()} certificate"
                 )
 
         # Set environment variables if provided
@@ -921,7 +952,7 @@ class FumitmWindows:
                 if needs_leading_newline:
                     f.write("\n")
                 f.write(cert_content)
-            self.print_info(f"Appended Cloudflare certificate to {target_file}")
+            self.print_info(f"Appended {self.get_provider_short_name()} certificate to {target_file}")
             return True
         except Exception as e:
             self.print_error(f"Failed to append certificate to {target_file}: {e}")
@@ -1064,7 +1095,7 @@ class FumitmWindows:
         try:
             # Use PowerShell to install certificate
             ps_command = f"""
-            $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('{cert_path}')
+            $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('{self._ps_escape(cert_path)}')
             $store = New-Object System.Security.Cryptography.X509Certificates.X509Store('{store_name}', 'CurrentUser')
             $store.Open('ReadWrite')
             $store.Add($cert)
@@ -1160,7 +1191,7 @@ class FumitmWindows:
                 # Fallback to PowerShell verification
                 ps_command = f"""
                 try {{
-                    $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('{temp_cert_path}')
+                    $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('{self._ps_escape(temp_cert_path)}')
                     if ($cert.Subject) {{
                         Write-Output "Valid certificate"
                         exit 0
@@ -1287,7 +1318,7 @@ class FumitmWindows:
                 if response.lower() == "y":
                     try:
                         ps_command = f"""
-                        $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('{CERT_PATH}')
+                        $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('{self._ps_escape(CERT_PATH)}')
                         $store = New-Object System.Security.Cryptography.X509Certificates.X509Store('Root', 'LocalMachine')
                         $store.Open('ReadWrite')
                         $store.Add($cert)
@@ -1330,7 +1361,7 @@ class FumitmWindows:
             if not self.certificate_exists_in_file(CERT_PATH, node_extra_ca_certs):
                 if not self.is_install_mode():
                     self.print_action(
-                        f"Would append Cloudflare certificate to existing {node_extra_ca_certs}"
+                        f"Would append {self.get_provider_short_name()} certificate to existing {node_extra_ca_certs}"
                     )
                 else:
                     self.append_certificate_if_missing(CERT_PATH, node_extra_ca_certs)
@@ -1358,10 +1389,9 @@ class FumitmWindows:
                 ["npm", "config", "get", "cafile"],
                 capture_output=True,
                 text=True,
-                shell=True,
             )
             current_cafile = result.stdout.strip() if result.returncode == 0 else ""
-        except:
+        except Exception:
             current_cafile = ""
 
         if current_cafile and current_cafile not in ["null", "undefined"]:
@@ -1372,11 +1402,11 @@ class FumitmWindows:
 
                     if not self.is_install_mode():
                         self.print_action(
-                            f"Would append Cloudflare certificate to {current_cafile}"
+                            f"Would append {self.get_provider_short_name()} certificate to {current_cafile}"
                         )
                     else:
                         response = input(
-                            f"Found existing npm cafile at {current_cafile}. Append Cloudflare cert? (Y/n) "
+                            f"Found existing npm cafile at {current_cafile}. Append {self.get_provider_short_name()} cert? (Y/n) "
                         )
                         if response.lower() != "n":
                             self.append_certificate_if_missing(
@@ -1396,7 +1426,6 @@ class FumitmWindows:
                     subprocess.run(
                         ["npm", "config", "set", "cafile", bundle_path],
                         check=True,
-                        shell=True,
                     )
                     self.print_info(f"Configured npm cafile to: {bundle_path}")
                 except FileNotFoundError:
@@ -1447,7 +1476,6 @@ class FumitmWindows:
                     ["gcloud", "config", "get-value", "core/custom_ca_certs_file"],
                     capture_output=True,
                     text=True,
-                    shell=True,
                 )
                 current_ca_file = (
                     result.stdout.strip() if result.returncode == 0 else ""
@@ -1471,12 +1499,11 @@ class FumitmWindows:
                                     "core/custom_ca_certs_file",
                                 ],
                                 capture_output=True,
-                                shell=True,
                             )
                             self.print_info(
                                 "Configured gcloud to use Windows certificate store"
                             )
-            except:
+            except Exception:
                 pass
             return
 
@@ -1498,10 +1525,9 @@ class FumitmWindows:
                 ["gcloud", "config", "get-value", "core/custom_ca_certs_file"],
                 capture_output=True,
                 text=True,
-                shell=True,
             )
             current_ca_file = result.stdout.strip() if result.returncode == 0 else ""
-        except:
+        except Exception:
             current_ca_file = ""
 
         needs_setup = False
@@ -1523,7 +1549,6 @@ class FumitmWindows:
             result = subprocess.run(
                 ["gcloud", "config", "set", "core/custom_ca_certs_file", bundle_path],
                 capture_output=True,
-                shell=True,
             )
             if result.returncode == 0:
                 self.print_info(f"gcloud configured to use CA bundle: {bundle_path}")
@@ -1547,7 +1572,7 @@ class FumitmWindows:
             try:
                 # Try to find Java installation
                 result = subprocess.run(
-                    ["where", "java"], capture_output=True, text=True, shell=True
+                    ["where", "java"], capture_output=True, text=True
                 )
                 if result.returncode == 0:
                     java_path = result.stdout.strip().split("\n")[0]
@@ -1589,7 +1614,6 @@ class FumitmWindows:
                     "changeit",
                 ],
                 capture_output=True,
-                shell=True,
             )
             if (
                 result.returncode == 0
@@ -1597,7 +1621,7 @@ class FumitmWindows:
             ):
                 # Certificate already exists, nothing to do
                 return
-        except:
+        except Exception:
             pass
 
         self.print_info("Setting up Java certificate...")
@@ -1624,7 +1648,6 @@ class FumitmWindows:
                     "-noprompt",
                 ],
                 capture_output=True,
-                shell=True,
             )
             if result.returncode == 0:
                 self.print_info("Certificate added to Java keystore successfully")
@@ -1716,7 +1739,6 @@ class FumitmWindows:
                 ["podman", "machine", "list"],
                 capture_output=True,
                 text=True,
-                shell=True,
             )
             if "Currently running" not in result.stdout:
                 self.print_warn("No Podman machine is currently running")
@@ -1724,7 +1746,7 @@ class FumitmWindows:
                     "Please start a Podman machine first with: podman machine start"
                 )
                 return
-        except:
+        except Exception:
             return
 
         if not self.is_install_mode():
@@ -1734,7 +1756,7 @@ class FumitmWindows:
             )
             self.print_action("Would run: podman machine ssh 'sudo update-ca-trust'")
         else:
-            self.print_info("Copying THG certificate to Podman VM...")
+            self.print_info(f"Copying {self.get_provider_short_name()} certificate to Podman VM...")
 
             # Copy certificate into Podman VM
             with open(CERT_PATH, "r") as f:
@@ -1750,7 +1772,6 @@ class FumitmWindows:
                 input=cert_content,
                 text=True,
                 capture_output=True,
-                shell=True,
             )
 
             if result.returncode == 0:
@@ -1758,7 +1779,6 @@ class FumitmWindows:
                 result = subprocess.run(
                     ["podman", "machine", "ssh", "sudo update-ca-trust"],
                     capture_output=True,
-                    shell=True,
                 )
                 if result.returncode == 0:
                     self.print_info("Podman certificate installed successfully")
@@ -1781,7 +1801,7 @@ class FumitmWindows:
             )
             self.print_action("Would run: rdctl shell sudo update-ca-certificates")
         else:
-            self.print_info("Copying THG certificate to Rancher VM...")
+            self.print_info(f"Copying {self.get_provider_short_name()} certificate to Rancher VM...")
 
             # Copy certificate into Rancher VM
             with open(CERT_PATH, "r") as f:
@@ -1796,7 +1816,6 @@ class FumitmWindows:
                 input=cert_content,
                 text=True,
                 capture_output=True,
-                shell=True,
             )
 
             if result.returncode == 0:
@@ -1804,7 +1823,6 @@ class FumitmWindows:
                 result = subprocess.run(
                     ["rdctl", "shell", "sudo update-ca-certificates"],
                     capture_output=True,
-                    shell=True,
                 )
                 if result.returncode == 0:
                     self.print_info("Rancher certificate installed successfully")
@@ -1828,7 +1846,7 @@ class FumitmWindows:
                 text=True,
             )
             current_ca_info = result.stdout.strip() if result.returncode == 0 else ""
-        except:
+        except Exception:
             current_ca_info = ""
 
         if current_ca_info:
@@ -1837,11 +1855,11 @@ class FumitmWindows:
                 if not self.certificate_exists_in_file(CERT_PATH, current_ca_info):
                     if not self.is_install_mode():
                         self.print_action(
-                            f"Would append Cloudflare certificate to {current_ca_info}"
+                            f"Would append {self.get_provider_short_name()} certificate to {current_ca_info}"
                         )
                     else:
                         response = input(
-                            f"Found existing Git CA file at {current_ca_info}. Append Cloudflare cert? (Y/n) "
+                            f"Found existing Git CA file at {current_ca_info}. Append {self.get_provider_short_name()} cert? (Y/n) "
                         )
                         if response.lower() != "n":
                             self.append_certificate_if_missing(
@@ -1877,11 +1895,11 @@ class FumitmWindows:
                             # Create empty file if no system certs available
                             Path(current_ca_info).touch()
 
-                        # Append Cloudflare certificate (with duplicate detection)
+                        # Append provider certificate (with duplicate detection)
                         self.append_certificate_if_missing(CERT_PATH, current_ca_info)
 
                         self.print_info(
-                            f"Created Git CA bundle with Cloudflare certificate at {current_ca_info}"
+                            f"Created Git CA bundle with {self.get_provider_short_name()} certificate at {current_ca_info}"
                         )
 
                     except Exception as e:
@@ -1951,7 +1969,7 @@ class FumitmWindows:
                 )
 
     def verify_connection(self, tool_name):
-        """Verify if a tool can connect through WARP."""
+        """Verify if a tool can connect through the proxy."""
         test_url = "https://www.cloudflare.com"
         result = "UNKNOWN"
 
@@ -1983,7 +2001,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                         ["node", "-e", node_script],
                         capture_output=True,
                         text=True,
-                        shell=True,
                     )
 
                     if proc_result.returncode == 0:
@@ -2002,9 +2019,9 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 result = "NOT_INSTALLED"
 
         elif tool_name == "python":
-            # Check if Python trusts the system Cloudflare WARP certificate
+            # Check if Python trusts the system certificate
             self.print_info(
-                "Checking if Python trusts system Cloudflare WARP certificate..."
+                f"Checking if Python trusts system {self.get_provider_short_name()} certificate..."
             )
 
             try:
@@ -2024,7 +2041,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                         f"Python SSL default verify paths: {ssl.get_default_verify_paths()}"
                     )
                     self.print_debug(
-                        "Python successfully trusts the system Cloudflare WARP certificate"
+                        f"Python successfully trusts the system {self.get_provider_short_name()} certificate"
                     )
 
             except urllib.error.HTTPError as e:
@@ -2065,13 +2082,11 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                             ["curl", "-v", "-s", "-o", "nul", test_url],
                             capture_output=True,
                             text=True,
-                            shell=True,
                         )
                     else:
                         curl_result = subprocess.run(
                             ["curl", "-s", "-o", "nul", test_url],
                             capture_output=True,
-                            shell=True,
                         )
 
                     if curl_result.returncode == 0:
@@ -2129,17 +2144,17 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                         temp_warp_cert, node_extra_ca_certs
                     ):
                         self.print_info(
-                            "  ✓ NODE_EXTRA_CA_CERTS contains current WARP certificate"
+                            f"  ✓ NODE_EXTRA_CA_CERTS contains current {self.get_provider_short_name()} certificate"
                         )
                         verify_result = self.verify_connection("node")
                         if verify_result == "WORKING":
-                            self.print_info("  ✓ Node.js can connect through WARP")
+                            self.print_info(f"  ✓ Node.js can connect through {self.get_provider_short_name()}")
                         else:
                             self.print_warn("  ✗ Node.js connection test failed")
                             has_issues = True
                     else:
                         self.print_warn(
-                            "  ✗ NODE_EXTRA_CA_CERTS file exists but doesn't contain current WARP certificate"
+                            f"  ✗ NODE_EXTRA_CA_CERTS file exists but doesn't contain current {self.get_provider_short_name()} certificate"
                         )
                         self.print_action(
                             "    Run with --fix to append the certificate to this file"
@@ -2167,7 +2182,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                         ["npm", "config", "get", "cafile"],
                         capture_output=True,
                         text=True,
-                        shell=True,
                     )
                     npm_cafile = result.stdout.strip() if result.returncode == 0 else ""
 
@@ -2177,11 +2191,11 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                                 temp_warp_cert, npm_cafile
                             ):
                                 self.print_info(
-                                    "  ✓ npm cafile contains current WARP certificate"
+                                    f"  ✓ npm cafile contains current {self.get_provider_short_name()} certificate"
                                 )
                             else:
                                 self.print_warn(
-                                    "  ✗ npm cafile doesn't contain current WARP certificate"
+                                    f"  ✗ npm cafile doesn't contain current {self.get_provider_short_name()} certificate"
                                 )
                                 has_issues = True
                         else:
@@ -2192,7 +2206,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     else:
                         self.print_warn("  ✗ npm cafile not configured")
                         has_issues = True
-                except:
+                except Exception:
                     pass
         else:
             self.print_info("  - Node.js not installed")
@@ -2207,10 +2221,10 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
 
             if python_verify_result == "WORKING":
                 self.print_info(
-                    "  ✓ Python trusts the system Cloudflare WARP certificate"
+                    f"  ✓ Python trusts the system {self.get_provider_short_name()} certificate"
                 )
                 self.print_info(
-                    "  ✓ Python can connect through WARP without additional configuration"
+                    f"  ✓ Python can connect through {self.get_provider_short_name()} without additional configuration"
                 )
 
                 # Even if system trust works, check if environment variables are set
@@ -2225,7 +2239,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                                 temp_warp_cert, env_value
                             ):
                                 self.print_warn(
-                                    f"  ⚠ {env_var} is set but doesn't contain current WARP certificate"
+                                    f"  ⚠ {env_var} is set but doesn't contain current {self.get_provider_short_name()} certificate"
                                 )
                                 self.print_action(
                                     f"    Consider updating {env_value} or unsetting {env_var}"
@@ -2254,12 +2268,12 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                             temp_warp_cert, requests_ca_bundle
                         ):
                             self.print_info(
-                                "  ✓ REQUESTS_CA_BUNDLE contains current WARP certificate"
+                                f"  ✓ REQUESTS_CA_BUNDLE contains current {self.get_provider_short_name()} certificate"
                             )
                             python_configured = True
                         else:
                             self.print_warn(
-                                "  ✗ REQUESTS_CA_BUNDLE file exists but doesn't contain current WARP certificate"
+                                f"  ✗ REQUESTS_CA_BUNDLE file exists but doesn't contain current {self.get_provider_short_name()} certificate"
                             )
                             self.print_action(
                                 "    Run with --fix to update the bundle with current certificate"
@@ -2280,12 +2294,12 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                             temp_warp_cert, ssl_cert_file
                         ):
                             self.print_info(
-                                "  ✓ SSL_CERT_FILE contains current WARP certificate"
+                                f"  ✓ SSL_CERT_FILE contains current {self.get_provider_short_name()} certificate"
                             )
                             python_configured = True
                         else:
                             self.print_warn(
-                                "  ✗ SSL_CERT_FILE file exists but doesn't contain current WARP certificate"
+                                f"  ✗ SSL_CERT_FILE file exists but doesn't contain current {self.get_provider_short_name()} certificate"
                             )
                             has_issues = True
                     else:
@@ -2319,7 +2333,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     ["gcloud", "config", "get-value", "core/custom_ca_certs_file"],
                     capture_output=True,
                     text=True,
-                    shell=True,
                 )
                 gcloud_ca = result.stdout.strip() if result.returncode == 0 else ""
 
@@ -2327,11 +2340,11 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     # Custom CA file is configured
                     if self.certificate_exists_in_file(temp_warp_cert, gcloud_ca):
                         self.print_info(
-                            "  ✓ gcloud configured with current WARP certificate (custom bundle)"
+                            f"  ✓ gcloud configured with current {self.get_provider_short_name()} certificate (custom bundle)"
                         )
                     else:
                         self.print_warn(
-                            "  ✗ gcloud CA file doesn't contain current WARP certificate"
+                            f"  ✗ gcloud CA file doesn't contain current {self.get_provider_short_name()} certificate"
                         )
                         has_issues = True
                 else:
@@ -2349,7 +2362,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                             "    Fix: Run with --fix --tools gcloud to install certificate"
                         )
                         has_issues = True
-            except:
+            except Exception:
                 self.print_warn("  ✗ Failed to check gcloud configuration")
                 has_issues = True
         else:
@@ -2373,21 +2386,20 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                             "changeit",
                         ],
                         capture_output=True,
-                        shell=True,
                     )
                     if (
                         result.returncode == 0
                         and self.get_keytool_alias() in result.stdout.decode()
                     ):
                         self.print_info(
-                            "  ✓ Java keystore contains Cloudflare certificate"
+                            f"  ✓ Java keystore contains {self.get_provider_short_name()} certificate"
                         )
                     else:
                         self.print_warn(
-                            "  ✗ Java keystore missing Cloudflare certificate"
+                            f"  ✗ Java keystore missing {self.get_provider_short_name()} certificate"
                         )
                         has_issues = True
-                except:
+                except Exception:
                     self.print_warn("  ✗ Failed to check Java keystore")
                     has_issues = True
             else:
@@ -2406,10 +2418,10 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 with open(wgetrc_path, "r") as f:
                     content = f.read()
                 if "ca_certificate=" in content and CERT_PATH in content:
-                    self.print_info("  ✓ wget configured with Cloudflare certificate")
+                    self.print_info(f"  ✓ wget configured with {self.get_provider_short_name()} certificate")
                 else:
                     self.print_warn(
-                        "  ✗ wget not configured with Cloudflare certificate"
+                        f"  ✗ wget not configured with {self.get_provider_short_name()} certificate"
                     )
                     has_issues = True
             else:
@@ -2428,7 +2440,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     ["podman", "machine", "list"],
                     capture_output=True,
                     text=True,
-                    shell=True,
                 )
                 if "Currently running" in result.stdout:
                     # Check if certificate exists in Podman VM
@@ -2440,19 +2451,18 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                             f"test -f /etc/pki/ca-trust/source/anchors/{self.get_container_cert_name()}",
                         ],
                         capture_output=True,
-                        shell=True,
                     )
                     if result.returncode == 0:
                         self.print_info(
-                            "  ✓ Podman VM has Cloudflare certificate installed"
+                            f"  ✓ Podman VM has {self.get_provider_short_name()} certificate installed"
                         )
                     else:
-                        self.print_warn("  ✗ Podman VM missing Cloudflare certificate")
+                        self.print_warn(f"  ✗ Podman VM missing {self.get_provider_short_name()} certificate")
                         has_issues = True
                 else:
                     self.print_info("  - Podman installed but no machine is running")
                     self.print_info("    Start a machine with: podman machine start")
-            except:
+            except Exception:
                 self.print_info("  - Failed to check Podman status")
         else:
             self.print_info("  - Podman not installed (would configure VM if present)")
@@ -2465,7 +2475,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             try:
                 # Try to check if Rancher is running
                 result = subprocess.run(
-                    ["rdctl", "version"], capture_output=True, text=True, shell=True
+                    ["rdctl", "version"], capture_output=True, text=True
                 )
                 if "rdctl" in result.stdout:
                     # Check if certificate exists in Rancher VM
@@ -2476,20 +2486,19 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                             f"test -f /usr/local/share/ca-certificates/{self.get_container_cert_name()}",
                         ],
                         capture_output=True,
-                        shell=True,
                     )
                     if result.returncode == 0:
                         self.print_info(
-                            "  ✓ Rancher Desktop VM has Cloudflare certificate installed"
+                            f"  ✓ Rancher Desktop VM has {self.get_provider_short_name()} certificate installed"
                         )
                     else:
                         self.print_warn(
-                            "  ✗ Rancher Desktop VM missing Cloudflare certificate"
+                            f"  ✗ Rancher Desktop VM missing {self.get_provider_short_name()} certificate"
                         )
                         has_issues = True
                 else:
                     self.print_info("  - Rancher Desktop installed but not running")
-            except:
+            except Exception:
                 self.print_info("  - Rancher Desktop installed but not running")
         else:
             self.print_info(
@@ -2513,11 +2522,11 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     # Custom CA file is configured
                     if self.certificate_exists_in_file(temp_warp_cert, git_ca_info):
                         self.print_info(
-                            "  ✓ Git configured with current WARP certificate (custom bundle)"
+                            f"  ✓ Git configured with current {self.get_provider_short_name()} certificate (custom bundle)"
                         )
                     else:
                         self.print_warn(
-                            "  ✗ Git CA file doesn't contain current WARP certificate"
+                            f"  ✗ Git CA file doesn't contain current {self.get_provider_short_name()} certificate"
                         )
                         has_issues = True
                 else:
@@ -2535,255 +2544,12 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                             "    Fix: Run with --fix --tools git to install certificate"
                         )
                         has_issues = True
-            except:
+            except Exception:
                 self.print_warn("  ✗ Failed to check Git configuration")
                 has_issues = True
         else:
             self.print_info("  - Git not installed")
         return has_issues
-
-    def check_all_status(self):
-        """Check status of all configurations."""
-        has_issues = False
-        temp_warp_cert = None
-
-        provider_name = self.get_provider_name()
-        short_name = self.get_provider_short_name()
-
-        self.print_info(f"Checking {provider_name} Certificate Status")
-        self.print_info("=" * len(f"Checking {provider_name} Certificate Status"))
-        print()
-
-        # First, get the current WARP certificate to use for all comparisons
-        if self.command_exists("warp-cli"):
-            try:
-                result = subprocess.run(
-                    ["warp-cli", "certs", "--no-paginate"],
-                    capture_output=True,
-                    text=True,
-                    shell=True,
-                )
-                if result.returncode == 0 and result.stdout.strip():
-                    with tempfile.NamedTemporaryFile(
-                        mode="w", suffix=".pem", delete=False
-                    ) as tf:
-                        tf.write(result.stdout.strip())
-                        temp_warp_cert = tf.name
-
-                    self.print_debug("Retrieved WARP certificate for comparison")
-                    # Pre-cache fingerprint for the WARP cert
-                    self.cert_fingerprint = self.get_cert_fingerprint(temp_warp_cert)
-                    self.print_debug(
-                        f"WARP certificate fingerprint: {self.cert_fingerprint}"
-                    )
-                else:
-                    self.print_error("Failed to retrieve WARP certificate")
-                    return
-            except Exception as e:
-                self.print_error(f"Error retrieving WARP certificate: {e}")
-                return
-        else:
-            self.print_error(
-                "warp-cli command not found. Please ensure Cloudflare WARP is installed."
-            )
-            return
-
-        # Check if WARP is connected
-        self.print_status("Cloudflare WARP Connection:")
-        if self.command_exists("warp-cli"):
-            try:
-                result = subprocess.run(
-                    ["warp-cli", "status"], capture_output=True, text=True, shell=True
-                )
-                warp_status = result.stdout if result.returncode == 0 else "unknown"
-                if "Connected" in warp_status:
-                    self.print_info("  ✓ WARP is connected")
-                else:
-                    self.print_warn("  ✗ WARP is not connected")
-                    self.print_action("  Run: warp-cli connect")
-                    has_issues = True
-            except:
-                self.print_error("  ✗ Failed to check WARP status")
-                has_issues = True
-        else:
-            self.print_error("  ✗ warp-cli not found")
-            self.print_action("  Install Cloudflare WARP client")
-            has_issues = True
-        print()
-
-        # Check certificate status
-        self.print_status("Certificate Status:")
-
-        # Check if WARP certificate is valid
-        try:
-            # Try openssl first
-            result = subprocess.run(
-                [
-                    "openssl",
-                    "x509",
-                    "-noout",
-                    "-checkend",
-                    "86400",
-                    "-in",
-                    temp_warp_cert,
-                ],
-                capture_output=True,
-            )
-            if result.returncode == 0:
-                self.print_info("  ✓ WARP certificate is valid")
-            else:
-                raise Exception("OpenSSL validation failed")
-        except Exception as e:
-            self.print_debug(
-                f"OpenSSL not available, trying PowerShell validation: {e}"
-            )
-            try:
-                # Fallback to PowerShell validation
-                ps_command = f"""
-                try {{
-                    $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('{temp_warp_cert}')
-                    $now = Get-Date
-                    $expiry = $cert.NotAfter
-                    $daysUntilExpiry = ($expiry - $now).Days
-
-                    if ($daysUntilExpiry -gt 1) {{
-                        Write-Output "Valid"
-                        exit 0
-                    }} else {{
-                        Write-Output "Expiring"
-                        exit 1
-                    }}
-                }} catch {{
-                    Write-Output "Invalid"
-                    exit 2
-                }}
-                """
-
-                result = subprocess.run(
-                    ["powershell", "-Command", ps_command],
-                    capture_output=True,
-                    text=True,
-                )
-
-                if result.returncode == 0:
-                    self.print_info("  ✓ WARP certificate is valid")
-                elif result.returncode == 1:
-                    self.print_warn("  ✗ WARP certificate is expired or expiring soon")
-                    has_issues = True
-                else:
-                    self.print_error("  ✗ WARP certificate is invalid")
-                    has_issues = True
-            except Exception as ps_e:
-                self.print_error("  ✗ Failed to check certificate validity")
-                self.print_debug(f"PowerShell validation error: {ps_e}")
-                has_issues = True
-
-        # Check where the certificate is currently stored
-        cert_locations = []
-        cert_found = False
-
-        # Check common locations
-        if os.path.exists(CERT_PATH):
-            with open(CERT_PATH, "r") as f:
-                existing_cert = f.read()
-            with open(temp_warp_cert, "r") as f:
-                warp_cert_content = f.read()
-            if existing_cert == warp_cert_content:
-                cert_locations.append(f"    - {CERT_PATH}")
-                cert_found = True
-
-        # Check Windows certificate store
-        if self.check_certificate_in_store(temp_warp_cert, "Root"):
-            cert_locations.append("    - Windows Root certificate store")
-            cert_found = True
-
-        # Check environment variables
-        for env_var in [
-            "NODE_EXTRA_CA_CERTS",
-            "REQUESTS_CA_BUNDLE",
-            "SSL_CERT_FILE",
-        ]:
-            env_value = self.get_environment_variable(env_var)
-            if env_value and os.path.exists(env_value):
-                if self.certificate_exists_in_file(temp_warp_cert, env_value):
-                    cert_locations.append(f"    - {env_value} ({env_var})")
-                    cert_found = True
-
-        if cert_found:
-            self.print_info("  ✓ WARP certificate found in:")
-            for loc in cert_locations:
-                print(loc)
-        else:
-            self.print_warn("  ✗ WARP certificate not found in any configured location")
-            self.print_action("    Run with --fix to install the certificate")
-            has_issues = True
-        print()
-
-        # Display selected tools info if filtering
-        if self.selected_tools:
-            selected_tools_info = self.get_selected_tools_info()
-            self.print_info(f"Selected tools: {', '.join(selected_tools_info)}")
-            print()
-
-        # Check each tool
-        for tool_key, tool_info in self.tools_registry.items():
-            if not self.should_process_tool(tool_key):
-                continue
-
-            self.print_status(f"{tool_info['name']} Configuration:")
-            if tool_info.get("check_func"):
-                tool_has_issues = tool_info["check_func"](temp_warp_cert)
-                if tool_has_issues:
-                    has_issues = True
-            print()
-
-        # Check curl configuration if not filtering
-        if not self.selected_tools:
-            self.print_status("curl Configuration:")
-            if self.command_exists("curl"):
-                verify_result = self.verify_connection("curl")
-                if verify_result == "WORKING":
-                    self.print_info("  ✓ curl can connect through WARP")
-                    # Check if it's using Windows certificate store
-                    if os.environ.get("CURL_CA_BUNDLE"):
-                        self.print_info(
-                            f"  ✓ CURL_CA_BUNDLE is set to: {os.environ['CURL_CA_BUNDLE']}"
-                        )
-                    else:
-                        self.print_info("  ✓ Using Windows certificate store")
-                else:
-                    if os.environ.get("CURL_CA_BUNDLE"):
-                        self.print_info("  ✓ CURL_CA_BUNDLE is set")
-                    else:
-                        self.print_warn(
-                            "  ✗ curl failed due to Windows certificate revocation check issue"
-                        )
-                        self.print_info(
-                            "    This is a common Windows networking issue, not a certificate problem"
-                        )
-                        self.print_action(
-                            "    Fix: Run with --fix to set CURL_CA_BUNDLE environment variable"
-                        )
-                        has_issues = True
-            else:
-                self.print_info("  - curl not installed")
-            print()
-
-        # Summary
-        self.print_info("Summary:")
-        self.print_info("========")
-        if has_issues:
-            self.print_warn("Some configurations need attention.")
-            self.print_action("Run 'python fumitm_windows.py --fix' to fix the issues")
-        else:
-            self.print_info(
-                "✓ All configured tools are properly set up for Cloudflare WARP"
-            )
-        print()
-
-        # Cleanup
-        if temp_warp_cert:
-            os.unlink(temp_warp_cert)
 
     def check_all_status(self):
         """Check status of all configurations."""
@@ -2836,7 +2602,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             try:
                 ps_command = f"""
                 try {{
-                    $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('{temp_warp_cert}')
+                    $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('{self._ps_escape(temp_warp_cert)}')
                     $now = Get-Date
                     $expiry = $cert.NotAfter
                     $daysUntilExpiry = ($expiry - $now).Days
@@ -3133,8 +2899,8 @@ Examples:
     cert_group.add_argument(
         "--provider",
         choices=list(PROVIDERS.keys()),
-        default="warp",
-        help="MITM proxy provider to use (default: warp)",
+        default=None,
+        help="MITM proxy provider to use (default: auto-detect)",
     )
     cert_group.add_argument(
         "--use-warp-cli",
