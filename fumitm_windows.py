@@ -535,21 +535,13 @@ class FumitmWindows:
             return None
 
     def _get_netskope_cert(self):
-        """Retrieve the Netskope CA certificate from known Windows locations."""
+        """Retrieve the Netskope CA certificate from known Windows locations.
+
+        Vendor-managed cert sources are checked first so that CA rotations
+        are picked up immediately. The manual override at CERT_PATH is only
+        used as a fallback when no vendor-managed file is available.
+        """
         found_encrypted = []
-
-        if os.path.exists(CERT_PATH):
-            try:
-                with open(CERT_PATH, "r", encoding="utf-8") as f:
-                    cert_content = f.read().strip()
-
-                if "-----BEGIN CERTIFICATE-----" in cert_content:
-                    self.print_info(f"Using Netskope certificate from {CERT_PATH}")
-                    return cert_content
-            except Exception as e:
-                self.print_debug(
-                    f"Could not read manual Netskope certificate at {CERT_PATH}: {e}"
-                )
 
         for path in self.get_netskope_cert_sources():
             if not os.path.exists(path):
@@ -564,6 +556,19 @@ class FumitmWindows:
                     return cert_content
             except Exception as e:
                 self.print_debug(f"Could not read Netskope certificate at {path}: {e}")
+
+        if os.path.exists(CERT_PATH):
+            try:
+                with open(CERT_PATH, "r", encoding="utf-8") as f:
+                    cert_content = f.read().strip()
+
+                if "-----BEGIN CERTIFICATE-----" in cert_content:
+                    self.print_info(f"Using Netskope certificate from {CERT_PATH}")
+                    return cert_content
+            except Exception as e:
+                self.print_debug(
+                    f"Could not read manual Netskope certificate at {CERT_PATH}: {e}"
+                )
 
         for path in self.get_netskope_cert_sources():
             enc_path = f"{path}.enc"
@@ -653,6 +658,17 @@ class FumitmWindows:
         if any(os.path.exists(path) for path in self.get_netskope_cert_sources()):
             self.print_info("  ✓ Netskope certificate file found")
             return False
+
+        if os.path.exists(CERT_PATH):
+            try:
+                with open(CERT_PATH, "r", encoding="utf-8") as f:
+                    if "-----BEGIN CERTIFICATE-----" in f.read():
+                        self.print_info(
+                            f"  ✓ Netskope certificate found at {CERT_PATH}"
+                        )
+                        return False
+            except Exception as e:
+                self.print_debug(f"Could not read {CERT_PATH}: {e}")
 
         self.print_warn("  ✗ Could not verify Netskope status")
         return True
