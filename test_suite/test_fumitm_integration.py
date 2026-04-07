@@ -3169,6 +3169,284 @@ class TestToolResultAccuracy(FumitmTestCase):
             assert result.status == 'skipped'
 
 
+class TestBareReturnsFixed(FumitmTestCase):
+    """Tests that setup functions return explicit ToolResult instead of None."""
+
+    def test_node_not_found_returns_skipped(self):
+        """setup_node_cert returns skipped when node not found."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=False):
+            result = instance.setup_node_cert()
+            assert result.status == 'skipped'
+            assert result.tool == 'node'
+
+    def test_python_not_found_returns_skipped(self):
+        """setup_python_cert returns skipped when python not found."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=False):
+            result = instance.setup_python_cert()
+            assert result.status == 'skipped'
+            assert result.tool == 'python'
+
+    def test_gcloud_not_found_returns_skipped(self):
+        """setup_gcloud_cert returns skipped when gcloud not found."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=False), \
+             patch('os.path.exists', return_value=False):
+            result = instance.setup_gcloud_cert()
+            assert result.status == 'skipped'
+            assert result.tool == 'gcloud'
+
+    def test_gcloud_already_works_returns_already_ok(self):
+        """setup_gcloud_cert returns already_ok when gcloud works via system trust."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'verify_connection', return_value='WORKING'), \
+             patch('os.path.exists', return_value=False):
+            result = instance.setup_gcloud_cert()
+            assert result.status == 'already_ok'
+
+    def test_curl_not_found_returns_skipped(self):
+        """setup_curl_cert returns skipped when curl not found."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=False):
+            result = instance.setup_curl_cert()
+            assert result.status == 'skipped'
+            assert result.tool == 'curl'
+
+    def test_curl_already_works_returns_already_ok(self):
+        """setup_curl_cert returns already_ok when curl works via system trust."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'verify_connection', return_value='WORKING'):
+            result = instance.setup_curl_cert()
+            assert result.status == 'already_ok'
+
+    def test_wget_not_found_returns_skipped(self):
+        """setup_wget_cert returns skipped when wget not found."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=False):
+            result = instance.setup_wget_cert()
+            assert result.status == 'skipped'
+            assert result.tool == 'wget'
+
+    def test_wget_already_works_returns_already_ok(self):
+        """setup_wget_cert returns already_ok when wget works via system trust."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'verify_connection', return_value='WORKING'):
+            result = instance.setup_wget_cert()
+            assert result.status == 'already_ok'
+
+    def test_gradle_not_found_returns_skipped(self):
+        """setup_gradle_cert returns skipped when gradle not found."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=False), \
+             patch('os.path.exists', return_value=False):
+            result = instance.setup_gradle_cert()
+            assert result.status == 'skipped'
+            assert result.tool == 'gradle'
+
+    def test_brew_cacerts_status_mode_returns_skipped(self):
+        """setup_brew_cacerts returns skipped in dry-run mode when bundle missing."""
+        instance = self.create_fumitm_instance(mode='status')
+        brew_prefix = instance._get_brew_prefix()
+        bundle_path = os.path.join(brew_prefix, 'etc', 'ca-certificates', 'cert.pem')
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch('subprocess.run') as mock_run, \
+             patch('os.path.exists', return_value=False):
+            mock_run.return_value = MagicMock(returncode=0)  # brew list succeeds
+            result = instance.setup_brew_cacerts()
+            assert result.status == 'skipped'
+
+    def test_node_nonexistent_file_returns_failed(self):
+        """setup_node_cert returns failed when NODE_EXTRA_CA_CERTS points to missing file."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.dict(os.environ, {'NODE_EXTRA_CA_CERTS': '/nonexistent/cert.pem'}), \
+             patch.object(instance, '_path_belongs_to_other_provider', return_value=None), \
+             patch('os.path.exists', return_value=False):
+            result = instance.setup_node_cert()
+            assert result.status == 'failed'
+            assert 'non-existent' in result.message
+
+    def test_python_nonexistent_requests_ca_bundle_returns_failed(self):
+        """setup_python_cert returns failed when REQUESTS_CA_BUNDLE points to missing file."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.dict(os.environ, {'REQUESTS_CA_BUNDLE': '/nonexistent/bundle.pem'}, clear=False), \
+             patch('os.path.exists', return_value=False):
+            result = instance.setup_python_cert()
+            assert result.status == 'failed'
+            assert 'non-existent' in result.message
+
+    def test_python_healthy_requests_but_missing_ssl_cert_returns_configured(self):
+        """setup_python_cert returns configured when SSL_CERT_FILE needs setting."""
+        instance = self.create_fumitm_instance(mode='install')
+        bundle_path = '/Users/testuser/.python-ca-bundle.pem'
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.dict(os.environ, {
+                 'REQUESTS_CA_BUNDLE': bundle_path,
+                 'SSL_CERT_FILE': '',
+             }, clear=False), \
+             patch('os.path.exists', return_value=True), \
+             patch.object(instance, 'is_writable', return_value=True), \
+             patch.object(instance, 'is_suspicious_full_bundle', return_value=(False, None)), \
+             patch.object(instance, 'certificate_exists_in_file', return_value=True), \
+             patch.object(instance, 'detect_shell', return_value='zsh'), \
+             patch.object(instance, 'get_shell_config', return_value='/tmp/.zshrc'), \
+             patch.object(instance, 'add_to_shell_config') as mock_shell:
+            result = instance.setup_python_cert()
+            assert result.status == 'configured'
+            mock_shell.assert_called_with('SSL_CERT_FILE', bundle_path, '/tmp/.zshrc')
+
+    def test_gcloud_pre_bootstrap_without_gcloud_returns_configured(self):
+        """setup_gcloud_cert returns configured when pre-bootstrap changes config."""
+        instance = self.create_fumitm_instance(mode='install')
+        python_bundle = os.path.expanduser("~/.python-ca-bundle.pem")
+
+        def exists_side_effect(path):
+            return path == python_bundle
+
+        with patch.object(instance, 'command_exists', return_value=False), \
+             patch('os.path.exists', side_effect=exists_side_effect), \
+             patch.object(instance, '_ensure_gcloud_properties', return_value=True) as mock_props, \
+             patch.object(instance, 'detect_shell', return_value='zsh'), \
+             patch.object(instance, 'get_shell_config', return_value='/tmp/.zshrc'), \
+             patch.object(instance, 'add_to_shell_config') as mock_shell:
+            result = instance.setup_gcloud_cert()
+            assert result.status == 'configured'
+            mock_props.assert_called_once()
+            mock_shell.assert_called_once()
+
+    def test_gcloud_pre_bootstrap_already_configured_returns_skipped(self):
+        """setup_gcloud_cert returns skipped when pre-bootstrap is a no-op."""
+        instance = self.create_fumitm_instance(mode='install')
+        python_bundle = os.path.expanduser("~/.python-ca-bundle.pem")
+        shell_config = '/tmp/.zshrc'
+
+        def exists_side_effect(path):
+            if path == python_bundle:
+                return True
+            if path == shell_config:
+                return True
+            return False
+
+        shell_content = f'export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE="{python_bundle}"\n'
+        mock_open_obj = mock_open(read_data=shell_content)
+
+        with patch.object(instance, 'command_exists', return_value=False), \
+             patch('os.path.exists', side_effect=exists_side_effect), \
+             patch.object(instance, '_ensure_gcloud_properties', return_value=False), \
+             patch.object(instance, 'detect_shell', return_value='zsh'), \
+             patch.object(instance, 'get_shell_config', return_value=shell_config), \
+             patch('builtins.open', mock_open_obj), \
+             patch.object(instance, 'add_to_shell_config'):
+            result = instance.setup_gcloud_cert()
+            assert result.status == 'skipped'
+            assert result.tool == 'gcloud'
+
+    def test_gcloud_pre_bootstrap_status_mode_returns_skipped(self):
+        """setup_gcloud_cert returns skipped (not configured) in status mode."""
+        instance = self.create_fumitm_instance(mode='status')
+        python_bundle = os.path.expanduser("~/.python-ca-bundle.pem")
+
+        def exists_side_effect(path):
+            return path == python_bundle
+
+        with patch.object(instance, 'command_exists', return_value=False), \
+             patch('os.path.exists', side_effect=exists_side_effect), \
+             patch.object(instance, '_ensure_gcloud_properties', return_value=True), \
+             patch.object(instance, 'detect_shell', return_value='zsh'), \
+             patch.object(instance, 'get_shell_config', return_value='/tmp/.zshrc'), \
+             patch.object(instance, 'add_to_shell_config'):
+            result = instance.setup_gcloud_cert()
+            assert result.status == 'skipped'
+
+    def test_gcloud_pre_bootstrap_stale_shell_export_returns_configured(self):
+        """setup_gcloud_cert returns configured when shell export has wrong value."""
+        instance = self.create_fumitm_instance(mode='install')
+        python_bundle = os.path.expanduser("~/.python-ca-bundle.pem")
+        shell_config = '/tmp/.zshrc'
+
+        def exists_side_effect(path):
+            if path == python_bundle:
+                return True
+            if path == shell_config:
+                return True
+            return False
+
+        stale = 'export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE="/wrong/path.pem"\n'
+        mock_open_obj = mock_open(read_data=stale)
+
+        with patch.object(instance, 'command_exists', return_value=False), \
+             patch('os.path.exists', side_effect=exists_side_effect), \
+             patch.object(instance, '_ensure_gcloud_properties', return_value=False), \
+             patch.object(instance, 'detect_shell', return_value='zsh'), \
+             patch.object(instance, 'get_shell_config', return_value=shell_config), \
+             patch('builtins.open', mock_open_obj), \
+             patch.object(instance, 'add_to_shell_config'):
+            result = instance.setup_gcloud_cert()
+            assert result.status == 'configured'
+
+    def test_node_user_declined_fallback_returns_skipped(self):
+        """setup_node_cert returns skipped when user declines alternative path."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.dict(os.environ, {'NODE_EXTRA_CA_CERTS': '/system/cert.pem'}), \
+             patch.object(instance, '_path_belongs_to_other_provider', return_value=None), \
+             patch('os.path.exists', return_value=True), \
+             patch.object(instance, 'certificate_exists_in_file', return_value=False), \
+             patch.object(instance, 'is_writable', return_value=False), \
+             patch.object(instance, 'suggest_user_path', return_value='/tmp/alt.pem'), \
+             patch.object(instance, '_prompt', return_value='n'):
+            result = instance.setup_node_cert()
+            assert result.status == 'skipped'
+            assert 'declined' in result.message.lower()
+
+    def test_python_unwritable_requests_ca_bundle_dry_run_returns_skipped(self):
+        """setup_python_cert returns skipped in status mode for unwritable bundle."""
+        instance = self.create_fumitm_instance(mode='status')
+        bundle = '/system/ca-bundle.pem'
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.dict(os.environ, {
+                 'REQUESTS_CA_BUNDLE': bundle,
+                 'SSL_CERT_FILE': '',
+             }, clear=False), \
+             patch('os.path.exists', return_value=True), \
+             patch.object(instance, 'is_writable', return_value=False), \
+             patch.object(instance, 'suggest_user_path', return_value='/tmp/alt.pem'):
+            result = instance.setup_python_cert()
+            assert result.status == 'skipped'
+
+    def test_python_unwritable_requests_ca_bundle_decline_returns_skipped(self):
+        """setup_python_cert returns skipped when user declines alternative path."""
+        instance = self.create_fumitm_instance(mode='install')
+        bundle = '/system/ca-bundle.pem'
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.dict(os.environ, {
+                 'REQUESTS_CA_BUNDLE': bundle,
+                 'SSL_CERT_FILE': '',
+             }, clear=False), \
+             patch('os.path.exists', return_value=True), \
+             patch.object(instance, 'is_writable', return_value=False), \
+             patch.object(instance, 'suggest_user_path', return_value='/tmp/alt.pem'), \
+             patch.object(instance, '_prompt', return_value='n'):
+            result = instance.setup_python_cert()
+            assert result.status == 'skipped'
+            assert 'declined' in result.message.lower()
+
+    def test_gradle_already_configured_returns_already_ok(self):
+        """setup_gradle_cert returns already_ok when properties already set."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'find_java_cacerts', return_value='/fake/cacerts'), \
+             patch.object(instance, 'update_properties_file', return_value=False):
+            result = instance.setup_gradle_cert()
+            assert result.status == 'already_ok'
+            assert result.tool == 'gradle'
+
+
 class TestAwsVerification(FumitmTestCase):
     """Tests for AWS CLI verify_connection and status checking."""
 
@@ -3333,20 +3611,21 @@ class TestAwsSetup(FumitmTestCase):
     """Tests for AWS CLI setup_aws_cert function."""
 
     def test_aws_not_installed_returns_early(self):
-        """setup_aws_cert returns early when aws not found."""
+        """setup_aws_cert returns skipped when aws not found."""
         instance = self.create_fumitm_instance(mode='install')
         with patch.object(instance, 'command_exists', return_value=False):
             result = instance.setup_aws_cert()
-            assert result is None  # bare return
+            assert result.status == 'skipped'
+            assert result.tool == 'aws'
 
     def test_aws_already_working_skips(self):
-        """setup_aws_cert skips when aws already works via system trust."""
+        """setup_aws_cert returns already_ok when aws works via system trust."""
         instance = self.create_fumitm_instance(mode='install')
         with patch.object(instance, 'command_exists', return_value=True), \
              patch.object(instance, 'verify_connection', return_value='WORKING'), \
              patch.dict(os.environ, {}, clear=True):
             result = instance.setup_aws_cert()
-            assert result is None  # bare return, no changes needed
+            assert result.status == 'already_ok'
 
     def test_aws_working_cross_provider_bundle_still_migrates(self):
         """setup_aws_cert should fix stale AWS_CA_BUNDLE even when aws still works."""
@@ -3377,7 +3656,7 @@ class TestAwsSetup(FumitmTestCase):
              patch.object(instance, 'verify_connection', return_value='FAILED'), \
              patch.dict(os.environ, {}, clear=True):
             result = instance.setup_aws_cert()
-            assert result is None  # returns in status mode
+            assert result.status == 'skipped'
 
     def test_aws_no_bundle_install_mode_creates_bundle(self):
         """setup_aws_cert creates bundle and configures env var when no bundle set."""
@@ -3521,6 +3800,137 @@ class TestAwsSetup(FumitmTestCase):
         assert entry['scope'] == 'user'
         assert 'setup_func' in entry
         assert 'check_func' in entry
+
+
+class TestGitTlsBackend(FumitmTestCase):
+    """Tests for git TLS backend detection (Apple Git vs OpenSSL)."""
+
+    def test_is_apple_git_true(self):
+        """_is_apple_git returns True for Apple's Git."""
+        instance = self.create_fumitm_instance()
+        mock_result = MagicMock()
+        mock_result.stdout = 'git version 2.50.1 (Apple Git-155)'
+        with patch('subprocess.run', return_value=mock_result):
+            assert instance._is_apple_git() is True
+
+    def test_is_apple_git_false(self):
+        """_is_apple_git returns False for Homebrew Git."""
+        instance = self.create_fumitm_instance()
+        mock_result = MagicMock()
+        mock_result.stdout = 'git version 2.50.0'
+        with patch('subprocess.run', return_value=mock_result):
+            assert instance._is_apple_git() is False
+
+    def test_is_apple_git_command_fails(self):
+        """_is_apple_git returns False when git command fails."""
+        instance = self.create_fumitm_instance()
+        with patch('subprocess.run', side_effect=FileNotFoundError):
+            assert instance._is_apple_git() is False
+
+    def test_git_no_sslcainfo_apple_git_returns_already_ok(self):
+        """Apple Git with no sslCAInfo returns already_ok."""
+        instance = self.create_fumitm_instance(mode='install')
+        mock_git_config = MagicMock()
+        mock_git_config.returncode = 1  # not set
+        mock_git_config.stdout = ''
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, '_is_apple_git', return_value=True), \
+             patch('subprocess.run', return_value=mock_git_config):
+            result = instance.setup_git_cert()
+            assert result.status == 'already_ok'
+            assert 'Apple Git' in result.message
+
+    def test_git_no_sslcainfo_openssl_git_configures(self):
+        """OpenSSL Git with no sslCAInfo creates bundle in install mode."""
+        instance = self.create_fumitm_instance(mode='install')
+
+        def mock_run_side_effect(*args, **kwargs):
+            cmd = args[0]
+            result = MagicMock()
+            if cmd == ['git', 'config', '--global', 'http.sslCAInfo']:
+                result.returncode = 1
+                result.stdout = ''
+            else:
+                result.returncode = 0
+                result.stdout = ''
+            return result
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, '_is_apple_git', return_value=False), \
+             patch('subprocess.run', side_effect=mock_run_side_effect), \
+             patch.object(instance, '_safe_makedirs'), \
+             patch.object(instance, 'create_bundle_with_system_certs') as mock_create, \
+             patch.object(instance, 'safe_append_certificate') as mock_append:
+            result = instance.setup_git_cert()
+            assert result.status == 'configured'
+            mock_create.assert_called_once()
+            mock_append.assert_called_once()
+
+    def test_git_no_sslcainfo_openssl_git_status_mode(self):
+        """OpenSSL Git with no sslCAInfo in status mode shows actions."""
+        instance = self.create_fumitm_instance(mode='status')
+        mock_git_config = MagicMock()
+        mock_git_config.returncode = 1
+        mock_git_config.stdout = ''
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, '_is_apple_git', return_value=False), \
+             patch('subprocess.run', return_value=mock_git_config):
+            result = instance.setup_git_cert()
+            assert result.status == 'skipped'
+            assert 'Dry run' in result.message
+
+    def test_git_missing_path_apple_git_returns_already_ok(self):
+        """Apple Git with sslCAInfo pointing to missing file returns already_ok."""
+        instance = self.create_fumitm_instance(mode='install')
+        mock_git_config = MagicMock()
+        mock_git_config.returncode = 0
+        mock_git_config.stdout = '/nonexistent/ca-bundle.pem'
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, '_is_apple_git', return_value=True), \
+             patch.object(instance, '_path_belongs_to_other_provider', return_value=None), \
+             patch('subprocess.run', return_value=mock_git_config), \
+             patch('os.path.exists', return_value=False):
+            result = instance.setup_git_cert()
+            assert result.status == 'already_ok'
+            assert 'Apple Git' in result.message
+
+    def test_git_missing_path_openssl_git_configures(self):
+        """OpenSSL Git with sslCAInfo pointing to missing file reconfigures."""
+        instance = self.create_fumitm_instance(mode='install')
+
+        def mock_run_side_effect(*args, **kwargs):
+            cmd = args[0]
+            result = MagicMock()
+            if cmd == ['git', 'config', '--global', 'http.sslCAInfo']:
+                result.returncode = 0
+                result.stdout = '/nonexistent/ca-bundle.pem'
+            else:
+                result.returncode = 0
+                result.stdout = ''
+            return result
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, '_is_apple_git', return_value=False), \
+             patch.object(instance, '_path_belongs_to_other_provider', return_value=None), \
+             patch('subprocess.run', side_effect=mock_run_side_effect), \
+             patch('os.path.exists', return_value=False), \
+             patch.object(instance, '_safe_makedirs'), \
+             patch.object(instance, 'create_bundle_with_system_certs'), \
+             patch.object(instance, 'safe_append_certificate'):
+            result = instance.setup_git_cert()
+            assert result.status == 'configured'
+
+    def test_check_git_status_openssl_no_config_flags_issue(self):
+        """check_git_status flags issue for OpenSSL Git with no sslCAInfo."""
+        instance = self.create_fumitm_instance()
+        mock_git_config = MagicMock()
+        mock_git_config.returncode = 1
+        mock_git_config.stdout = ''
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, '_is_apple_git', return_value=False), \
+             patch('subprocess.run', return_value=mock_git_config):
+            has_issues = instance.check_git_status(None)
+            assert has_issues is True
 
 
 if __name__ == '__main__':

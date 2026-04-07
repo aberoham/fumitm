@@ -675,6 +675,70 @@ class TestRunAsUser(FumitmTestCase):
             with pytest.raises(SystemExit):
                 instance._apply_target_user('ghost@domain.com')
 
+    def test_apply_target_user_augments_path_arm64(self):
+        """_apply_target_user prepends /opt/homebrew/bin on Apple Silicon."""
+        instance = self.create_fumitm_instance()
+        fake_pw = MagicMock()
+        fake_pw.pw_uid = 501
+        fake_pw.pw_gid = 20
+        fake_pw.pw_dir = '/Users/testuser'
+        original_path = '/usr/bin:/bin:/usr/sbin:/sbin'
+        with patch('pwd.getpwnam', return_value=fake_pw), \
+             patch('platform.machine', return_value='arm64'), \
+             patch.dict(os.environ, {'PATH': original_path, 'HOME': '/root'}, clear=False), \
+             patch('os.path.isdir', return_value=True):
+            instance._apply_target_user('testuser')
+            path = os.environ['PATH']
+            assert '/opt/homebrew/bin' in path.split(os.pathsep)
+            assert path.index('/opt/homebrew/bin') < path.index('/usr/bin')
+
+    def test_apply_target_user_augments_path_x86(self):
+        """_apply_target_user prepends /usr/local/bin on Intel Macs."""
+        instance = self.create_fumitm_instance()
+        fake_pw = MagicMock()
+        fake_pw.pw_uid = 501
+        fake_pw.pw_gid = 20
+        fake_pw.pw_dir = '/Users/testuser'
+        original_path = '/usr/bin:/bin:/usr/sbin:/sbin'
+        with patch('pwd.getpwnam', return_value=fake_pw), \
+             patch('platform.machine', return_value='x86_64'), \
+             patch.dict(os.environ, {'PATH': original_path, 'HOME': '/root'}, clear=False), \
+             patch('os.path.isdir', return_value=True):
+            instance._apply_target_user('testuser')
+            path = os.environ['PATH']
+            assert '/usr/local/bin' in path.split(os.pathsep)
+
+    def test_apply_target_user_skips_nonexistent_dirs(self):
+        """_apply_target_user does not add directories that don't exist."""
+        instance = self.create_fumitm_instance()
+        fake_pw = MagicMock()
+        fake_pw.pw_uid = 501
+        fake_pw.pw_gid = 20
+        fake_pw.pw_dir = '/Users/testuser'
+        original_path = '/usr/bin:/bin'
+        with patch('pwd.getpwnam', return_value=fake_pw), \
+             patch('platform.machine', return_value='arm64'), \
+             patch.dict(os.environ, {'PATH': original_path, 'HOME': '/root'}, clear=False), \
+             patch('os.path.isdir', return_value=False):
+            instance._apply_target_user('testuser')
+            assert os.environ['PATH'] == original_path
+
+    def test_apply_target_user_no_duplicate_path_entries(self):
+        """_apply_target_user does not duplicate entries already in PATH."""
+        instance = self.create_fumitm_instance()
+        fake_pw = MagicMock()
+        fake_pw.pw_uid = 501
+        fake_pw.pw_gid = 20
+        fake_pw.pw_dir = '/Users/testuser'
+        original_path = '/opt/homebrew/bin:/usr/bin:/bin'
+        with patch('pwd.getpwnam', return_value=fake_pw), \
+             patch('platform.machine', return_value='arm64'), \
+             patch.dict(os.environ, {'PATH': original_path, 'HOME': '/root'}, clear=False), \
+             patch('os.path.isdir', return_value=True):
+            instance._apply_target_user('testuser')
+            entries = os.environ['PATH'].split(os.pathsep)
+            assert entries.count('/opt/homebrew/bin') == 1
+
 
 class TestSkipUpdateCheck(FumitmTestCase):
     """--skip-update-check prevents the GitHub HTTP call."""
