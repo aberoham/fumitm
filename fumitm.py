@@ -843,7 +843,18 @@ class FumitmPython:
     def command_exists(self, cmd):
         """Check if a command exists."""
         return shutil.which(cmd) is not None
-    
+
+    def _is_apple_git(self):
+        """True when the active git binary is Apple's SecureTransport build."""
+        try:
+            result = subprocess.run(
+                ['git', 'version'],
+                capture_output=True, text=True, timeout=5,
+            )
+            return 'Apple Git' in result.stdout
+        except Exception:
+            return False
+
     def is_writable(self, path):
         """Check if a file/directory is writable."""
         if os.path.isfile(path):
@@ -907,6 +918,29 @@ class FumitmPython:
         self._target_uid = pw.pw_uid
         self._target_gid = pw.pw_gid
         os.environ['HOME'] = pw.pw_dir
+
+        # Augment PATH so command_exists() finds user-installed tools.
+        # Root's PATH typically lacks Homebrew and user-local bin directories.
+        brew_prefix = (
+            '/opt/homebrew/bin'
+            if platform.machine() == 'arm64'
+            else '/usr/local/bin'
+        )
+        user_paths = [
+            brew_prefix,
+            os.path.join(pw.pw_dir, '.local/bin'),
+        ]
+        current = os.environ.get('PATH', '')
+        current_entries = current.split(os.pathsep)
+        for p in reversed(user_paths):
+            try:
+                exists = os.path.isdir(p)
+            except (OSError, TypeError):
+                exists = False
+            if exists and p not in current_entries:
+                current = p + os.pathsep + current
+        os.environ['PATH'] = current
+        self.print_debug("Augmented PATH with user tool directories")
 
     @staticmethod
     def _detect_console_user():
@@ -2215,7 +2249,7 @@ class FumitmPython:
                     if result.stderr:
                         self.print_debug(result.stderr.strip())
                     return ToolResult('brew-cacerts', 'failed', 'brew postinstall ca-certificates failed')
-            return
+            return ToolResult('brew-cacerts', 'skipped', 'Dry run')
 
         if self.certificate_exists_in_file(self.cert_path, bundle_path):
             self.print_debug(
@@ -2264,7 +2298,7 @@ class FumitmPython:
     def setup_node_cert(self):
         """Setup Node.js certificate."""
         if not self.command_exists('node'):
-            return
+            return ToolResult('node', 'skipped', 'node not found in PATH')
         
         shell_type = self.detect_shell()
         shell_config = self.get_shell_config(shell_type)
@@ -2327,6 +2361,8 @@ class FumitmPython:
 
                                 self.add_to_shell_config("NODE_EXTRA_CA_CERTS", new_path, shell_config)
                                 self.print_info(f"Created new certificate bundle at {new_path}")
+                            else:
+                                return ToolResult('node', 'skipped', 'User declined alternative path')
                     else:
                         if not self.is_install_mode():
                             self.print_action(f"Would append proxy certificate to {node_extra_ca_certs}")
@@ -2334,10 +2370,10 @@ class FumitmPython:
                             self.print_info(f"Appending proxy certificate to {node_extra_ca_certs}")
                             self.safe_append_certificate(self.cert_path, node_extra_ca_certs)
             else:
-                needs_setup = True
                 self.print_info("Configuring Node.js certificate...")
                 self.print_warn(f"NODE_EXTRA_CA_CERTS points to a non-existent file: {node_extra_ca_certs}")
                 self.print_warn("Please fix this manually")
+                return ToolResult('node', 'failed', f'NODE_EXTRA_CA_CERTS points to non-existent file: {node_extra_ca_certs}')
         else:
             needs_setup = True
             self.print_info("Configuring Node.js certificate...")
@@ -2367,6 +2403,12 @@ class FumitmPython:
         # Cleanup stale yarn/pnpm configs that might override NODE_EXTRA_CA_CERTS
         self.cleanup_yarn_cafile()
         self.cleanup_pnpm_cafile()
+
+        if not needs_setup:
+            return ToolResult('node', 'already_ok', 'Node.js certificate already configured')
+        if self.is_install_mode():
+            return ToolResult('node', 'configured', 'Configured Node.js certificate')
+        return ToolResult('node', 'skipped', 'Dry run')
 
     def setup_npm_cafile(self):
         """Setup npm cafile."""
@@ -2610,7 +2652,7 @@ class FumitmPython:
         """Setup Python certificate."""
         if not self.command_exists('python3') and not self.command_exists('python'):
             self.print_info("Python not found, skipping Python setup")
-            return
+            return ToolResult('python', 'skipped', 'python not found in PATH')
 
         # Note: Unlike gcloud which uses a consistent system trust store, different
         # Python installations (system, Homebrew, venvs) may have different trust
@@ -2634,7 +2676,8 @@ class FumitmPython:
                     self.print_error(f"Cannot write to {requests_ca_bundle} (permission denied)")
                     new_path = self.suggest_user_path(requests_ca_bundle, "python")
                     self.print_warn(f"Suggesting alternative path: {new_path}")
-                    
+                    needs_setup = True
+
                     if not self.is_install_mode():
                         self.print_action(f"Would create directory: {os.path.dirname(new_path)}")
                         self.print_action(f"Would copy {requests_ca_bundle} to {new_path}")
@@ -2662,6 +2705,8 @@ class FumitmPython:
                             self.add_to_shell_config("SSL_CERT_FILE", new_path, shell_config)
                             self.add_to_shell_config("CURL_CA_BUNDLE", new_path, shell_config)
                             self.print_info(f"Created new certificate bundle at {new_path}")
+                        else:
+                            return ToolResult('python', 'skipped', 'User declined alternative path')
                 else:
                     # Check if the existing bundle looks suspicious (likely just WARP CA)
                     suspicious, reason = self.is_suspicious_full_bundle(requests_ca_bundle, self.cert_path)
@@ -2672,6 +2717,7 @@ class FumitmPython:
                         if not self.is_install_mode():
                             self.print_action(f"Would create full CA bundle at {python_bundle}")
                             self.print_action(f"Would repoint REQUESTS_CA_BUNDLE to {python_bundle}")
+                            return ToolResult('python', 'skipped', 'Dry run')
                         else:
                             self.create_bundle_with_system_certs(python_bundle)
                             self.safe_append_certificate(self.cert_path, python_bundle)
@@ -2679,7 +2725,7 @@ class FumitmPython:
                             self.add_to_shell_config("SSL_CERT_FILE", python_bundle, shell_config)
                             self.add_to_shell_config("CURL_CA_BUNDLE", python_bundle, shell_config)
                             self.print_info(f"Repointed REQUESTS_CA_BUNDLE to managed bundle: {python_bundle}")
-                        return
+                            return ToolResult('python', 'configured', 'Repointed suspicious REQUESTS_CA_BUNDLE')
 
                     # Check if the file contains our certificate using normalized comparison
                     if not self.certificate_exists_in_file(self.cert_path, requests_ca_bundle):
@@ -2698,16 +2744,17 @@ class FumitmPython:
                         shell_config = self.get_shell_config(shell_type)
                         ssl_cert_file = os.environ.get('SSL_CERT_FILE', '')
                         if not ssl_cert_file:
+                            needs_setup = True
                             if not self.is_install_mode():
                                 self.print_action(f"Would set SSL_CERT_FILE to {requests_ca_bundle}")
                             else:
                                 self.add_to_shell_config("SSL_CERT_FILE", requests_ca_bundle, shell_config)
                                 self.print_info(f"Set SSL_CERT_FILE to {requests_ca_bundle}")
             else:
-                needs_setup = True
                 self.print_info("Configuring Python certificate...")
                 self.print_info(f"REQUESTS_CA_BUNDLE is already set to: {requests_ca_bundle}")
                 self.print_warn(f"REQUESTS_CA_BUNDLE points to a non-existent file: {requests_ca_bundle}")
+                return ToolResult('python', 'failed', f'REQUESTS_CA_BUNDLE points to non-existent file: {requests_ca_bundle}')
         else:
             needs_setup = True
             self.print_info("Configuring Python certificate...")
@@ -2732,6 +2779,7 @@ class FumitmPython:
             if os.path.exists(ssl_cert_file):
                 suspicious, reason = self.is_suspicious_full_bundle(ssl_cert_file, self.cert_path)
                 if suspicious:
+                    needs_setup = True
                     self.print_info("Configuring SSL_CERT_FILE...")
                     self.print_warn(f"SSL_CERT_FILE looks suspiciously small ({reason})")
                     if not self.is_install_mode():
@@ -2744,6 +2792,7 @@ class FumitmPython:
                         self.add_to_shell_config("SSL_CERT_FILE", python_bundle, shell_config)
                         self.print_info(f"Repointed SSL_CERT_FILE to managed bundle: {python_bundle}")
                 elif not self.certificate_exists_in_file(self.cert_path, ssl_cert_file):
+                    needs_setup = True
                     self.print_info("Configuring SSL_CERT_FILE...")
                     self.print_warn("SSL_CERT_FILE doesn't contain proxy certificate")
                     if not self.is_install_mode():
@@ -2755,6 +2804,7 @@ class FumitmPython:
                         self.add_to_shell_config("SSL_CERT_FILE", python_bundle, shell_config)
                         self.print_info(f"Repointed SSL_CERT_FILE to managed bundle: {python_bundle}")
             else:
+                needs_setup = True
                 self.print_info("Configuring SSL_CERT_FILE...")
                 self.print_warn(f"SSL_CERT_FILE points to non-existent file: {ssl_cert_file}")
                 if not self.is_install_mode():
@@ -2765,6 +2815,12 @@ class FumitmPython:
                         self.safe_append_certificate(self.cert_path, python_bundle)
                     self.add_to_shell_config("SSL_CERT_FILE", python_bundle, shell_config)
                     self.print_info(f"Repointed SSL_CERT_FILE to managed bundle: {python_bundle}")
+
+        if not needs_setup:
+            return ToolResult('python', 'already_ok', 'Python certificate already configured')
+        if self.is_install_mode():
+            return ToolResult('python', 'configured', 'Configured Python certificate')
+        return ToolResult('python', 'skipped', 'Dry run')
 
     def _ensure_gcloud_properties(self, ca_bundle):
         """Pre-create ~/.config/gcloud/properties with custom_ca_certs_file.
@@ -2788,10 +2844,10 @@ class FumitmPython:
                     if stripped.startswith("custom_ca_certs_file"):
                         current_value = stripped.split("=", 1)[-1].strip()
                         if current_value == ca_bundle:
-                            return
+                            return False
                         if os.path.exists(current_value) and \
                                 self.certificate_exists_in_file(self.cert_path, current_value):
-                            return
+                            return False
                 # Existing value is stale or wrong — replace it
                 lines = content.splitlines()
                 new_lines = []
@@ -2807,7 +2863,7 @@ class FumitmPython:
                         f.write('\n'.join(new_lines) + '\n')
                     self._fix_ownership(properties_file)
                     self.print_info(f"Updated custom_ca_certs_file in {properties_file}")
-                return
+                return True
 
             # File exists but no custom_ca_certs_file — append under [core]
             if "[core]" in content:
@@ -2840,33 +2896,48 @@ class FumitmPython:
                     f.write(f"[core]\n{target_line}\n")
                 self._fix_ownership(properties_file)
                 self.print_info(f"Created {properties_file} with custom_ca_certs_file")
+        return True
 
     def setup_gcloud_cert(self):
         """Setup gcloud certificate."""
         # Pre-create the gcloud properties file so that future gcloud installs
         # (e.g. `brew install --cask gcloud-cli`) can bootstrap behind a MITM
         # proxy. Also set the env var for direct gcloud invocations.
+        pre_bootstrap = False
         python_bundle = os.path.expanduser("~/.python-ca-bundle.pem")
         if os.path.exists(python_bundle):
-            self._ensure_gcloud_properties(python_bundle)
+            props_changed = self._ensure_gcloud_properties(python_bundle)
             shell_type = self.detect_shell()
             shell_config = self.get_shell_config(shell_type)
+            env_var = "CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE"
+            already_in_shell = False
+            if os.path.exists(shell_config):
+                with open(shell_config, 'r') as f:
+                    already_in_shell = (
+                        f'export {env_var}="{python_bundle}"'
+                        in f.read()
+                    )
             self.add_to_shell_config(
-                "CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE",
+                env_var,
                 python_bundle,
                 shell_config,
             )
+            pre_bootstrap = props_changed or not already_in_shell
 
         if not self.command_exists('gcloud'):
             self.print_info("gcloud not found, skipping gcloud setup")
-            return
+            if pre_bootstrap:
+                if self.is_install_mode():
+                    return ToolResult('gcloud', 'configured', 'Pre-created gcloud properties for future install')
+                return ToolResult('gcloud', 'skipped', 'Dry run')
+            return ToolResult('gcloud', 'skipped', 'gcloud not found in PATH')
 
         # First check if gcloud already works (e.g., via system trust store)
         # If it works, don't add unnecessary configuration
         verify_result = self.verify_connection("gcloud")
         if verify_result == "WORKING":
             self.print_debug("gcloud already works via system trust, skipping configuration")
-            return
+            return ToolResult('gcloud', 'already_ok', 'Works via system trust store')
 
         gcloud_cert_dir = os.path.expanduser("~/.config/gcloud/certs")
         gcloud_bundle = os.path.join(gcloud_cert_dir, "combined-ca-bundle.pem")
@@ -2900,7 +2971,8 @@ class FumitmPython:
                     self.safe_append_certificate(self.cert_path, gcloud_bundle)
                     subprocess.run(['gcloud', 'config', 'set', 'core/custom_ca_certs_file', gcloud_bundle], capture_output=True, timeout=30)
                     self.print_info(f"Repointed gcloud custom CA file to managed bundle: {gcloud_bundle}")
-                return
+                    return ToolResult('gcloud', 'configured', 'Repointed suspicious gcloud CA file')
+                return ToolResult('gcloud', 'skipped', 'Dry run')
 
             # Check if current CA file contains our certificate using normalized comparison
             if not self.certificate_exists_in_file(self.cert_path, current_ca_file):
@@ -2909,7 +2981,7 @@ class FumitmPython:
             needs_setup = True
 
         if not needs_setup:
-            return
+            return ToolResult('gcloud', 'already_ok', 'gcloud certificate already configured')
 
         self.print_info("Configuring gcloud certificate...")
         
@@ -2930,17 +3002,18 @@ class FumitmPython:
             else:
                 if not self.is_install_mode():
                     self.print_action("Would ask to update gcloud CA configuration")
-                    return
+                    return ToolResult('gcloud', 'skipped', 'Dry run')
                 else:
                     response = self._prompt("Do you want to update it? (y/N) ")
                     if response.lower() != 'y':
-                        return
+                        return ToolResult('gcloud', 'skipped', 'User declined')
         
         if not self.is_install_mode():
             self.print_action(f"Would create directory: {gcloud_cert_dir}")
             self.print_action(f"Would create gcloud CA bundle at {gcloud_bundle}")
             self.print_action("Would copy system certificates and append proxy certificate")
             self.print_action(f"Would run: gcloud config set core/custom_ca_certs_file {gcloud_bundle}")
+            return ToolResult('gcloud', 'skipped', 'Dry run')
         else:
             # Create combined bundle
             self.print_info(f"Creating gcloud CA bundle at {gcloud_bundle}")
@@ -2962,13 +3035,15 @@ class FumitmPython:
                         subprocess.run(['gcloud', 'info', '--run-diagnostics'], timeout=10)
                     except subprocess.TimeoutExpired:
                         self.print_warn("gcloud diagnostics timed out, skipping")
+                return ToolResult('gcloud', 'configured', 'Configured gcloud certificate')
             else:
                 self.print_error("Failed to configure gcloud")
+                return ToolResult('gcloud', 'failed', 'Failed to configure gcloud')
 
     def setup_git_cert(self):
         """Setup Git sslCAInfo to a managed full bundle."""
         if not self.command_exists('git'):
-            return
+            return ToolResult('git', 'skipped', 'git not found in PATH')
         git_bundle = os.path.join(self.bundle_dir, "git/ca-bundle.pem")
         # Check current setting
         try:
@@ -2991,23 +3066,41 @@ class FumitmPython:
                     self.print_info("Configuring Git certificate...")
                     self.print_warn(f"Existing git http.sslCAInfo looks suspiciously small ({reason})")
             else:
-                # Path missing — don't configure by default; Git uses system trust store
-                return
+                if self._is_apple_git():
+                    return ToolResult(
+                        'git', 'already_ok',
+                        'sslCAInfo path missing; Apple Git uses system trust',
+                    )
+                repoint = True
+                self.print_info("Configuring Git certificate...")
+                self.print_info(
+                    f"http.sslCAInfo points to non-existent file: {current_ca}"
+                )
         else:
-            # Not set — Git uses system trust store when not configured
-            return
+            if self._is_apple_git():
+                return ToolResult(
+                    'git', 'already_ok',
+                    'Uses system trust store (Apple Git)',
+                )
+            repoint = True
+            self.print_info("Configuring Git certificate...")
+            self.print_info(
+                "http.sslCAInfo not set and git is OpenSSL-linked"
+                " (needs explicit CA bundle)"
+            )
         if not repoint:
-            return
+            return ToolResult('git', 'already_ok', 'sslCAInfo already correct')
         if not self.is_install_mode():
             self.print_action(f"Would create Git CA bundle at {git_bundle}")
             self.print_action(f"Would run: git config --global http.sslCAInfo {git_bundle}")
-            return
+            return ToolResult('git', 'skipped', 'Dry run')
         # Build full bundle and configure
         self._safe_makedirs(os.path.dirname(git_bundle))
         self.create_bundle_with_system_certs(git_bundle)
         self.safe_append_certificate(self.cert_path, git_bundle)
         subprocess.run(['git', 'config', '--global', 'http.sslCAInfo', git_bundle], capture_output=True, text=True)
         self.print_info(f"Configured git http.sslCAInfo to: {git_bundle}")
+        return ToolResult('git', 'configured', f'Set http.sslCAInfo to {git_bundle}')
 
     def setup_curl_cert(self):
         """Setup curl certificate configuration.
@@ -3019,14 +3112,14 @@ class FumitmPython:
         4. curl fails with no CURL_CA_BUNDLE set - configure it
         """
         if not self.command_exists('curl'):
-            return
+            return ToolResult('curl', 'skipped', 'curl not found in PATH')
 
         # First check if curl already works (e.g., via system trust store)
         # If it works, don't add unnecessary configuration
         verify_result = self.verify_connection("curl")
         if verify_result == "WORKING":
             self.print_debug("curl already works via system trust, skipping configuration")
-            return
+            return ToolResult('curl', 'already_ok', 'Works via system trust store')
 
         curl_bundle = os.path.join(self.bundle_dir, "curl/ca-bundle.pem")
         curl_env = os.environ.get('CURL_CA_BUNDLE', '')
@@ -3040,14 +3133,14 @@ class FumitmPython:
                 if not self.is_install_mode():
                     self.print_action(f"Would create curl CA bundle at {curl_bundle}")
                     self.print_action(f"Would repoint CURL_CA_BUNDLE to {curl_bundle}")
-                    return
+                    return ToolResult('curl', 'skipped', 'Dry run')
             elif not os.path.exists(curl_env):
                 self.print_info("Configuring curl certificate bundle...")
                 self.print_warn(f"CURL_CA_BUNDLE points to non-existent file: {curl_env}")
                 if not self.is_install_mode():
                     self.print_action(f"Would create curl CA bundle at {curl_bundle}")
                     self.print_action(f"Would repoint CURL_CA_BUNDLE to {curl_bundle}")
-                    return
+                    return ToolResult('curl', 'skipped', 'Dry run')
             else:
                 suspicious, reason = self.is_suspicious_full_bundle(curl_env, self.cert_path)
                 if suspicious:
@@ -3056,20 +3149,20 @@ class FumitmPython:
                     if not self.is_install_mode():
                         self.print_action(f"Would create curl CA bundle at {curl_bundle}")
                         self.print_action(f"Would repoint CURL_CA_BUNDLE to {curl_bundle}")
-                        return
+                        return ToolResult('curl', 'skipped', 'Dry run')
                 else:
                     # Bundle exists and looks OK but curl still doesn't work
                     # This might be a different issue - don't touch it
                     self.print_warn("curl connection failed but CURL_CA_BUNDLE looks valid")
                     self.print_info("This may require manual investigation")
-                    return
+                    return ToolResult('curl', 'already_ok', 'CURL_CA_BUNDLE looks valid; may need manual investigation')
         else:
             # Case 2: No CURL_CA_BUNDLE set and curl doesn't work
             self.print_info("Configuring curl certificate bundle...")
             if not self.is_install_mode():
                 self.print_action(f"Would create curl CA bundle at {curl_bundle}")
                 self.print_action(f"Would set CURL_CA_BUNDLE={curl_bundle}")
-                return
+                return ToolResult('curl', 'skipped', 'Dry run')
 
         # Create the bundle and configure
         self._safe_makedirs(os.path.dirname(curl_bundle))
@@ -3079,6 +3172,7 @@ class FumitmPython:
         shell_config = self.get_shell_config(shell_type)
         self.add_to_shell_config("CURL_CA_BUNDLE", curl_bundle, shell_config)
         self.print_info(f"Configured CURL_CA_BUNDLE to: {curl_bundle}")
+        return ToolResult('curl', 'configured', f'Set CURL_CA_BUNDLE to {curl_bundle}')
 
     def setup_aws_cert(self):
         """Setup AWS CLI certificate configuration.
@@ -3088,7 +3182,7 @@ class FumitmPython:
         aws cli commands (e.g., aws configure sso, aws s3 ls).
         """
         if not self.command_exists('aws'):
-            return
+            return ToolResult('aws', 'skipped', 'aws not found in PATH')
 
         aws_bundle = os.path.join(self.bundle_dir, "aws/ca-bundle.pem")
         aws_env = os.environ.get('AWS_CA_BUNDLE', '')
@@ -3103,14 +3197,14 @@ class FumitmPython:
                 if not self.is_install_mode():
                     self.print_action(f"Would create AWS CA bundle at {aws_bundle}")
                     self.print_action(f"Would repoint AWS_CA_BUNDLE to {aws_bundle}")
-                    return
+                    return ToolResult('aws', 'skipped', 'Dry run')
             elif not os.path.exists(aws_env):
                 self.print_info("Configuring AWS CLI certificate bundle...")
                 self.print_warn(f"AWS_CA_BUNDLE points to non-existent file: {aws_env}")
                 if not self.is_install_mode():
                     self.print_action(f"Would create AWS CA bundle at {aws_bundle}")
                     self.print_action(f"Would repoint AWS_CA_BUNDLE to {aws_bundle}")
-                    return
+                    return ToolResult('aws', 'skipped', 'Dry run')
             else:
                 suspicious, reason = self.is_suspicious_full_bundle(aws_env, self.cert_path)
                 if suspicious:
@@ -3119,7 +3213,7 @@ class FumitmPython:
                     if not self.is_install_mode():
                         self.print_action(f"Would create AWS CA bundle at {aws_bundle}")
                         self.print_action(f"Would repoint AWS_CA_BUNDLE to {aws_bundle}")
-                        return
+                        return ToolResult('aws', 'skipped', 'Dry run')
                 elif not self.certificate_likely_exists_in_file(self.cert_path, aws_env):
                     # Bundle exists and looks OK but doesn't contain our proxy cert
                     self.print_info("Configuring AWS CLI certificate bundle...")
@@ -3127,7 +3221,7 @@ class FumitmPython:
                     if not self.is_install_mode():
                         self.print_action(f"Would create AWS CA bundle at {aws_bundle}")
                         self.print_action(f"Would repoint AWS_CA_BUNDLE to {aws_bundle}")
-                        return
+                        return ToolResult('aws', 'skipped', 'Dry run')
                 else:
                     if verify_result == "WORKING":
                         self.print_debug("AWS CLI already works with configured bundle, skipping configuration")
@@ -3135,17 +3229,17 @@ class FumitmPython:
                         # Bundle exists, looks OK, and contains our cert — unclear why it fails
                         self.print_warn("AWS CLI connection failed but AWS_CA_BUNDLE looks valid")
                         self.print_info("This may require manual investigation")
-                    return
+                    return ToolResult('aws', 'already_ok', 'AWS_CA_BUNDLE looks valid')
         else:
             if verify_result == "WORKING":
                 self.print_debug("AWS CLI already works via system trust, skipping configuration")
-                return
+                return ToolResult('aws', 'already_ok', 'Works via system trust store')
             # Case 2: No AWS_CA_BUNDLE set and aws doesn't work
             self.print_info("Configuring AWS CLI certificate bundle...")
             if not self.is_install_mode():
                 self.print_action(f"Would create AWS CA bundle at {aws_bundle}")
                 self.print_action(f"Would set AWS_CA_BUNDLE={aws_bundle}")
-                return
+                return ToolResult('aws', 'skipped', 'Dry run')
 
         # Create the bundle and configure
         self._safe_makedirs(os.path.dirname(aws_bundle))
@@ -3155,6 +3249,7 @@ class FumitmPython:
         shell_config = self.get_shell_config(shell_type)
         self.add_to_shell_config("AWS_CA_BUNDLE", aws_bundle, shell_config)
         self.print_info(f"Configured AWS_CA_BUNDLE to: {aws_bundle}")
+        return ToolResult('aws', 'configured', f'Set AWS_CA_BUNDLE to {aws_bundle}')
 
     def check_git_status(self, temp_warp_cert):
         """Check Git configuration status for http.sslCAInfo."""
@@ -3181,7 +3276,17 @@ class FumitmPython:
                         self.print_warn(f"  ✗ http.sslCAInfo points to non-existent file: {git_ca}")
                         has_issues = True
                 else:
-                    self.print_info("  - http.sslCAInfo not configured (uses system trust store)")
+                    if self._is_apple_git():
+                        self.print_info(
+                            "  - http.sslCAInfo not configured"
+                            " (Apple Git uses system trust store)"
+                        )
+                    else:
+                        self.print_warn(
+                            "  - http.sslCAInfo not configured"
+                            " (OpenSSL-linked git needs explicit CA bundle)"
+                        )
+                        has_issues = True
             except Exception:
                 self.print_warn("  ✗ Failed to check git configuration")
                 has_issues = True
@@ -3514,12 +3619,12 @@ class FumitmPython:
         gradle_props = self.get_gradle_properties_path()
 
         if not self.command_exists('gradle') and not os.path.exists(gradle_props):
-            return
+            return ToolResult('gradle', 'skipped', 'gradle not found in PATH')
 
         cacerts = self.find_java_cacerts()
         if not cacerts:
             self.print_error("Could not find Java cacerts file for Gradle")
-            return
+            return ToolResult('gradle', 'skipped', 'Java cacerts file not found')
 
         props_to_set = {
             'systemProp.javax.net.ssl.trustStore': cacerts,
@@ -3527,7 +3632,12 @@ class FumitmPython:
             'systemProp.https.protocols': 'TLSv1.2'
         }
 
-        self.update_properties_file(gradle_props, props_to_set, "Gradle properties")
+        changed = self.update_properties_file(gradle_props, props_to_set, "Gradle properties")
+        if not changed:
+            return ToolResult('gradle', 'already_ok', 'Gradle properties already configured')
+        if self.is_install_mode():
+            return ToolResult('gradle', 'configured', 'Updated Gradle properties')
+        return ToolResult('gradle', 'skipped', 'Dry run')
 
     def setup_dbeaver_cert(self):
         """Setup DBeaver certificate."""
@@ -3587,14 +3697,14 @@ class FumitmPython:
     def setup_wget_cert(self):
         """Setup wget certificate."""
         if not self.command_exists('wget'):
-            return
+            return ToolResult('wget', 'skipped', 'wget not found in PATH')
 
         # First check if wget already works (e.g., via system trust store)
         # If it works, don't add unnecessary configuration
         verify_result = self.verify_connection("wget")
         if verify_result == "WORKING":
             self.print_debug("wget already works via system trust, skipping configuration")
-            return
+            return ToolResult('wget', 'already_ok', 'Works via system trust store')
 
         wgetrc_path = os.path.expanduser("~/.wgetrc")
         config_line = f"ca_certificate={self.cert_path}"
@@ -3602,24 +3712,25 @@ class FumitmPython:
         if os.path.exists(wgetrc_path):
             with open(wgetrc_path, 'r') as f:
                 content = f.read()
-            
+
             if "ca_certificate=" in content:
                 # Check if it's already set to our certificate
                 if self.cert_path in content:
-                    return
-                
+                    return ToolResult('wget', 'already_ok', 'wget certificate already configured')
+
                 self.print_info("Configuring wget certificate...")
                 self.print_warn(f"wget ca_certificate is already set in {wgetrc_path}")
-                
+
                 # Find current setting
                 for line in content.splitlines():
                     if line.strip().startswith("ca_certificate="):
                         self.print_info(f"Current setting: {line.strip()}")
                         break
-                
+
                 if not self.is_install_mode():
                     self.print_action(f"Would ask to update the ca_certificate in {wgetrc_path}")
                     self.print_action(f"Would set: {config_line}")
+                    return ToolResult('wget', 'skipped', 'Dry run')
                 else:
                     response = self._prompt("Do you want to update it? (y/N) ")
                     if response.lower() == 'y':
@@ -3631,29 +3742,32 @@ class FumitmPython:
                                 new_lines.append(f"#{line}")
                             else:
                                 new_lines.append(line)
-                        
+
                         # Add new entry
                         new_lines.append(config_line)
-                        
+
                         # Write back
                         with open(wgetrc_path + '.bak', 'w') as f:
                             f.write(content)
                         with open(wgetrc_path, 'w') as f:
                             f.write('\n'.join(new_lines) + '\n')
-                        
+
                         self.print_info(f"Updated wget configuration in {wgetrc_path}")
-                return
-        
+                        return ToolResult('wget', 'configured', 'Updated wget configuration')
+                    return ToolResult('wget', 'skipped', 'User declined')
+
         # File doesn't exist or doesn't have ca_certificate
         self.print_info("Configuring wget certificate...")
-        
+
         if not self.is_install_mode():
             self.print_action(f"Would add to {wgetrc_path}: {config_line}")
+            return ToolResult('wget', 'skipped', 'Dry run')
         else:
             self.print_info(f"Adding configuration to {wgetrc_path}")
             with open(wgetrc_path, 'a') as f:
                 f.write(f"\n{config_line}\n")
             self.print_info("Added ca_certificate to wget configuration")
+            return ToolResult('wget', 'configured', 'Added ca_certificate to wget configuration')
     
     def _podman_vm_running(self):
         """Check whether a Podman machine is currently running."""
