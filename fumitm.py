@@ -23,7 +23,7 @@ from pathlib import Path
 # Version and metadata
 __description__ = "MITM Proxy Certificate Fixer Upper for macOS and Linux"
 __author__ = "Ingersoll & Claude"
-__version__ = "2026.4.7"  # CalVer: YYYY.MM.DD (auto-updated on release)
+__version__ = "2026.5.6"  # CalVer: YYYY.MM.DD (auto-updated on release)
 
 
 def parse_calver(version_str):
