@@ -2932,12 +2932,13 @@ class FumitmPython:
                 return ToolResult('gcloud', 'skipped', 'Dry run')
             return ToolResult('gcloud', 'skipped', 'gcloud not found in PATH')
 
-        # First check if gcloud already works (e.g., via system trust store)
-        # If it works, don't add unnecessary configuration
-        verify_result = self.verify_connection("gcloud")
-        if verify_result == "WORKING":
-            self.print_debug("gcloud already works via system trust, skipping configuration")
-            return ToolResult('gcloud', 'already_ok', 'Works via system trust store')
+        # We do NOT short-circuit on a successful basic HTTPS check here. The
+        # IAP tunnel WebSocket path (gcloud compute ssh --tunnel-through-iap)
+        # builds its own SSL context with an explicit ca_certs path read from
+        # core/custom_ca_certs_file — it ignores the system trust store and
+        # the SSL_CERT_FILE environment variable. So we always make sure the
+        # property is set to a bundle that contains our proxy CA, even when a
+        # plain `gcloud projects list` already works.
 
         gcloud_cert_dir = os.path.expanduser("~/.config/gcloud/certs")
         gcloud_bundle = os.path.join(gcloud_cert_dir, "combined-ca-bundle.pem")
@@ -4976,7 +4977,10 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             if verify_result == "WORKING":
                 self.print_info("  ✓ gcloud can connect through proxy")
 
-                # Check if custom CA is configured (informational only)
+                # core/custom_ca_certs_file is required for the IAP tunnel
+                # WebSocket path even when basic HTTPS already works through the
+                # system trust store, so we report a missing/stale value as an
+                # issue rather than informational.
                 try:
                     result = subprocess.run(
                         ['gcloud', 'config', 'get-value', 'core/custom_ca_certs_file'],
@@ -4988,10 +4992,17 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                         self.print_info(f"  - Custom CA configured at: {gcloud_ca}")
                         if self.certificate_exists_in_file(temp_warp_cert, gcloud_ca):
                             self.print_info("  ✓ Custom CA contains current certificate")
+                        else:
+                            self.print_warn("  ✗ gcloud CA file doesn't contain current certificate")
+                            self.print_action("    Run with --fix to update the CA configuration (required for IAP tunneling)")
+                            has_issues = True
                     else:
-                        self.print_info("  - Using system certificate trust (no custom CA needed)")
+                        self.print_warn("  ✗ core/custom_ca_certs_file is not set")
+                        self.print_action("    Run with --fix to configure (required for `gcloud compute ssh --tunnel-through-iap`)")
+                        has_issues = True
                 except Exception:
-                    self.print_info("  - Using system certificate trust")
+                    self.print_warn("  ✗ Failed to check gcloud configuration")
+                    has_issues = True
             elif verify_result == "SKIPPED":
                 # Can't verify, fall back to config check
                 try:
