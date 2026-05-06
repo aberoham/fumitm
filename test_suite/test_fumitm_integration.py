@@ -2239,7 +2239,11 @@ class TestGcloudVerification(FumitmTestCase):
             assert result == "NOT_INSTALLED"
 
     def test_check_gcloud_status_working_no_custom_ca(self, tmp_path):
-        """Test gcloud status when working without custom CA."""
+        """gcloud status flags missing core/custom_ca_certs_file even when basic HTTPS works.
+
+        IAP tunnel reads core/custom_ca_certs_file explicitly and ignores the
+        system trust store, so a working `gcloud projects list` is not enough.
+        """
         cert_file = tmp_path / "cert.pem"
         cert_file.write_text(mock_data.MOCK_CERTIFICATE)
 
@@ -2259,8 +2263,7 @@ class TestGcloudVerification(FumitmTestCase):
 
             has_issues = instance.check_gcloud_status(str(cert_file))
 
-            # Should NOT have issues when gcloud works without custom CA
-            assert has_issues is False
+            assert has_issues is True
 
     def test_check_gcloud_status_failed_suggests_fix(self, tmp_path):
         """Test gcloud status suggests fix when connection fails."""
@@ -3197,14 +3200,43 @@ class TestBareReturnsFixed(FumitmTestCase):
             assert result.status == 'skipped'
             assert result.tool == 'gcloud'
 
-    def test_gcloud_already_works_returns_already_ok(self):
-        """setup_gcloud_cert returns already_ok when gcloud works via system trust."""
+    def test_gcloud_already_configured_returns_already_ok(self):
+        """setup_gcloud_cert returns already_ok when core/custom_ca_certs_file already points to a bundle with our cert."""
         instance = self.create_fumitm_instance(mode='install')
+        existing_bundle = '/Users/testuser/.python-ca-bundle.pem'
         with patch.object(instance, 'command_exists', return_value=True), \
-             patch.object(instance, 'verify_connection', return_value='WORKING'), \
-             patch('os.path.exists', return_value=False):
-            result = instance.setup_gcloud_cert()
+             patch('os.path.exists', return_value=False), \
+             patch('subprocess.run') as mock_run, \
+             patch.object(instance, 'is_suspicious_full_bundle', return_value=(False, None)), \
+             patch.object(instance, 'certificate_exists_in_file', return_value=True):
+            mock_run.return_value = MagicMock(returncode=0, stdout=existing_bundle)
+            with patch('os.path.exists', side_effect=lambda p: p == existing_bundle):
+                result = instance.setup_gcloud_cert()
             assert result.status == 'already_ok'
+
+    def test_gcloud_iap_regression_configures_when_https_works_but_ca_unset(self):
+        """IAP regression: even if basic HTTPS works, missing core/custom_ca_certs_file must be configured.
+
+        IAP tunnel (`gcloud compute ssh --tunnel-through-iap`) reads ca_certs
+        explicitly from core/custom_ca_certs_file and ignores system trust /
+        SSL_CERT_FILE, so we must always set the property.
+        """
+        instance = self.create_fumitm_instance(mode='install')
+        gcloud_managed = os.path.expanduser("~/.config/gcloud/certs/combined-ca-bundle.pem")
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch('os.path.exists', return_value=False), \
+             patch.object(instance, '_safe_makedirs'), \
+             patch.object(instance, 'create_bundle_with_system_certs'), \
+             patch.object(instance, 'safe_append_certificate'), \
+             patch.object(instance, 'is_devcontainer', return_value=True), \
+             patch('subprocess.run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout='')
+            result = instance.setup_gcloud_cert()
+            assert result.status == 'configured'
+            assert_subprocess_called_with(
+                mock_run,
+                ['gcloud', 'config', 'set', 'core/custom_ca_certs_file', gcloud_managed]
+            )
 
     def test_curl_not_found_returns_skipped(self):
         """setup_curl_cert returns skipped when curl not found."""
