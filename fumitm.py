@@ -10,10 +10,7 @@ import argparse
 import platform
 import json
 import ssl
-import base64
-import hashlib
 import pwd
-import socket
 import urllib.request
 import urllib.error
 from collections import namedtuple
@@ -1630,15 +1627,6 @@ class FumitmPython:
             self.print_debug(f"Error checking suspicious bundle {bundle_path}: {e}")
             return (False, "")
 
-    def get_bundle_stats(self, path):
-        """Return (cert_count, size_bytes) for a certificate bundle path."""
-        try:
-            count = self.count_certificates_in_file(path)
-            size = os.path.getsize(path) if os.path.exists(path) else 0
-            return count, size
-        except Exception:
-            return 0, 0
-
     def create_bundle_with_system_certs(self, bundle_path):
         """Create a CA bundle initialized with system certificates.
 
@@ -2424,8 +2412,7 @@ class FumitmPython:
         
         # npm needs a full CA bundle, not just a single certificate
         npm_bundle = os.path.join(self.bundle_dir, "npm/ca-bundle.pem")
-        needs_setup = False
-        
+
         if current_cafile and current_cafile not in ["null", "undefined"]:
             # If the cafile belongs to a different provider, migrate unconditionally
             other_provider = self._path_belongs_to_other_provider(current_cafile)
@@ -2462,7 +2449,6 @@ class FumitmPython:
 
                 # Check if the file contains our certificate using normalized comparison
                 if not self.certificate_exists_in_file(self.cert_path, current_cafile):
-                    needs_setup = True
                     self.print_info("Configuring npm certificate...")
                     self.print_warn("Current npm cafile doesn't contain proxy certificate")
                     
@@ -2498,7 +2484,6 @@ class FumitmPython:
                                 self.print_info(f"Appending proxy certificate to {current_cafile}")
                                 self.safe_append_certificate(self.cert_path, current_cafile)
             else:
-                needs_setup = True
                 self.print_info("Configuring npm certificate...")
                 self.print_warn(f"npm cafile points to non-existent file: {current_cafile}")
                 
@@ -2514,7 +2499,6 @@ class FumitmPython:
                         subprocess.run(['npm', 'config', 'set', 'cafile', npm_bundle])
                         self.print_info(f"Created and configured npm cafile at {npm_bundle}")
         else:
-            needs_setup = True
             self.print_info("Configuring npm certificate...")
             self.print_info("npm cafile is not configured")
             
@@ -4545,7 +4529,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     result = "WORKING"
                     
                     # Additional validation - check SSL context
-                    context = ssl.create_default_context()
                     self.print_debug(f"Python SSL default verify paths: {ssl.get_default_verify_paths()}")
                     self.print_debug("Python successfully trusts the system proxy certificate")
                     
