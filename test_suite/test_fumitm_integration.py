@@ -3965,5 +3965,90 @@ class TestGitTlsBackend(FumitmTestCase):
             assert has_issues is True
 
 
+class TestShellConfigIdempotency(FumitmTestCase):
+    """Ensure add_to_shell_config is a no-op when the active export already
+    matches the desired value.
+
+    Regression: previously the function only checked whether `export VAR=`
+    appeared anywhere in the file and prompted the user even when the
+    existing value was correct. Saying "y" rewrote the file with an
+    identical line, falsely flagged shell_modified, and produced a
+    "1 configured" entry plus a "source ~/.zshrc" hint on every run.
+    """
+
+    def test_idempotent_when_value_matches(self, tmp_path):
+        instance = self.create_fumitm_instance(mode='install')
+        rc = tmp_path / '.zshrc'
+        original = (
+            '# user prologue\n'
+            'export PATH="/usr/local/bin:$PATH"\n'
+            'export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE="/Users/test/.python-ca-bundle.pem"\n'
+            '# user epilogue\n'
+        )
+        rc.write_text(original)
+
+        with patch.object(instance, '_prompt') as prompt:
+            instance.add_to_shell_config(
+                'CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE',
+                '/Users/test/.python-ca-bundle.pem',
+                str(rc),
+            )
+
+        assert prompt.call_count == 0, "should not prompt when value already matches"
+        assert rc.read_text() == original, "file should be untouched"
+        assert getattr(instance, 'shell_modified', False) is False
+
+    def test_prompts_and_rewrites_when_value_differs(self, tmp_path):
+        instance = self.create_fumitm_instance(mode='install')
+        rc = tmp_path / '.zshrc'
+        rc.write_text(
+            'export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE="/old/path.pem"\n'
+        )
+
+        with patch.object(instance, '_prompt', return_value='y'):
+            instance.add_to_shell_config(
+                'CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE',
+                '/new/path.pem',
+                str(rc),
+            )
+
+        new_content = rc.read_text()
+        assert '#export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE="/old/path.pem"' in new_content
+        assert 'export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE="/new/path.pem"' in new_content
+        assert instance.shell_modified is True
+
+    def test_appends_when_only_commented_export_exists(self, tmp_path):
+        instance = self.create_fumitm_instance(mode='install')
+        rc = tmp_path / '.zshrc'
+        rc.write_text('#export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE="/old/path.pem"\n')
+
+        with patch.object(instance, '_prompt') as prompt:
+            instance.add_to_shell_config(
+                'CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE',
+                '/new/path.pem',
+                str(rc),
+            )
+
+        assert prompt.call_count == 0, "commented-out lines should not trigger a prompt"
+        assert 'export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE="/new/path.pem"' in rc.read_text()
+        assert instance.shell_modified is True
+
+    def test_idempotent_with_unquoted_existing_value(self, tmp_path):
+        instance = self.create_fumitm_instance(mode='install')
+        rc = tmp_path / '.zshrc'
+        original = 'export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE=/Users/test/bundle.pem\n'
+        rc.write_text(original)
+
+        with patch.object(instance, '_prompt') as prompt:
+            instance.add_to_shell_config(
+                'CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE',
+                '/Users/test/bundle.pem',
+                str(rc),
+            )
+
+        assert prompt.call_count == 0
+        assert rc.read_text() == original
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
