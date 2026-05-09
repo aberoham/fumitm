@@ -1717,15 +1717,34 @@ class FumitmPython:
         if os.path.exists(shell_config):
             with open(shell_config, 'r') as f:
                 content = f.read()
-                
-            if f"export {var_name}=" in content:
+
+            # Find the first active (non-commented) export of this variable
+            # and compare its value to what we would write. If they already
+            # match, this is a no-op and we should not warn or prompt.
+            active_line = None
+            for line in content.splitlines():
+                stripped = line.strip()
+                if stripped.startswith('#'):
+                    continue
+                if stripped.startswith(f"export {var_name}="):
+                    active_line = stripped
+                    break
+
+            if active_line is not None:
+                rhs = active_line.split('=', 1)[1].strip()
+                if (rhs.startswith('"') and rhs.endswith('"')) or \
+                        (rhs.startswith("'") and rhs.endswith("'")):
+                    rhs = rhs[1:-1]
+                if rhs == var_value:
+                    # Already set to the desired value — quietly do nothing
+                    # so repeated runs are idempotent and we don't claim a
+                    # change in the summary or trigger a stale "reload your
+                    # shell" hint.
+                    return
+
                 self.print_warn(f"{var_name} already exists in {shell_config}")
-                # Find current value
-                for line in content.splitlines():
-                    if line.strip().startswith(f"export {var_name}="):
-                        self.print_info(f"Current value: {line.strip()}")
-                        break
-                
+                self.print_info(f"Current value: {active_line}")
+
                 if not self.is_install_mode():
                     self.print_action(f"Would ask to update {var_name} in {shell_config}")
                     self.print_action(f"Would set: export {var_name}=\"{var_value}\"")
