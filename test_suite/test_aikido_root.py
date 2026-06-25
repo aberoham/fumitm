@@ -233,6 +233,59 @@ class TestAikidoAbsentNoOp(FumitmTestCase):
         assert target.read_text().count('BEGIN CERTIFICATE') == 1
 
 
+class TestVendorInjectedBundle(FumitmTestCase):
+    """fumitm ignores a vendor-injected REQUESTS_CA_BUNDLE and builds its own."""
+
+    def test_is_vendor_injected_bundle(self):
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+        assert inst._is_vendor_injected_bundle(mock_data.AIKIDO_COMBINED_PEM) is True
+        assert inst._is_vendor_injected_bundle(
+            mock_data.AIKIDO_SUPPORT_DIR + 'anything.pem') is True
+        assert inst._is_vendor_injected_bundle('/Users/x/.python-ca-bundle.pem') is False
+
+    def test_setup_python_ignores_vendor_bundle_and_includes_all_roots(
+            self, tmp_path, monkeypatch):
+        primary = tmp_path / 'primary.pem'
+        primary.write_text(mock_data.MOCK_CERTIFICATE)
+        aikido = tmp_path / 'aikido.pem'
+        aikido.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
+        home = tmp_path / 'home'
+        home.mkdir()
+
+        monkeypatch.setenv('HOME', str(home))
+        # Aikido injects its own unwritable combined PEM at runtime.
+        monkeypatch.setenv('REQUESTS_CA_BUNDLE', mock_data.AIKIDO_COMBINED_PEM)
+        monkeypatch.delenv('SSL_CERT_FILE', raising=False)
+        monkeypatch.delenv('CURL_CA_BUNDLE', raising=False)
+
+        inst = _aikido_instance_with_root(aikido)
+        inst.mode = 'install'
+        inst.cert_path = str(primary)
+
+        def seed_system_certs(path):
+            with open(path, 'w') as f:
+                f.write('-----BEGIN CERTIFICATE-----\nSYSTEMROOT\n-----END CERTIFICATE-----\n')
+            return True
+
+        with patch.object(inst, 'command_exists',
+                          side_effect=lambda c: c == 'python3'), \
+             patch.object(inst, 'detect_shell', return_value='zsh'), \
+             patch.object(inst, 'get_shell_config', return_value=str(home / '.zshrc')), \
+             patch.object(inst, 'add_to_shell_config'), \
+             patch.object(inst, 'create_bundle_with_system_certs',
+                          side_effect=seed_system_certs):
+            result = inst.setup_python_cert()
+
+        bundle = home / '.python-ca-bundle.pem'
+        assert bundle.exists(), "fumitm-managed bundle was not created"
+        body = bundle.read_text()
+        # Public roots (seeded), primary provider root, and Aikido root all present.
+        assert 'SYSTEMROOT' in body
+        assert mock_data.MOCK_CERTIFICATE.strip() in body
+        assert mock_data.MOCK_AIKIDO_ROOT_CERT.strip() in body
+        assert result.status == 'configured'
+
+
 class TestAikidoResolution(FumitmTestCase):
     """--with-aikido forces on; --no-aikido forces off; detection gates the rest."""
 

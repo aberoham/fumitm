@@ -488,6 +488,19 @@ class FumitmPython:
                 return config['name']
         return None
 
+    def _is_vendor_injected_bundle(self, path):
+        """Return True if path lives under a supplemental-root vendor's own directory.
+
+        Such a bundle (e.g. Aikido's combined PEM) is maintained and env-injected
+        by the vendor at runtime. fumitm must not adopt, append to, or relocate
+        it; it manages its own bundle instead.
+        """
+        for descriptor in SUPPLEMENTAL_ROOTS.values():
+            support_dir = descriptor.get('support_dir')
+            if support_dir and path.startswith(support_dir):
+                return True
+        return False
+
     def _detect_warp(self):
         """Return True if Cloudflare WARP appears to be installed."""
         return shutil.which('warp-cli') is not None
@@ -3099,7 +3112,20 @@ class FumitmPython:
         needs_setup = False
 
         requests_ca_bundle = os.environ.get('REQUESTS_CA_BUNDLE', '')
-        
+
+        # A supplemental-root vendor (e.g. Aikido) may export REQUESTS_CA_BUNDLE
+        # at its own maintained, root-owned bundle. fumitm must not adopt or
+        # relocate that file: it is the vendor's to manage and would be reverted
+        # on the vendor's next update. Ignore it and fall through to building
+        # fumitm's own ~/.python-ca-bundle.pem with every root, which the
+        # vendor-untouched SSL_CERT_FILE then points at.
+        if requests_ca_bundle and self._is_vendor_injected_bundle(requests_ca_bundle):
+            self.print_info(
+                f"Ignoring vendor-injected REQUESTS_CA_BUNDLE ({requests_ca_bundle}); "
+                f"using fumitm-managed bundle {python_bundle}"
+            )
+            requests_ca_bundle = ''
+
         if requests_ca_bundle:
             if os.path.exists(requests_ca_bundle):
                 # Check if we can write to the file

@@ -1261,14 +1261,17 @@ class TestBundleCreation(FumitmTestCase):
         with patch('platform.system', return_value='Darwin'):
             instance = fumitm.FumitmPython(mode='install')
 
-            # Mock os.path.exists: neither system cert location exists
+            # Mock os.path.exists: neither system cert location exists.
+            # The assertions run outside this patch because Python 3.13's
+            # pathlib.Path.exists() delegates to os.path.exists(), so a global
+            # patch would otherwise mask the file the method actually created.
             with patch('os.path.exists', return_value=False):
                 result = instance.create_bundle_with_system_certs(str(target_bundle))
 
-                # Should create empty file and return False
-                assert result is False
-                assert target_bundle.exists()
-                assert target_bundle.read_text() == ""
+            # Should create empty file and return False
+            assert result is False
+            assert target_bundle.exists()
+            assert target_bundle.read_text() == ""
 
     def test_returns_true_when_system_certs_copied(self, tmp_path):
         """Test return value indicates whether system certs were found."""
