@@ -16,6 +16,13 @@ fumitm supports JAMF Pro, Ansible, Puppet, and similar headless orchestration to
 | `--run-as-user USERNAME` | Configure certs for USERNAME's home directory (requires root). Use `auto` to detect console user on macOS. |
 | `--skip-update-check` | Skip the GitHub update check (implied by `--headless`). |
 | `--provider warp\|netskope` | Explicit provider selection (default: auto-detect). |
+| `--with-aikido` | Force-add the Aikido Endpoint Protection root CA to all bundles even if it is not auto-detected (e.g. on CI images without the agent installed). |
+| `--no-aikido` | Do not add the Aikido root CA even if Aikido is detected. Mutually exclusive with `--with-aikido`. |
+
+When Aikido Endpoint Protection is present, its root CA is auto-detected and
+added to every managed bundle/keystore alongside the primary provider's root; no
+flag is required. The two flags above only override that auto-detection. Aikido
+support targets macOS/Linux; the Windows port does not yet add the Aikido root.
 
 ## Exit Codes
 

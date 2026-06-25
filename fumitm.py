@@ -181,6 +181,29 @@ PROVIDERS = {
     },
 }
 
+# Supplemental root CAs: vendors that perform *selective* TLS interception on
+# top of a primary provider. Unlike PROVIDERS, these are never selected to the
+# exclusion of others — when detected, their root is added to every bundle
+# fumitm builds *alongside* the primary provider's root. They are deliberately
+# kept out of PROVIDERS so _resolve_provider can never return one.
+SUPPLEMENTAL_ROOTS = {
+    'aikido': {
+        'name': 'Aikido Endpoint Protection',
+        'short_name': 'Aikido',
+        # Keychain label and subject CN both start with this; the org-specific
+        # "- org-NNNNNN" suffix varies, so we always match on the prefix.
+        'keychain_label_prefix': 'Aikido Endpoint Protection Root CA',
+        'support_dir': '/Library/Application Support/AikidoSecurity/',
+        'combined_pem': (
+            '/Library/Application Support/AikidoSecurity/'
+            'EndpointProtection/run/endpoint-protection-pip-combined-ca.pem'
+        ),
+        'cert_path': '~/.aikido-ca.pem',
+        'keytool_alias': 'aikido-root',
+        'container_cert_name': 'aikido',
+    },
+}
+
 class NonInteractiveError(Exception):
     """Raised when interactive input is needed but stdin is not a terminal."""
 
@@ -204,7 +227,7 @@ class FumitmPython:
                  headless=False, skip_update_check=False,
                  log_file=None, log_dir=None,
                  json_log_file=None, json_log_dir=None,
-                 run_as_user=None):
+                 run_as_user=None, with_aikido=False, no_aikido=False):
         self.mode = mode
         self.debug = debug
         self.shell_modified = False
@@ -265,6 +288,14 @@ class FumitmPython:
         self.provider = self._resolve_provider(provider)
         self.cert_path = os.path.expanduser(self.provider['cert_path'])
         self.bundle_dir = os.path.expanduser(self.provider['bundle_dir'])
+
+        # Resolve supplemental root CAs (e.g. Aikido) that ride alongside the
+        # primary provider. Each entry is a descriptor copy that gains a 'path'
+        # key once its root certificate is materialized by _prepare_extra_roots.
+        # Empty when none are detected, which keeps behavior byte-for-byte
+        # identical to the no-supplemental-root case.
+        self._extra_root_temp_files = []
+        self.extra_roots = self._resolve_extra_roots(with_aikido, no_aikido)
 
         # Define tool registry with tags, descriptions, and scope. Scope
         # determines what runs without user context when root runs without
@@ -492,6 +523,164 @@ class FumitmPython:
             pass
 
         return False
+
+    def _resolve_extra_roots(self, with_aikido, no_aikido):
+        """Determine which supplemental root CAs are active for this run.
+
+        A supplemental root is included when explicitly forced on, or when it is
+        auto-detected and not explicitly forced off. Returns a list of descriptor
+        copies (each tagged with its registry key); empty when none apply.
+        """
+        active = []
+        # Aikido is the only supplemental root today; the structure generalizes
+        # so future vendors slot in the same way.
+        aikido_forced_off = no_aikido
+        aikido_active = with_aikido or (not aikido_forced_off and self._detect_aikido())
+        if aikido_active:
+            entry = dict(SUPPLEMENTAL_ROOTS['aikido'])
+            entry['key'] = 'aikido'
+            active.append(entry)
+        return active
+
+    def _detect_aikido(self):
+        """Return True if Aikido Endpoint Protection appears to be present.
+
+        Any of the following is sufficient: the AikidoSecurity support directory
+        exists, the maintained combined PEM exists, or (macOS) the System
+        Keychain holds a certificate whose label starts with the Aikido root CA
+        prefix. The org-specific suffix on the label is ignored.
+        """
+        descriptor = SUPPLEMENTAL_ROOTS['aikido']
+        if os.path.isdir(descriptor['support_dir']):
+            return True
+        if os.path.exists(descriptor['combined_pem']):
+            return True
+
+        if platform.system() == 'Darwin':
+            try:
+                result = subprocess.run(
+                    ['security', 'find-certificate', '-c',
+                     descriptor['keychain_label_prefix'],
+                     '/Library/Keychains/System.keychain'],
+                    capture_output=True, text=True
+                )
+                if result.returncode == 0:
+                    return True
+            except Exception as e:
+                self.print_debug(f"Aikido keychain detection failed: {e}")
+
+        return False
+
+    def _get_aikido_root_cert(self):
+        """Retrieve the Aikido root CA certificate(s) as PEM text.
+
+        Tries the macOS System Keychain first (by label prefix), then falls back
+        to parsing the maintained combined PEM. Only certificates whose subject
+        CN starts with the Aikido root prefix are kept; the ephemeral hex-CN
+        interception intermediate is deliberately excluded.
+
+        Returns:
+            str or None: PEM text containing the Aikido root(s), or None.
+        """
+        descriptor = SUPPLEMENTAL_ROOTS['aikido']
+        prefix = descriptor['keychain_label_prefix']
+
+        # Source 1: macOS System Keychain, all matching certs by label prefix.
+        if platform.system() == 'Darwin':
+            try:
+                result = subprocess.run(
+                    ['security', 'find-certificate', '-a', '-c', prefix, '-p',
+                     '/Library/Keychains/System.keychain'],
+                    capture_output=True, text=True
+                )
+                if result.returncode == 0 and '-----BEGIN CERTIFICATE-----' in result.stdout:
+                    roots = self._filter_certs_by_cn_prefix(result.stdout, prefix)
+                    if roots:
+                        self.print_info("Using Aikido root CA from macOS System Keychain")
+                        return '\n'.join(roots)
+            except Exception as e:
+                self.print_debug(f"Aikido keychain extraction failed: {e}")
+
+        # Source 2: maintained combined PEM on disk.
+        combined = descriptor['combined_pem']
+        if os.path.exists(combined):
+            try:
+                with open(combined, 'r') as f:
+                    roots = self._filter_certs_by_cn_prefix(f.read(), prefix)
+                if roots:
+                    self.print_info(f"Using Aikido root CA from {combined}")
+                    return '\n'.join(roots)
+            except Exception as e:
+                self.print_debug(f"Could not parse Aikido combined PEM: {e}")
+
+        self.print_warn("Could not extract Aikido root CA; skipping supplemental trust")
+        return None
+
+    def _filter_certs_by_cn_prefix(self, pem_text, cn_prefix):
+        """Return the PEM blocks whose subject CN starts with cn_prefix.
+
+        Splits a PEM bundle into individual certificates and keeps only those
+        whose subject common name begins with the given prefix, validating each
+        with openssl. This is what rejects Aikido's ephemeral hex-CN
+        interception intermediate while keeping the long-lived root.
+        """
+        marker = '-----END CERTIFICATE-----'
+        blocks = []
+        for chunk in pem_text.split(marker):
+            if '-----BEGIN CERTIFICATE-----' in chunk:
+                blocks.append(chunk[chunk.index('-----BEGIN CERTIFICATE-----'):] + marker + '\n')
+
+        matching = []
+        for block in blocks:
+            subject = self._openssl_subject(block)
+            if subject is None:
+                continue
+            cn = self._subject_common_name(subject)
+            if cn and cn.startswith(cn_prefix):
+                matching.append(block.strip())
+        return matching
+
+    def _openssl_subject(self, cert_pem):
+        """Return the openssl subject line for a single PEM cert, or None if invalid."""
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as tf:
+                tf.write(cert_pem)
+                tmp_path = tf.name
+        except Exception:
+            return None
+        try:
+            result = subprocess.run(
+                ['openssl', 'x509', '-noout', '-subject', '-in', tmp_path],
+                capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                return None
+            return result.stdout.strip()
+        except Exception:
+            return None
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _subject_common_name(subject_line):
+        """Extract the CN value from an openssl subject line, or None.
+
+        Handles the RFC 2253 form ("subject=CN=foo,O=bar"), the spaced OpenSSL 3
+        form ("subject=CN = foo, O = bar"), and the legacy slash form
+        ("subject= /CN=foo/O=bar") that LibreSSL and older builds emit.
+        """
+        if not subject_line:
+            return None
+        body = subject_line.split('=', 1)[1] if subject_line.lower().startswith('subject') else subject_line
+        # Normalize the slash-delimited legacy form into comma-delimited.
+        for token in body.replace('/', ',').split(','):
+            key, sep, value = token.partition('=')
+            if sep and key.strip().upper() == 'CN':
+                return value.strip()
+        return None
 
     def is_install_mode(self):
         return self.mode == 'install'
@@ -2154,9 +2343,246 @@ class FumitmPython:
         
         # Cache the fingerprint for later use
         self.get_cert_fingerprint()
-        
+
         return True
-    
+
+    def _prepare_extra_roots(self):
+        """Materialize each detected supplemental root CA to a file on disk.
+
+        In install mode the root is written to its persistent cert_path with
+        ownership corrected; in status mode it is written to a temp file tracked
+        for cleanup. Each surviving entry gains a 'path' key. Entries whose root
+        cannot be retrieved or validated are dropped, so downstream bundle
+        assembly silently skips them.
+        """
+        if not self.extra_roots:
+            return
+        getters = {'aikido': self._get_aikido_root_cert}
+        resolved = []
+        for entry in self.extra_roots:
+            if entry.get('path'):
+                resolved.append(entry)
+                continue
+            getter = getters.get(entry['key'])
+            pem = getter() if getter else None
+            if not pem:
+                continue
+            if not self._is_valid_pem_cert(pem):
+                self.print_warn(f"{entry['name']} root certificate is not valid PEM; skipping")
+                continue
+            path = self._write_extra_root(entry, pem)
+            if path:
+                entry['path'] = path
+                resolved.append(entry)
+        self.extra_roots = resolved
+
+    def _is_valid_pem_cert(self, pem_text):
+        """Return True if pem_text starts with a certificate openssl can parse."""
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as tf:
+                tf.write(pem_text)
+                tmp = tf.name
+        except Exception:
+            return False
+        try:
+            result = subprocess.run(
+                ['openssl', 'x509', '-noout', '-in', tmp], capture_output=True
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    def _write_extra_root(self, entry, pem_text):
+        """Write a supplemental root's PEM to disk and return its path, or None."""
+        if not pem_text.endswith('\n'):
+            pem_text = pem_text + '\n'
+        if self.is_install_mode():
+            path = os.path.expanduser(entry['cert_path'])
+            try:
+                with open(path, 'w') as f:
+                    f.write(pem_text)
+                self._fix_ownership(path)
+                self.print_info(f"Saved {entry['name']} root CA to {path}")
+                return path
+            except Exception as e:
+                self.print_error(f"Could not save {entry['name']} root CA: {e}")
+                return None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as tf:
+                tf.write(pem_text)
+                path = tf.name
+            self._extra_root_temp_files.append(path)
+            return path
+        except Exception as e:
+            self.print_debug(f"Could not write temp {entry['name']} root: {e}")
+            return None
+
+    def _cleanup_extra_root_temp_files(self):
+        """Remove any temp files created for supplemental roots in status mode."""
+        for path in self._extra_root_temp_files:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        self._extra_root_temp_files = []
+
+    def _announce_extra_roots(self):
+        """Print a one-line notice for each active supplemental root CA."""
+        for entry in self.extra_roots:
+            if entry.get('path'):
+                self.print_info(
+                    f"{entry['name']} detected — supplemental root CA will be "
+                    f"added to managed bundles alongside {self.provider['short_name']}"
+                )
+
+    def _all_proxy_root_paths(self):
+        """Return the on-disk paths of every CA root that bundles must contain.
+
+        Always begins with the primary provider cert, followed by any
+        materialized supplemental roots. When no supplemental roots are active
+        this is exactly [self.cert_path], preserving original behavior.
+        """
+        paths = [self.cert_path]
+        paths.extend(e['path'] for e in self.extra_roots if e.get('path'))
+        return paths
+
+    def _append_all_proxy_roots(self, target_file):
+        """Append every proxy root (primary + supplemental) to target_file.
+
+        Each append is individually idempotent via safe_append_certificate.
+        Returns True only if every root was appended (or already present).
+        """
+        ok = True
+        for path in self._all_proxy_root_paths():
+            if not self.safe_append_certificate(path, target_file):
+                ok = False
+        return ok
+
+    def _all_roots_present_in_file(self, target_file, likely=False):
+        """Return True only if every proxy root is already present in target_file.
+
+        With likely=True, uses the faster pure-Python matcher. When no
+        supplemental roots are active this reduces to a single primary-cert
+        check, preserving original behavior.
+        """
+        matcher = (self.certificate_likely_exists_in_file if likely
+                   else self.certificate_exists_in_file)
+        return all(
+            matcher(path, target_file)
+            for path in self._all_proxy_root_paths()
+        )
+
+    def _status_roots_present(self, primary_cert_path, target_file, likely=False):
+        """Status-mode 'all roots present' check.
+
+        Uses the supplied primary certificate path (typically a temp file, since
+        the primary may not be saved to cert_path during a status check) plus
+        every materialized supplemental root. When no supplemental roots are
+        active this reduces to the single primary check, preserving behavior.
+        """
+        matcher = (self.certificate_likely_exists_in_file if likely
+                   else self.certificate_exists_in_file)
+        if not matcher(primary_cert_path, target_file):
+            return False
+        for entry in self.extra_roots:
+            if entry.get('path') and not matcher(entry['path'], target_file):
+                return False
+        return True
+
+    def _all_root_aliases(self):
+        """Return (keytool_alias, cert_path) for the primary and each supplemental root."""
+        pairs = [(self.provider['keytool_alias'], self.cert_path)]
+        pairs.extend(
+            (e['keytool_alias'], e['path']) for e in self.extra_roots if e.get('path')
+        )
+        return pairs
+
+    def _keytool_alias_present(self, keytool_bin, keystore, alias):
+        """Return True if alias is already present in the Java keystore."""
+        try:
+            result = subprocess.run(
+                [keytool_bin, '-list', '-alias', alias,
+                 '-keystore', keystore, '-storepass', 'changeit'],
+                capture_output=True
+            )
+            return result.returncode == 0 and alias in result.stdout.decode()
+        except Exception:
+            return False
+
+    def _ensure_roots_in_keystore(self, keytool_bin, keystore, label):
+        """Import every proxy root (primary + supplemental) into a Java keystore.
+
+        Each root is imported under its own alias and skipped when already
+        present. Returns 'already_ok', 'configured', or 'failed' for the
+        keystore as a whole. With no supplemental roots active this is
+        equivalent to the original single-alias check-then-import.
+        """
+        imported = False
+        failed = False
+        for alias, cert_path in self._all_root_aliases():
+            if self._keytool_alias_present(keytool_bin, keystore, alias):
+                continue
+            if not self.is_install_mode():
+                self.print_action(f"    Would import {alias} certificate to: {keystore}")
+                imported = True
+                continue
+            result = subprocess.run(
+                [keytool_bin, '-import', '-trustcacerts', '-alias', alias,
+                 '-file', cert_path, '-keystore', keystore, '-storepass', 'changeit',
+                 '-noprompt'],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                self.print_info(f"    ✓ {label}: {alias} added successfully")
+                imported = True
+            else:
+                self.print_warn(f"    ✗ {label}: Failed to add {alias} (may require sudo)")
+                self.print_info("      Fix with:")
+                print(f"        sudo {keytool_bin} -import -trustcacerts \\")
+                print(f"          -alias {alias} \\")
+                print(f"          -file {cert_path} \\")
+                print(f"          -keystore {keystore} \\")
+                print("          -storepass changeit -noprompt")
+                if result.stdout:
+                    self.print_warn(f"      Keytool response: {result.stdout}")
+                failed = True
+        if failed and not imported:
+            return 'failed'
+        if imported:
+            return 'configured'
+        return 'already_ok'
+
+    def _all_container_certs(self):
+        """Return (container_cert_name, cert_path) for the primary and each supplemental root."""
+        pairs = [(self.provider['container_cert_name'], self.cert_path)]
+        pairs.extend(
+            (e['container_cert_name'], e['path']) for e in self.extra_roots if e.get('path')
+        )
+        return pairs
+
+    def _container_certs_present(self, docker_certs_dir):
+        """Return True if every proxy root is present in ~/.docker/certs.d."""
+        for name, cert_path in self._all_container_certs():
+            dest = os.path.join(docker_certs_dir, f"{name}.crt")
+            if not (os.path.exists(dest)
+                    and self.certificate_likely_exists_in_file(cert_path, dest)):
+                return False
+        return True
+
+    def _install_container_certs(self, docker_certs_dir):
+        """Copy every proxy root into ~/.docker/certs.d as {name}.crt."""
+        self._safe_makedirs(docker_certs_dir)
+        for name, cert_path in self._all_container_certs():
+            dest = os.path.join(docker_certs_dir, f"{name}.crt")
+            shutil.copy(cert_path, dest)
+            self._fix_ownership(dest)
+            self.print_info(f"Certificate installed to {dest}")
+
     def _get_brew_prefix(self):
         """Return the Homebrew prefix directory.
 
@@ -2258,7 +2684,7 @@ class FumitmPython:
                     return ToolResult('brew-cacerts', 'failed', 'brew postinstall ca-certificates failed')
             return ToolResult('brew-cacerts', 'skipped', 'Dry run')
 
-        if self.certificate_exists_in_file(self.cert_path, bundle_path):
+        if self._all_roots_present_in_file(bundle_path):
             self.print_debug(
                 "Proxy certificate already in Homebrew CA bundle"
             )
@@ -2329,11 +2755,12 @@ class FumitmPython:
                     self._safe_makedirs(os.path.dirname(node_bundle))
                     shutil.copy(self.cert_path, node_bundle)
                     self._fix_ownership(node_bundle)
+                    self._append_all_proxy_roots(node_bundle)
                     self.add_to_shell_config("NODE_EXTRA_CA_CERTS", node_bundle, shell_config)
                     self.print_info(f"Migrated Node.js CA bundle to {node_bundle}")
             elif os.path.exists(node_extra_ca_certs):
                 # Check if the file contains our certificate using normalized comparison
-                if self.certificate_exists_in_file(self.cert_path, node_extra_ca_certs):
+                if self._all_roots_present_in_file(node_extra_ca_certs):
                     # Certificate already exists in NODE_EXTRA_CA_CERTS, skip to npm setup
                     pass
                 else:
@@ -2364,7 +2791,7 @@ class FumitmPython:
                                         Path(new_path).touch()
                                         self._fix_ownership(new_path)
 
-                                self.safe_append_certificate(self.cert_path, new_path)
+                                self._append_all_proxy_roots(new_path)
 
                                 self.add_to_shell_config("NODE_EXTRA_CA_CERTS", new_path, shell_config)
                                 self.print_info(f"Created new certificate bundle at {new_path}")
@@ -2375,7 +2802,7 @@ class FumitmPython:
                             self.print_action(f"Would append proxy certificate to {node_extra_ca_certs}")
                         else:
                             self.print_info(f"Appending proxy certificate to {node_extra_ca_certs}")
-                            self.safe_append_certificate(self.cert_path, node_extra_ca_certs)
+                            self._append_all_proxy_roots(node_extra_ca_certs)
             else:
                 self.print_info("Configuring Node.js certificate...")
                 self.print_warn(f"NODE_EXTRA_CA_CERTS points to a non-existent file: {node_extra_ca_certs}")
@@ -2395,10 +2822,11 @@ class FumitmPython:
                 self.print_info(f"Creating Node.js CA bundle at {node_bundle}")
                 self._safe_makedirs(os.path.dirname(node_bundle))
                 
-                # Start with just the proxy certificate
+                # Start with just the proxy certificates
                 # (NODE_EXTRA_CA_CERTS supplements system certs, doesn't replace them)
                 shutil.copy(self.cert_path, node_bundle)
                 self._fix_ownership(node_bundle)
+                self._append_all_proxy_roots(node_bundle)
 
                 self.add_to_shell_config("NODE_EXTRA_CA_CERTS", node_bundle, shell_config)
                 self.print_info("Created Node.js CA bundle with proxy certificate")
@@ -2444,7 +2872,7 @@ class FumitmPython:
                 else:
                     self._safe_makedirs(os.path.dirname(npm_bundle))
                     self.create_bundle_with_system_certs(npm_bundle)
-                    self.safe_append_certificate(self.cert_path, npm_bundle)
+                    self._append_all_proxy_roots(npm_bundle)
                     subprocess.run(['npm', 'config', 'set', 'cafile', npm_bundle])
                     self.print_info(f"Migrated npm cafile to: {npm_bundle}")
                 return
@@ -2461,13 +2889,13 @@ class FumitmPython:
                     else:
                         self._safe_makedirs(os.path.dirname(npm_bundle))
                         self.create_bundle_with_system_certs(npm_bundle)
-                        self.safe_append_certificate(self.cert_path, npm_bundle)
+                        self._append_all_proxy_roots(npm_bundle)
                         subprocess.run(['npm', 'config', 'set', 'cafile', npm_bundle])
                         self.print_info(f"Repointed npm cafile to managed bundle: {npm_bundle}")
                     return
 
                 # Check if the file contains our certificate using normalized comparison
-                if not self.certificate_exists_in_file(self.cert_path, current_cafile):
+                if not self._all_roots_present_in_file(current_cafile):
                     self.print_info("Configuring npm certificate...")
                     self.print_warn("Current npm cafile doesn't contain proxy certificate")
                     
@@ -2490,7 +2918,7 @@ class FumitmPython:
                                     self._fix_ownership(npm_bundle)
 
                             # Append certificate to bundle
-                            self.safe_append_certificate(self.cert_path, npm_bundle)
+                            self._append_all_proxy_roots(npm_bundle)
 
                             subprocess.run(['npm', 'config', 'set', 'cafile', npm_bundle])
                             self.print_info(f"Created new npm cafile at {npm_bundle}")
@@ -2501,7 +2929,7 @@ class FumitmPython:
                             response = self._prompt("Do you want to append it to the existing cafile? (y/N) ")
                             if response.lower() == 'y':
                                 self.print_info(f"Appending proxy certificate to {current_cafile}")
-                                self.safe_append_certificate(self.cert_path, current_cafile)
+                                self._append_all_proxy_roots(current_cafile)
             else:
                 self.print_info("Configuring npm certificate...")
                 self.print_warn(f"npm cafile points to non-existent file: {current_cafile}")
@@ -2514,7 +2942,7 @@ class FumitmPython:
                     if response.lower() != 'n':
                         self._safe_makedirs(os.path.dirname(npm_bundle))
                         self.create_bundle_with_system_certs(npm_bundle)
-                        self.safe_append_certificate(self.cert_path, npm_bundle)
+                        self._append_all_proxy_roots(npm_bundle)
                         subprocess.run(['npm', 'config', 'set', 'cafile', npm_bundle])
                         self.print_info(f"Created and configured npm cafile at {npm_bundle}")
         else:
@@ -2530,7 +2958,7 @@ class FumitmPython:
                     self._safe_makedirs(os.path.dirname(npm_bundle))
                     if not self.create_bundle_with_system_certs(npm_bundle):
                         self.print_warn("Could not find system CA bundle, creating new bundle with only proxy certificate")
-                    self.safe_append_certificate(self.cert_path, npm_bundle)
+                    self._append_all_proxy_roots(npm_bundle)
                     subprocess.run(['npm', 'config', 'set', 'cafile', npm_bundle])
                     self.print_info(f"Configured npm cafile to: {npm_bundle}")
                     
@@ -2588,7 +3016,7 @@ class FumitmPython:
                 return  # Points to fumitm-managed bundle, that's OK
 
             # Check if file exists and contains WARP cert
-            if os.path.exists(current_cafile) and self.certificate_exists_in_file(self.cert_path, current_cafile):
+            if os.path.exists(current_cafile) and self._all_roots_present_in_file(current_cafile):
                 return  # Working config, leave it
 
             # Problematic config - delete it
@@ -2631,7 +3059,7 @@ class FumitmPython:
                 return  # Points to fumitm-managed bundle, that's OK
 
             # Check if file exists and contains WARP cert
-            if os.path.exists(current_cafile) and self.certificate_exists_in_file(self.cert_path, current_cafile):
+            if os.path.exists(current_cafile) and self._all_roots_present_in_file(current_cafile):
                 return  # Working config, leave it
 
             # Problematic config - delete it
@@ -2699,7 +3127,7 @@ class FumitmPython:
                                     self._fix_ownership(new_path)
 
                             # Append certificate to the new path
-                            self.safe_append_certificate(self.cert_path, new_path)
+                            self._append_all_proxy_roots(new_path)
 
                             needs_setup = True
                             self.print_info("Configuring Python certificate...")
@@ -2723,7 +3151,7 @@ class FumitmPython:
                             return ToolResult('python', 'skipped', 'Dry run')
                         else:
                             self.create_bundle_with_system_certs(python_bundle)
-                            self.safe_append_certificate(self.cert_path, python_bundle)
+                            self._append_all_proxy_roots(python_bundle)
                             self.add_to_shell_config("REQUESTS_CA_BUNDLE", python_bundle, shell_config)
                             self.add_to_shell_config("SSL_CERT_FILE", python_bundle, shell_config)
                             self.add_to_shell_config("CURL_CA_BUNDLE", python_bundle, shell_config)
@@ -2731,7 +3159,7 @@ class FumitmPython:
                             return ToolResult('python', 'configured', 'Repointed suspicious REQUESTS_CA_BUNDLE')
 
                     # Check if the file contains our certificate using normalized comparison
-                    if not self.certificate_exists_in_file(self.cert_path, requests_ca_bundle):
+                    if not self._all_roots_present_in_file(requests_ca_bundle):
                         needs_setup = True
                         self.print_info("Configuring Python certificate...")
                         self.print_info(f"REQUESTS_CA_BUNDLE is already set to: {requests_ca_bundle}")
@@ -2740,7 +3168,7 @@ class FumitmPython:
                             self.print_action(f"Would append proxy certificate to {requests_ca_bundle}")
                         else:
                             self.print_info(f"Appending proxy certificate to {requests_ca_bundle}")
-                            self.safe_append_certificate(self.cert_path, requests_ca_bundle)
+                            self._append_all_proxy_roots(requests_ca_bundle)
                     else:
                         # REQUESTS_CA_BUNDLE is healthy — ensure SSL_CERT_FILE is also set,
                         # since tools like httpx and Python's ssl module use it independently.
@@ -2769,7 +3197,7 @@ class FumitmPython:
                 self.print_info(f"Creating Python CA bundle at {python_bundle}")
                 if not self.create_bundle_with_system_certs(python_bundle):
                     self.print_warn("Could not find system CA bundle, creating new bundle")
-                self.safe_append_certificate(self.cert_path, python_bundle)
+                self._append_all_proxy_roots(python_bundle)
 
             self.add_to_shell_config("REQUESTS_CA_BUNDLE", python_bundle, shell_config)
             self.add_to_shell_config("SSL_CERT_FILE", python_bundle, shell_config)
@@ -2791,10 +3219,10 @@ class FumitmPython:
                         # Ensure the managed bundle exists
                         if not os.path.exists(python_bundle):
                             self.create_bundle_with_system_certs(python_bundle)
-                            self.safe_append_certificate(self.cert_path, python_bundle)
+                            self._append_all_proxy_roots(python_bundle)
                         self.add_to_shell_config("SSL_CERT_FILE", python_bundle, shell_config)
                         self.print_info(f"Repointed SSL_CERT_FILE to managed bundle: {python_bundle}")
-                elif not self.certificate_exists_in_file(self.cert_path, ssl_cert_file):
+                elif not self._all_roots_present_in_file(ssl_cert_file):
                     needs_setup = True
                     self.print_info("Configuring SSL_CERT_FILE...")
                     self.print_warn("SSL_CERT_FILE doesn't contain proxy certificate")
@@ -2803,7 +3231,7 @@ class FumitmPython:
                     else:
                         if not os.path.exists(python_bundle):
                             self.create_bundle_with_system_certs(python_bundle)
-                            self.safe_append_certificate(self.cert_path, python_bundle)
+                            self._append_all_proxy_roots(python_bundle)
                         self.add_to_shell_config("SSL_CERT_FILE", python_bundle, shell_config)
                         self.print_info(f"Repointed SSL_CERT_FILE to managed bundle: {python_bundle}")
             else:
@@ -2815,7 +3243,7 @@ class FumitmPython:
                 else:
                     if not os.path.exists(python_bundle):
                         self.create_bundle_with_system_certs(python_bundle)
-                        self.safe_append_certificate(self.cert_path, python_bundle)
+                        self._append_all_proxy_roots(python_bundle)
                     self.add_to_shell_config("SSL_CERT_FILE", python_bundle, shell_config)
                     self.print_info(f"Repointed SSL_CERT_FILE to managed bundle: {python_bundle}")
 
@@ -2849,7 +3277,7 @@ class FumitmPython:
                         if current_value == ca_bundle:
                             return False
                         if os.path.exists(current_value) and \
-                                self.certificate_exists_in_file(self.cert_path, current_value):
+                                self._all_roots_present_in_file(current_value):
                             return False
                 # Existing value is stale or wrong — replace it
                 lines = content.splitlines()
@@ -2972,14 +3400,14 @@ class FumitmPython:
                 else:
                     self._safe_makedirs(gcloud_cert_dir)
                     self.create_bundle_with_system_certs(gcloud_bundle)
-                    self.safe_append_certificate(self.cert_path, gcloud_bundle)
+                    self._append_all_proxy_roots(gcloud_bundle)
                     subprocess.run(['gcloud', 'config', 'set', 'core/custom_ca_certs_file', gcloud_bundle], capture_output=True, timeout=30)
                     self.print_info(f"Repointed gcloud custom CA file to managed bundle: {gcloud_bundle}")
                     return ToolResult('gcloud', 'configured', 'Repointed suspicious gcloud CA file')
                 return ToolResult('gcloud', 'skipped', 'Dry run')
 
             # Check if current CA file contains our certificate using normalized comparison
-            if not self.certificate_exists_in_file(self.cert_path, current_ca_file):
+            if not self._all_roots_present_in_file(current_ca_file):
                 needs_setup = True
         else:
             needs_setup = True
@@ -3022,7 +3450,7 @@ class FumitmPython:
             # Create combined bundle
             self.print_info(f"Creating gcloud CA bundle at {gcloud_bundle}")
             self.create_bundle_with_system_certs(gcloud_bundle)
-            self.safe_append_certificate(self.cert_path, gcloud_bundle)
+            self._append_all_proxy_roots(gcloud_bundle)
 
             # Configure gcloud
             result = subprocess.run(
@@ -3101,7 +3529,7 @@ class FumitmPython:
         # Build full bundle and configure
         self._safe_makedirs(os.path.dirname(git_bundle))
         self.create_bundle_with_system_certs(git_bundle)
-        self.safe_append_certificate(self.cert_path, git_bundle)
+        self._append_all_proxy_roots(git_bundle)
         subprocess.run(['git', 'config', '--global', 'http.sslCAInfo', git_bundle], capture_output=True, text=True)
         self.print_info(f"Configured git http.sslCAInfo to: {git_bundle}")
         return ToolResult('git', 'configured', f'Set http.sslCAInfo to {git_bundle}')
@@ -3171,7 +3599,7 @@ class FumitmPython:
         # Create the bundle and configure
         self._safe_makedirs(os.path.dirname(curl_bundle))
         self.create_bundle_with_system_certs(curl_bundle)
-        self.safe_append_certificate(self.cert_path, curl_bundle)
+        self._append_all_proxy_roots(curl_bundle)
         shell_type = self.detect_shell()
         shell_config = self.get_shell_config(shell_type)
         self.add_to_shell_config("CURL_CA_BUNDLE", curl_bundle, shell_config)
@@ -3218,7 +3646,7 @@ class FumitmPython:
                         self.print_action(f"Would create AWS CA bundle at {aws_bundle}")
                         self.print_action(f"Would repoint AWS_CA_BUNDLE to {aws_bundle}")
                         return ToolResult('aws', 'skipped', 'Dry run')
-                elif not self.certificate_likely_exists_in_file(self.cert_path, aws_env):
+                elif not self._all_roots_present_in_file(aws_env, likely=True):
                     # Bundle exists and looks OK but doesn't contain our proxy cert
                     self.print_info("Configuring AWS CLI certificate bundle...")
                     self.print_info(f"AWS_CA_BUNDLE bundle is missing the {self.provider['name']} proxy certificate")
@@ -3248,7 +3676,7 @@ class FumitmPython:
         # Create the bundle and configure
         self._safe_makedirs(os.path.dirname(aws_bundle))
         self.create_bundle_with_system_certs(aws_bundle)
-        self.safe_append_certificate(self.cert_path, aws_bundle)
+        self._append_all_proxy_roots(aws_bundle)
         shell_type = self.detect_shell()
         shell_config = self.get_shell_config(shell_type)
         self.add_to_shell_config("AWS_CA_BUNDLE", aws_bundle, shell_config)
@@ -3482,42 +3910,14 @@ class FumitmPython:
                 failed_count += 1
                 continue
 
-            # Check if certificate already exists
-            try:
-                result = subprocess.run(
-                    ['keytool', '-list', '-alias', self.provider['keytool_alias'],
-                     '-keystore', cacerts, '-storepass', 'changeit'],
-                    capture_output=True
-                )
-                if result.returncode == 0 and self.provider['keytool_alias'] in result.stdout.decode():
-                    self.print_info(f"  ✓ {version_name}: Certificate already installed")
-                    already_ok_count += 1
-                    continue
-            except Exception:
-                pass
-
-            self.print_info(f"  Configuring {version_name}...")
-
-            if not self.is_install_mode():
-                self.print_action(f"    Would import certificate to: {cacerts}")
+            status = self._ensure_roots_in_keystore('keytool', cacerts, version_name)
+            if status == 'already_ok':
+                self.print_info(f"  ✓ {version_name}: Certificate already installed")
+                already_ok_count += 1
+            elif status == 'configured':
+                configured_count += 1
             else:
-                result = subprocess.run(
-                    ['keytool', '-import', '-trustcacerts', '-alias', self.provider['keytool_alias'],
-                     '-file', self.cert_path, '-keystore', cacerts, '-storepass', 'changeit', '-noprompt'],
-                    capture_output=True
-                )
-                if result.returncode == 0:
-                    self.print_info(f"    ✓ {version_name}: Certificate added successfully")
-                    configured_count += 1
-                else:
-                    self.print_warn(f"    ✗ {version_name}: Failed to add certificate (may require sudo)")
-                    self.print_info( "      Fix with:")
-                    print(f"        sudo keytool -import -trustcacerts \\")
-                    print(f"          -alias {self.provider['keytool_alias']} \\")
-                    print(f"          -file {self.cert_path} \\")
-                    print(f"          -keystore {cacerts} \\")
-                    print( "          -storepass changeit -noprompt")
-                    failed_count += 1
+                failed_count += 1
 
         total = len(java_homes)
         if failed_count > 0 and configured_count == 0 and already_ok_count == 0:
@@ -3561,46 +3961,14 @@ class FumitmPython:
                 failed_count += 1
                 continue
 
-            # Check if certificate already exists
-            try:
-                result = subprocess.run(
-                    ['keytool', '-list', '-alias', self.provider['keytool_alias'],
-                     '-keystore', cacerts, '-storepass', 'changeit'],
-                    capture_output=True
-                )
-                if result.returncode == 0 and self.provider['keytool_alias'] in result.stdout.decode():
-                    # Certificate already exists
-                    self.print_info(f"  ✓ {version_name}: Certificate already installed")
-                    already_ok_count += 1
-                    continue
-            except Exception:
-                pass
-
-            self.print_info(f"  Installing certificate for {version_name}...")
-
-            if not self.is_install_mode():
-                self.print_action(f"    Would import certificate to: {cacerts}")
+            status = self._ensure_roots_in_keystore('keytool', cacerts, version_name)
+            if status == 'already_ok':
+                self.print_info(f"  ✓ {version_name}: Certificate already installed")
+                already_ok_count += 1
+            elif status == 'configured':
+                configured_count += 1
             else:
-                result = subprocess.run(
-                    ['keytool', '-import', '-trustcacerts', '-alias', self.provider['keytool_alias'],
-                     '-file', self.cert_path, '-keystore', cacerts, '-storepass', 'changeit', '-noprompt'],
-                    capture_output=True,
-                    text=True
-                )
-                if result.returncode == 0:
-                    self.print_info(f"    ✓ {version_name}: Certificate added successfully")
-                    configured_count += 1
-                else:
-                    self.print_warn(f"    ✗ {version_name}: Failed to add certificate (may require sudo)")
-                    self.print_info( "      Fix with:")
-                    print(f"        sudo keytool -import -trustcacerts \\")
-                    print(f"          -alias {self.provider['keytool_alias']} \\")
-                    print(f"          -file {self.cert_path} \\")
-                    print(f"          -keystore {cacerts} \\")
-                    print( "          -storepass changeit -noprompt")
-                    if len(result.stdout) > 0:
-                        self.print_warn(f"      Keytool response: {result.stdout}")
-                    failed_count += 1
+                failed_count += 1
 
         total = len(java_homes)
         if failed_count > 0 and configured_count == 0 and already_ok_count == 0:
@@ -3657,46 +4025,15 @@ class FumitmPython:
             self.print_error(f"DBeaver cacerts file not found at: {dbeaver_cacerts}")
             return ToolResult('dbeaver', 'failed', 'DBeaver cacerts file not found')
 
-        # Check if certificate already exists
-        try:
-            result = subprocess.run(
-                [dbeaver_keytool, '-list', '-alias', self.provider['keytool_alias'],
-                 '-keystore', dbeaver_cacerts, '-storepass', 'changeit'],
-                capture_output=True
-            )
-            if result.returncode == 0 and self.provider['keytool_alias'] in result.stdout.decode():
-                # Certificate already exists, nothing to do
-                return ToolResult('dbeaver', 'already_ok', 'Certificate already installed')
-        except Exception:
-            pass
-
         self.print_info("Configuring DBeaver certificate...")
         self.print_info("Found DBeaver at default install location")
 
-        if not self.is_install_mode():
-            self.print_action(f"Would import certificate to DBeaver keystore: {dbeaver_cacerts}")
-            self.print_action(f"Would run: {dbeaver_keytool} -import -trustcacerts -alias {self.provider['keytool_alias']} -file {self.cert_path} -keystore {dbeaver_cacerts} -storepass changeit -noprompt")
-        else:
-            self.print_info("Adding certificate to DBeaver keystore...")
-            result = subprocess.run(
-                [dbeaver_keytool, '-import', '-trustcacerts', '-alias', self.provider['keytool_alias'],
-                 '-file', self.cert_path, '-keystore', dbeaver_cacerts, '-storepass', 'changeit', '-noprompt'],
-                capture_output=True
-            )
-            if result.returncode == 0:
-                self.print_info("Certificate added to DBeaver keystore successfully")
-                return ToolResult('dbeaver', 'configured', 'Certificate added to DBeaver keystore')
-            else:
-                self.print_warn("Failed to add certificate to DBeaver keystore (may require sudo)")
-                self.print_info( "      Fix with:")
-                print(f"        sudo {dbeaver_keytool} -import -trustcacerts \\")
-                print(f"          -alias {self.provider['keytool_alias']} \\")
-                print(f"          -file {self.cert_path} \\")
-                print(f"          -keystore {dbeaver_cacerts} \\")
-                print( "          -storepass changeit -noprompt")
-                if len(result.stdout) > 0:
-                    self.print_warn(f"Keytool response: {result.stdout.decode('utf-8')}")
-                return ToolResult('dbeaver', 'failed', 'Failed to add certificate (may require sudo)')
+        status = self._ensure_roots_in_keystore(dbeaver_keytool, dbeaver_cacerts, 'DBeaver')
+        if status == 'already_ok':
+            return ToolResult('dbeaver', 'already_ok', 'Certificate already installed')
+        if status == 'configured':
+            return ToolResult('dbeaver', 'configured', 'Certificate added to DBeaver keystore')
+        return ToolResult('dbeaver', 'failed', 'Failed to add certificate (may require sudo)')
     
     def setup_wget_cert(self):
         """Setup wget certificate."""
@@ -3784,6 +4121,21 @@ class FumitmPython:
         except Exception:
             return False
 
+    def _check_cert_in_podman_vm(self):
+        """Return True if every proxy root is present in the Podman VM."""
+        try:
+            for cert_name, _ in self._all_container_certs():
+                result = subprocess.run(
+                    ['podman', 'machine', 'ssh',
+                     f'test -f /etc/pki/ca-trust/source/anchors/{cert_name}.pem'],
+                    capture_output=True
+                )
+                if result.returncode != 0:
+                    return False
+            return True
+        except Exception:
+            return False
+
     def _install_cert_via_podman_ssh(self):
         """Install cert into Podman VM via podman machine ssh.
 
@@ -3793,18 +4145,17 @@ class FumitmPython:
         Returns:
             tuple: (success: bool, message: str)
         """
-        cert_name = self.provider['container_cert_name']
         try:
-            with open(self.cert_path, 'r') as f:
-                cert_content = f.read()
-
-            result = subprocess.run(
-                ['podman', 'machine', 'ssh',
-                 f'sudo tee /etc/pki/ca-trust/source/anchors/{cert_name}.pem'],
-                input=cert_content, text=True, capture_output=True
-            )
-            if result.returncode != 0:
-                return False, 'Failed to copy certificate into VM'
+            for cert_name, cert_path in self._all_container_certs():
+                with open(cert_path, 'r') as f:
+                    cert_content = f.read()
+                result = subprocess.run(
+                    ['podman', 'machine', 'ssh',
+                     f'sudo tee /etc/pki/ca-trust/source/anchors/{cert_name}.pem'],
+                    input=cert_content, text=True, capture_output=True
+                )
+                if result.returncode != 0:
+                    return False, 'Failed to copy certificate into VM'
 
             result = subprocess.run(
                 ['podman', 'machine', 'ssh', 'sudo update-ca-trust'],
@@ -3830,21 +4181,13 @@ class FumitmPython:
         docker_certs_dir = os.path.expanduser("~/.docker/certs.d")
         cert_dest = os.path.join(docker_certs_dir, f"{self.provider['container_cert_name']}.crt")
 
-        persistent_installed = (
-            os.path.exists(cert_dest)
-            and self.certificate_likely_exists_in_file(self.cert_path, cert_dest)
-        )
+        persistent_installed = self._container_certs_present(docker_certs_dir)
 
         vm_is_running = self._podman_vm_running()
         vm_needs_cert = False
         if vm_is_running:
             try:
-                result = subprocess.run(
-                    ['podman', 'machine', 'ssh',
-                     f'test -f /etc/pki/ca-trust/source/anchors/{self.provider["container_cert_name"]}.pem'],
-                    capture_output=True
-                )
-                vm_needs_cert = result.returncode != 0
+                vm_needs_cert = not self._check_cert_in_podman_vm()
             except Exception:
                 pass
 
@@ -3864,10 +4207,7 @@ class FumitmPython:
             vm_failed = False
 
             if not persistent_installed:
-                self._safe_makedirs(docker_certs_dir)
-                shutil.copy(self.cert_path, cert_dest)
-                self._fix_ownership(cert_dest)
-                self.print_info(f"Certificate installed to {cert_dest}")
+                self._install_container_certs(docker_certs_dir)
                 persistent_changed = True
 
             if vm_is_running and vm_needs_cert:
@@ -3894,14 +4234,16 @@ class FumitmPython:
     
     def _check_cert_in_rancher_vm(self):
         """Check whether the CA cert exists in the Rancher Desktop VM."""
-        cert_name = self.provider['container_cert_name']
         try:
-            result = subprocess.run(
-                ['rdctl', 'shell', 'test', '-f',
-                 f'/usr/local/share/ca-certificates/{cert_name}.crt'],
-                capture_output=True
-            )
-            return result.returncode == 0
+            for cert_name, _ in self._all_container_certs():
+                result = subprocess.run(
+                    ['rdctl', 'shell', 'test', '-f',
+                     f'/usr/local/share/ca-certificates/{cert_name}.crt'],
+                    capture_output=True
+                )
+                if result.returncode != 0:
+                    return False
+            return True
         except Exception:
             return False
 
@@ -3911,18 +4253,17 @@ class FumitmPython:
         Returns:
             tuple: (success: bool, message: str)
         """
-        cert_name = self.provider['container_cert_name']
         try:
-            with open(self.cert_path, 'r') as f:
-                cert_content = f.read()
-
-            result = subprocess.run(
-                ['rdctl', 'shell', 'sudo', 'tee',
-                 f'/usr/local/share/ca-certificates/{cert_name}.crt'],
-                input=cert_content, text=True, capture_output=True
-            )
-            if result.returncode != 0:
-                return False, 'Failed to copy certificate into VM'
+            for cert_name, cert_path in self._all_container_certs():
+                with open(cert_path, 'r') as f:
+                    cert_content = f.read()
+                result = subprocess.run(
+                    ['rdctl', 'shell', 'sudo', 'tee',
+                     f'/usr/local/share/ca-certificates/{cert_name}.crt'],
+                    input=cert_content, text=True, capture_output=True
+                )
+                if result.returncode != 0:
+                    return False, 'Failed to copy certificate into VM'
 
             result = subprocess.run(
                 ['rdctl', 'shell', 'sudo', 'update-ca-certificates'],
@@ -3946,10 +4287,7 @@ class FumitmPython:
         docker_certs_dir = os.path.expanduser("~/.docker/certs.d")
         cert_dest = os.path.join(docker_certs_dir, f"{self.provider['container_cert_name']}.crt")
 
-        persistent_installed = (
-            os.path.exists(cert_dest)
-            and self.certificate_likely_exists_in_file(self.cert_path, cert_dest)
-        )
+        persistent_installed = self._container_certs_present(docker_certs_dir)
 
         vm_is_running = False
         vm_needs_cert = False
@@ -3977,10 +4315,7 @@ class FumitmPython:
             vm_failed = False
 
             if not persistent_installed:
-                self._safe_makedirs(docker_certs_dir)
-                shutil.copy(self.cert_path, cert_dest)
-                self._fix_ownership(cert_dest)
-                self.print_info(f"Certificate installed to {cert_dest}")
+                self._install_container_certs(docker_certs_dir)
                 persistent_changed = True
 
             if vm_is_running and vm_needs_cert:
@@ -4056,17 +4391,20 @@ class FumitmPython:
                     self.print_info("Make sure emulator was started with -writable-system flag")
                     return ToolResult('android', 'failed', 'Failed to remount system partition')
 
-                # Push certificate
-                result = subprocess.run(
-                    ['adb', 'push', self.cert_path, f'/system/etc/security/cacerts/{self.provider["container_cert_name"]}.pem'],
-                    capture_output=True
-                )
-                if result.returncode == 0:
-                    # Set permissions
-                    subprocess.run(
-                        ['adb', 'shell', 'chmod', '644', f'/system/etc/security/cacerts/{self.provider["container_cert_name"]}.pem'],
-                        capture_output=True
+                # Push each proxy root (primary + supplemental) into the emulator
+                push_failed = False
+                for cert_name, cert_path in self._all_container_certs():
+                    dest = f'/system/etc/security/cacerts/{cert_name}.pem'
+                    result = subprocess.run(
+                        ['adb', 'push', cert_path, dest], capture_output=True
                     )
+                    if result.returncode != 0:
+                        push_failed = True
+                        break
+                    subprocess.run(
+                        ['adb', 'shell', 'chmod', '644', dest], capture_output=True
+                    )
+                if not push_failed:
                     self.print_info("Certificate installed. Rebooting emulator...")
                     subprocess.run(['adb', 'reboot'], capture_output=True)
                     self.print_info("Android emulator certificate installed successfully")
@@ -4079,14 +4417,16 @@ class FumitmPython:
     
     def _check_cert_in_colima_vm(self):
         """Check whether the CA cert exists in the Colima VM."""
-        cert_name = self.provider['container_cert_name']
         try:
-            result = subprocess.run(
-                ['colima', 'ssh', '--', 'test', '-f',
-                 f'/usr/local/share/ca-certificates/{cert_name}.crt'],
-                capture_output=True
-            )
-            return result.returncode == 0
+            for cert_name, _ in self._all_container_certs():
+                result = subprocess.run(
+                    ['colima', 'ssh', '--', 'test', '-f',
+                     f'/usr/local/share/ca-certificates/{cert_name}.crt'],
+                    capture_output=True
+                )
+                if result.returncode != 0:
+                    return False
+            return True
         except Exception:
             return False
 
@@ -4096,18 +4436,17 @@ class FumitmPython:
         Returns:
             tuple: (success: bool, message: str)
         """
-        cert_name = self.provider['container_cert_name']
         try:
-            with open(self.cert_path, 'r') as f:
-                cert_content = f.read()
-
-            result = subprocess.run(
-                ['colima', 'ssh', '--', 'sudo', 'tee',
-                 f'/usr/local/share/ca-certificates/{cert_name}.crt'],
-                input=cert_content, text=True, capture_output=True
-            )
-            if result.returncode != 0:
-                return False, 'Failed to copy certificate into VM'
+            for cert_name, cert_path in self._all_container_certs():
+                with open(cert_path, 'r') as f:
+                    cert_content = f.read()
+                result = subprocess.run(
+                    ['colima', 'ssh', '--', 'sudo', 'tee',
+                     f'/usr/local/share/ca-certificates/{cert_name}.crt'],
+                    input=cert_content, text=True, capture_output=True
+                )
+                if result.returncode != 0:
+                    return False, 'Failed to copy certificate into VM'
 
             result = subprocess.run(
                 ['colima', 'ssh', '--', 'sudo', 'update-ca-certificates'],
@@ -4132,10 +4471,7 @@ class FumitmPython:
         docker_certs_dir = os.path.expanduser("~/.docker/certs.d")
         cert_dest = os.path.join(docker_certs_dir, f"{self.provider['container_cert_name']}.crt")
 
-        persistent_installed = (
-            os.path.exists(cert_dest)
-            and self.certificate_likely_exists_in_file(self.cert_path, cert_dest)
-        )
+        persistent_installed = self._container_certs_present(docker_certs_dir)
 
         vm_is_running = False
         vm_needs_cert = False
@@ -4163,10 +4499,7 @@ class FumitmPython:
             vm_failed = False
 
             if not persistent_installed:
-                self._safe_makedirs(docker_certs_dir)
-                shutil.copy(self.cert_path, cert_dest)
-                self._fix_ownership(cert_dest)
-                self.print_info(f"Certificate installed to {cert_dest}")
+                self._install_container_certs(docker_certs_dir)
                 persistent_changed = True
 
             if vm_is_running and vm_needs_cert:
@@ -4272,16 +4605,16 @@ class FumitmPython:
         Uses nsenter via a locally cached container image to probe the VM's
         filesystem. Checks both Debian-style and Fedora-style cert paths.
         """
-        cert_name = self.provider['container_cert_name']
-        check_script = (
-            f'test -f /usr/local/share/ca-certificates/{cert_name}.crt'
-            f' || test -f /etc/pki/ca-trust/source/anchors/{cert_name}.pem'
-        )
         try:
-            result = self._run_nsenter(check_script)
-            if result is None:
-                return False
-            return result.returncode == 0
+            for cert_name, _ in self._all_container_certs():
+                check_script = (
+                    f'test -f /usr/local/share/ca-certificates/{cert_name}.crt'
+                    f' || test -f /etc/pki/ca-trust/source/anchors/{cert_name}.pem'
+                )
+                result = self._run_nsenter(check_script)
+                if result is None or result.returncode != 0:
+                    return False
+            return True
         except Exception:
             return False
 
@@ -4297,30 +4630,31 @@ class FumitmPython:
         Returns:
             tuple: (success: bool, message: str)
         """
-        cert_name = self.provider['container_cert_name']
-        # Debian/Alpine use .crt in /usr/local/share/ca-certificates/
-        # Fedora/RHEL use .pem in /etc/pki/ca-trust/source/anchors/
-        install_script = (
-            f'if [ -d /usr/local/share/ca-certificates ]; then'
-            f'  cat > /usr/local/share/ca-certificates/{cert_name}.crt'
-            f'  && update-ca-certificates 2>/dev/null;'
-            f' elif [ -d /etc/pki/ca-trust/source/anchors ]; then'
-            f'  cat > /etc/pki/ca-trust/source/anchors/{cert_name}.pem'
-            f'  && update-ca-trust 2>/dev/null;'
-            f' else exit 1; fi'
-        )
+        # Each root is written under its own filename so multiple roots
+        # (primary provider + supplemental, e.g. Aikido) all land in the VM.
+        # Debian/Alpine use .crt in /usr/local/share/ca-certificates/;
+        # Fedora/RHEL use .pem in /etc/pki/ca-trust/source/anchors/.
         try:
-            with open(self.cert_path, 'r') as f:
-                cert_content = f.read()
-
-            result = self._run_nsenter(install_script, stdin_data=cert_content,
-                                       timeout=60)
-            if result is None:
-                return False, 'No Docker image available for nsenter (try: docker pull alpine)'
-            if result.returncode == 0:
-                return True, 'Certificate installed in Docker VM'
-            self.print_debug(f"nsenter stderr: {result.stderr.strip()}")
-            return False, 'nsenter command failed'
+            for cert_name, cert_path in self._all_container_certs():
+                install_script = (
+                    f'if [ -d /usr/local/share/ca-certificates ]; then'
+                    f'  cat > /usr/local/share/ca-certificates/{cert_name}.crt'
+                    f'  && update-ca-certificates 2>/dev/null;'
+                    f' elif [ -d /etc/pki/ca-trust/source/anchors ]; then'
+                    f'  cat > /etc/pki/ca-trust/source/anchors/{cert_name}.pem'
+                    f'  && update-ca-trust 2>/dev/null;'
+                    f' else exit 1; fi'
+                )
+                with open(cert_path, 'r') as f:
+                    cert_content = f.read()
+                result = self._run_nsenter(install_script, stdin_data=cert_content,
+                                           timeout=60)
+                if result is None:
+                    return False, 'No Docker image available for nsenter (try: docker pull alpine)'
+                if result.returncode != 0:
+                    self.print_debug(f"nsenter stderr: {result.stderr.strip()}")
+                    return False, 'nsenter command failed'
+            return True, 'Certificate installed in Docker VM'
         except subprocess.TimeoutExpired:
             return False, 'nsenter timed out'
         except Exception as e:
@@ -4381,10 +4715,7 @@ class FumitmPython:
         cert_name = f"{self.provider['container_cert_name']}.crt"
         cert_dest = os.path.join(docker_certs_dir, cert_name)
 
-        persistent_installed = (
-            os.path.exists(cert_dest)
-            and self.certificate_likely_exists_in_file(self.cert_path, cert_dest)
-        )
+        persistent_installed = self._container_certs_present(docker_certs_dir)
 
         vm_is_running = self._docker_is_running()
         vm_needs_cert = False
@@ -4407,10 +4738,7 @@ class FumitmPython:
             vm_failed = False
 
             if not persistent_installed:
-                self._safe_makedirs(docker_certs_dir)
-                shutil.copy(self.cert_path, cert_dest)
-                self._fix_ownership(cert_dest)
-                self.print_info(f"Certificate installed to {cert_dest}")
+                self._install_container_certs(docker_certs_dir)
                 persistent_changed = True
 
             if vm_is_running and vm_needs_cert:
@@ -4760,7 +5088,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 "(brew postinstall ca-certificates)"
             )
             has_issues = True
-        elif self.certificate_exists_in_file(temp_warp_cert, bundle_path):
+        elif self._status_roots_present(temp_warp_cert, bundle_path):
             self.print_info(
                 "  ✓ Homebrew CA bundle contains proxy certificate"
             )
@@ -4789,7 +5117,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     self.print_action("    Run with --fix to migrate to the current provider's bundle")
                     has_issues = True
                 elif os.path.exists(node_extra_ca_certs):
-                    if self.certificate_exists_in_file(temp_warp_cert, node_extra_ca_certs):
+                    if self._status_roots_present(temp_warp_cert, node_extra_ca_certs):
                         self.print_info("  ✓ NODE_EXTRA_CA_CERTS contains current certificate")
                         verify_result = self.verify_connection("node")
                         if verify_result == "WORKING":
@@ -4821,7 +5149,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                             self.print_action("    Run with --fix to migrate to the current provider's bundle")
                             has_issues = True
                         elif os.path.exists(npm_cafile):
-                            if self.certificate_exists_in_file(temp_warp_cert, npm_cafile):
+                            if self._status_roots_present(temp_warp_cert, npm_cafile):
                                 self.print_info("  ✓ npm cafile contains current certificate")
                                 suspicious, reason = self.is_suspicious_full_bundle(npm_cafile, None)
                                 if suspicious:
@@ -4862,7 +5190,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                         elif yarn_cafile == npm_bundle:
                             self.print_info(f"  ✓ yarn {config_key} points to managed npm bundle")
                         elif os.path.exists(yarn_cafile):
-                            if self.certificate_exists_in_file(temp_warp_cert, yarn_cafile):
+                            if self._status_roots_present(temp_warp_cert, yarn_cafile):
                                 self.print_info(f"  ✓ yarn {config_key} contains current certificate")
                             else:
                                 self.print_warn(f"  ⚠ yarn {config_key} doesn't contain proxy certificate: {yarn_cafile}")
@@ -4894,7 +5222,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                         elif pnpm_cafile == npm_bundle:
                             self.print_info("  ✓ pnpm cafile points to managed npm bundle")
                         elif os.path.exists(pnpm_cafile):
-                            if self.certificate_exists_in_file(temp_warp_cert, pnpm_cafile):
+                            if self._status_roots_present(temp_warp_cert, pnpm_cafile):
                                 self.print_info("  ✓ pnpm cafile contains current certificate")
                             else:
                                 self.print_warn(f"  ⚠ pnpm cafile doesn't contain proxy certificate: {pnpm_cafile}")
@@ -4922,6 +5250,21 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             if python_verify_result == "WORKING":
                 self.print_info("  ✓ Python trusts the system proxy certificate")
                 self.print_info("  ✓ Python can connect through proxy without additional configuration")
+                # verify_connection() exercises Python's default trust (which
+                # honors REQUESTS_CA_BUNDLE), but rustls clients such as uv read
+                # SSL_CERT_FILE instead. A managed SSL_CERT_FILE that is missing
+                # a required root (e.g. the Aikido supplemental root) leaves uv
+                # broken even though Python itself works, so flag it explicitly.
+                ssl_cert_file = os.environ.get('SSL_CERT_FILE', '')
+                if ssl_cert_file and os.path.exists(ssl_cert_file):
+                    if not self._status_roots_present(temp_warp_cert, ssl_cert_file):
+                        self.print_warn(
+                            f"  ✗ SSL_CERT_FILE ({ssl_cert_file}) is missing a required root"
+                        )
+                        self.print_action(
+                            "    Run with --fix to add all roots (needed by uv/rustls clients)"
+                        )
+                        has_issues = True
             else:
                 # Python doesn't trust system cert, check environment variables
                 python_configured = False
@@ -4930,7 +5273,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 if requests_ca_bundle:
                     self.print_info(f"  REQUESTS_CA_BUNDLE is set to: {requests_ca_bundle}")
                     if os.path.exists(requests_ca_bundle):
-                        if self.certificate_exists_in_file(temp_warp_cert, requests_ca_bundle):
+                        if self._status_roots_present(temp_warp_cert, requests_ca_bundle):
                             self.print_info("  ✓ REQUESTS_CA_BUNDLE contains current certificate")
                             suspicious, reason = self.is_suspicious_full_bundle(requests_ca_bundle, None)
                             if suspicious:
@@ -4949,7 +5292,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 if ssl_cert_file:
                     self.print_info(f"  SSL_CERT_FILE is set to: {ssl_cert_file}")
                     if os.path.exists(ssl_cert_file):
-                        if self.certificate_exists_in_file(temp_warp_cert, ssl_cert_file):
+                        if self._status_roots_present(temp_warp_cert, ssl_cert_file):
                             self.print_info("  ✓ SSL_CERT_FILE contains current certificate")
                             suspicious, reason = self.is_suspicious_full_bundle(ssl_cert_file, None)
                             if suspicious:
@@ -4992,7 +5335,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
 
                     if gcloud_ca and os.path.exists(gcloud_ca):
                         self.print_info(f"  - Custom CA configured at: {gcloud_ca}")
-                        if self.certificate_exists_in_file(temp_warp_cert, gcloud_ca):
+                        if self._status_roots_present(temp_warp_cert, gcloud_ca):
                             self.print_info("  ✓ Custom CA contains current certificate")
                         else:
                             self.print_warn("  ✗ gcloud CA file doesn't contain current certificate")
@@ -5015,7 +5358,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     gcloud_ca = result.stdout.strip() if result.returncode == 0 else ""
 
                     if gcloud_ca and os.path.exists(gcloud_ca):
-                        if self.certificate_exists_in_file(temp_warp_cert, gcloud_ca):
+                        if self._status_roots_present(temp_warp_cert, gcloud_ca):
                             self.print_info("  ✓ gcloud configured with current certificate")
                             suspicious, reason = self.is_suspicious_full_bundle(gcloud_ca, None)
                             if suspicious:
@@ -5041,7 +5384,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     gcloud_ca = result.stdout.strip() if result.returncode == 0 else ""
 
                     if gcloud_ca and os.path.exists(gcloud_ca):
-                        if self.certificate_exists_in_file(temp_warp_cert, gcloud_ca):
+                        if self._status_roots_present(temp_warp_cert, gcloud_ca):
                             self.print_warn("  - Custom CA is configured with WARP cert but connection still fails")
                             self.print_action("    Check gcloud and Python configuration")
                         else:
@@ -5254,7 +5597,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             cert_path = os.path.join(docker_certs_dir, f"{self.provider['container_cert_name']}.crt")
 
             if os.path.exists(cert_path):
-                if self.certificate_likely_exists_in_file(temp_warp_cert, cert_path):
+                if self._status_roots_present(temp_warp_cert, cert_path, likely=True):
                     self.print_info("  ✓ Certificate installed in ~/.docker/certs.d/ (persistent)")
                 else:
                     self.print_warn("  ✗ Certificate in ~/.docker/certs.d/ is outdated")
@@ -5296,7 +5639,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             cert_path = os.path.join(docker_certs_dir, f"{self.provider['container_cert_name']}.crt")
 
             if os.path.exists(cert_path):
-                if self.certificate_likely_exists_in_file(temp_warp_cert, cert_path):
+                if self._status_roots_present(temp_warp_cert, cert_path, likely=True):
                     self.print_info("  ✓ Certificate installed in ~/.docker/certs.d/ (persistent)")
                 else:
                     self.print_warn("  ✗ Certificate in ~/.docker/certs.d/ is outdated")
@@ -5336,7 +5679,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             )
 
             if os.path.exists(cert_path):
-                if self.certificate_likely_exists_in_file(temp_warp_cert, cert_path):
+                if self._status_roots_present(temp_warp_cert, cert_path, likely=True):
                     self.print_info("  ✓ Certificate installed in ~/.docker/certs.d/ (persistent)")
                 else:
                     self.print_warn("  ✗ Certificate in ~/.docker/certs.d/ is outdated")
@@ -5386,7 +5729,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             cert_path = os.path.join(docker_certs_dir, f"{self.provider['container_cert_name']}.crt")
 
             if os.path.exists(cert_path):
-                if self.certificate_likely_exists_in_file(temp_warp_cert, cert_path):
+                if self._status_roots_present(temp_warp_cert, cert_path, likely=True):
                     self.print_info("  ✓ Certificate installed in ~/.docker/certs.d/ (persistent)")
                 else:
                     self.print_warn("  ✗ Certificate in ~/.docker/certs.d/ is outdated")
@@ -5534,6 +5877,11 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         self.cert_fingerprint = self.get_cert_fingerprint(temp_warp_cert)
         self.print_debug(f"{short} certificate fingerprint: {self.cert_fingerprint}")
 
+        # Materialize supplemental roots so per-tool status checks can verify
+        # each managed bundle contains them alongside the primary cert.
+        self._prepare_extra_roots()
+        self._announce_extra_roots()
+
         # Check provider connection
         if self._check_provider_connection():
             has_issues = True
@@ -5625,7 +5973,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             docker_certs_dir = os.path.expanduser("~/.docker/certs.d")
             cert_path = os.path.join(docker_certs_dir, f"{self.provider['container_cert_name']}.crt")
             if os.path.exists(cert_path):
-                if self.certificate_likely_exists_in_file(temp_warp_cert, cert_path):
+                if self._container_certs_present(docker_certs_dir):
                     self.print_info(f"  ✓ Certificate installed in {docker_certs_dir}")
                     self.print_info("    (Used by: Docker, OrbStack, Colima, Podman, Rancher Desktop, Lima)")
                     self._print_docker_build_hint()
@@ -5803,6 +6151,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         try:
             return self._main_inner()
         finally:
+            self._cleanup_extra_root_temp_files()
             self._close_log_files()
 
     def _main_inner(self):
@@ -5880,6 +6229,11 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 if not self.download_certificate():
                     self.print_error("Failed to download certificate. Exiting.")
                     return 1
+
+                # Materialize any supplemental roots (e.g. Aikido) so every tool
+                # fixer can append them alongside the primary provider cert.
+                self._prepare_extra_roots()
+                self._announce_extra_roots()
 
                 if self.selected_tools:
                     self.print_info(f"Processing selected tools: {', '.join(self.get_selected_tools_info())}")
@@ -5972,6 +6326,11 @@ def main():
                         help='Skip network verification tests (useful in devcontainers)')
     parser.add_argument('--provider', choices=list(PROVIDERS.keys()),
                         help='MITM proxy provider (default: auto-detect)')
+    parser.add_argument('--with-aikido', action='store_true',
+                        help='Force-add the Aikido Endpoint Protection root CA to all '
+                             'bundles even if it is not auto-detected')
+    parser.add_argument('--no-aikido', action='store_true',
+                        help='Do not add the Aikido root CA even if Aikido is detected')
     parser.add_argument('--yes', '-y', action='store_true',
                         help='Answer yes to all prompts (for non-interactive use)')
     parser.add_argument('--debug', '--verbose', action='store_true',
@@ -6046,6 +6405,9 @@ def main():
                 [t.strip() for t in tool_arg.split(',') if t.strip()]
             )
 
+    if args.with_aikido and args.no_aikido:
+        parser.error('--with-aikido and --no-aikido are mutually exclusive')
+
     mode = 'install' if args.fix else 'status'
 
     fumitm_instance = FumitmPython(
@@ -6065,6 +6427,8 @@ def main():
         json_log_file=args.json_log_file,
         json_log_dir=args.json_log_dir,
         run_as_user=args.run_as_user,
+        with_aikido=args.with_aikido,
+        no_aikido=args.no_aikido,
     )
     exit_code = fumitm_instance.main()
     sys.exit(exit_code)

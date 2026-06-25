@@ -282,7 +282,7 @@ class TestProviderCLI(FumitmTestCase):
     _DEFAULT_NEW_KWARGS = dict(
         no_color=False, headless=False, skip_update_check=False,
         log_file=None, log_dir=None, json_log_file=None, json_log_dir=None,
-        run_as_user=None,
+        run_as_user=None, with_aikido=False, no_aikido=False,
     )
 
     @patch('fumitm.sys.argv', ['fumitm.py', '--provider', 'netskope'])
