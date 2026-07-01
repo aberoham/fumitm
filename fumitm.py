@@ -221,19 +221,34 @@ ToolResult = namedtuple(
 
 
 class FumitmPython:
+    # Markers delimiting fumitm's managed export block in the shell config. The
+    # block is always re-emitted at the end of the file so its TLS-trust settings
+    # win over any earlier vendor block (e.g. Aikido) via last-export-wins.
+    _FUMITM_BLOCK_BEGIN = "# >>> fumitm managed (keep last) >>>"
+    _FUMITM_BLOCK_END = "# <<< fumitm managed <<<"
+
     def __init__(self, mode='status', debug=False, selected_tools=None,
                  cert_file=None, manual_cert=False, skip_verify=False,
                  provider=None, auto_yes=False, no_color=False,
                  headless=False, skip_update_check=False,
                  log_file=None, log_dir=None,
                  json_log_file=None, json_log_dir=None,
-                 run_as_user=None, with_aikido=False, no_aikido=False):
+                 run_as_user=None, with_aikido=False, no_aikido=False,
+                 aikido_cert_file=None):
         self.mode = mode
         self.debug = debug
         self.shell_modified = False
+        # Shell config paths whose pre-run original has already been backed up
+        # this run, so repeated writes in one run never overwrite the .bak with an
+        # intermediate generated file.
+        self._backed_up_shell_configs = set()
         self.cert_fingerprint = ""
         self.selected_tools = selected_tools or []
         self.cert_file = cert_file
+        # Stored raw and expanded at read time: --run-as-user/sudo targeting
+        # rewrites HOME later in __init__, so a tilde path must not be expanded
+        # against root's home here.
+        self.aikido_cert_file = aikido_cert_file
         self.manual_cert = manual_cert
         self.skip_verify = skip_verify
         self.auto_yes = auto_yes
@@ -546,9 +561,11 @@ class FumitmPython:
         """
         active = []
         # Aikido is the only supplemental root today; the structure generalizes
-        # so future vendors slot in the same way.
+        # so future vendors slot in the same way. Supplying an explicit cert file
+        # implies the operator wants Aikido active, mirroring --with-aikido.
         aikido_forced_off = no_aikido
-        aikido_active = with_aikido or (not aikido_forced_off and self._detect_aikido())
+        aikido_forced_on = with_aikido or bool(self.aikido_cert_file)
+        aikido_active = aikido_forced_on or (not aikido_forced_off and self._detect_aikido())
         if aikido_active:
             entry = dict(SUPPLEMENTAL_ROOTS['aikido'])
             entry['key'] = 'aikido'
@@ -587,10 +604,13 @@ class FumitmPython:
     def _get_aikido_root_cert(self):
         """Retrieve the Aikido root CA certificate(s) as PEM text.
 
-        Tries the macOS System Keychain first (by label prefix), then falls back
-        to parsing the maintained combined PEM. Only certificates whose subject
-        CN starts with the Aikido root prefix are kept; the ephemeral hex-CN
-        interception intermediate is deliberately excluded.
+        Sources are tried in order: an operator-supplied file (``--aikido-cert``),
+        the macOS System Keychain (by label prefix), the maintained combined PEM,
+        and finally a root persisted by an earlier run. The explicit and persisted
+        sources are what let ``--with-aikido`` succeed on hosts where the live
+        Aikido agent is absent, such as CI or no-agent images. Only certificates
+        whose subject CN starts with the Aikido root prefix are kept; the ephemeral
+        hex-CN interception intermediate is deliberately excluded.
 
         Returns:
             str or None: PEM text containing the Aikido root(s), or None.
@@ -598,7 +618,18 @@ class FumitmPython:
         descriptor = SUPPLEMENTAL_ROOTS['aikido']
         prefix = descriptor['keychain_label_prefix']
 
-        # Source 1: macOS System Keychain, all matching certs by label prefix.
+        # Source 1: explicit operator-supplied file. This is the supported path
+        # for forcing Aikido on hosts where no live agent or keychain entry
+        # exists; failure here is surfaced rather than silently falling through.
+        if self.aikido_cert_file:
+            cert_path = os.path.expanduser(self.aikido_cert_file)
+            pem = self._read_aikido_root_from_file(cert_path, prefix)
+            if pem:
+                self.print_info(f"Using Aikido root CA from {cert_path}")
+                return pem
+            self.print_warn(f"No Aikido root CA found in {cert_path}")
+
+        # Source 2: macOS System Keychain, all matching certs by label prefix.
         if platform.system() == 'Darwin':
             try:
                 result = subprocess.run(
@@ -614,19 +645,40 @@ class FumitmPython:
             except Exception as e:
                 self.print_debug(f"Aikido keychain extraction failed: {e}")
 
-        # Source 2: maintained combined PEM on disk.
-        combined = descriptor['combined_pem']
-        if os.path.exists(combined):
-            try:
-                with open(combined, 'r') as f:
-                    roots = self._filter_certs_by_cn_prefix(f.read(), prefix)
-                if roots:
-                    self.print_info(f"Using Aikido root CA from {combined}")
-                    return '\n'.join(roots)
-            except Exception as e:
-                self.print_debug(f"Could not parse Aikido combined PEM: {e}")
+        # Source 3: maintained combined PEM written by the live Aikido agent.
+        pem = self._read_aikido_root_from_file(descriptor['combined_pem'], prefix)
+        if pem:
+            self.print_info(f"Using Aikido root CA from {descriptor['combined_pem']}")
+            return pem
+
+        # Source 4: a root persisted by an earlier fumitm run. This keeps
+        # --with-aikido working after the live agent is removed or unavailable.
+        persisted = os.path.expanduser(descriptor['cert_path'])
+        pem = self._read_aikido_root_from_file(persisted, prefix)
+        if pem:
+            self.print_info(f"Using previously saved Aikido root CA from {persisted}")
+            return pem
 
         self.print_warn("Could not extract Aikido root CA; skipping supplemental trust")
+        return None
+
+    def _read_aikido_root_from_file(self, path, cn_prefix):
+        """Return CN-prefix-filtered Aikido root PEM text from a file, or None.
+
+        Reads the file at ``path`` (if it exists), keeps only the certificate
+        blocks whose subject CN starts with ``cn_prefix``, and returns them
+        joined as PEM text. Returns None when the file is absent, unreadable, or
+        contains no matching root.
+        """
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            with open(path, 'r') as f:
+                roots = self._filter_certs_by_cn_prefix(f.read(), cn_prefix)
+            if roots:
+                return '\n'.join(roots)
+        except Exception as e:
+            self.print_debug(f"Could not parse Aikido root from {path}: {e}")
         return None
 
     def _filter_certs_by_cn_prefix(self, pem_text, cn_prefix):
@@ -1693,54 +1745,90 @@ class FumitmPython:
     def certificate_likely_exists_in_file(self, cert_file, target_file):
         """Fast certificate check using pure Python string matching.
 
-        This function uses no subprocess calls for performance. It extracts
-        the first 100 characters of base64 content from the certificate and
-        searches for that unique portion in the target file.
+        Verifies that *every* certificate in cert_file is present in
+        target_file, identifying each by the first 100 characters of its base64
+        body. This matters when cert_file holds more than one certificate — for
+        example several Aikido roots returned during a root rotation — since a
+        bundle missing a later root must not be reported as complete. Uses no
+        subprocess calls for performance.
 
         Args:
-            cert_file: Path to the certificate to search for
+            cert_file: Path to the certificate(s) to search for
             target_file: Path to the bundle file to search in
 
         Returns:
-            bool: True if certificate likely exists in target file
+            bool: True if every certificate in cert_file exists in target_file
         """
         if not os.path.exists(target_file) or not os.path.exists(cert_file):
             return False
 
         try:
-            # Extract base64 content from cert file (skip BEGIN/END markers)
-            with open(cert_file, 'r') as f:
-                cert_lines = []
-                in_cert = False
-                for line in f:
-                    if '-----BEGIN CERTIFICATE-----' in line:
-                        in_cert = True
-                    elif '-----END CERTIFICATE-----' in line:
-                        in_cert = False
-                    elif in_cert:
-                        cert_lines.append(line.strip())
+            unique_portions = self._cert_unique_portions(cert_file)
+            if not unique_portions:
+                return False
 
-                if not cert_lines:
-                    return False
-
-                # Get first 100 chars of base64 content - enough to be unique
-                cert_unique_portion = ''.join(cert_lines)[:100]
-
-            # Search for this unique portion in target file
+            # Normalize whitespace and require every certificate to be present.
             with open(target_file, 'r') as tf:
-                target_content = tf.read()
-                # Normalize whitespace for comparison
-                target_normalized = ''.join(target_content.split())
+                target_normalized = ''.join(tf.read().split())
 
-                if cert_unique_portion in target_normalized:
-                    self.print_debug(f"Certificate likely exists in {target_file} (found matching content)")
-                    return True
+            for unique_portion in unique_portions:
+                if unique_portion not in target_normalized:
+                    return False
+            self.print_debug(f"All certificates found in {target_file}")
+            return True
 
         except Exception as e:
             self.print_debug(f"Error checking certificate content: {e}")
 
         return False
-    
+
+    def _cert_unique_portions(self, cert_file):
+        """Return a unique base64 fingerprint per certificate in cert_file.
+
+        Each certificate is identified by the first 100 characters of its base64
+        body — enough to be unique while needing no subprocess calls. The list
+        preserves file order and is empty when the file holds no certificate.
+        """
+        unique_portions = []
+        current = []
+        in_cert = False
+        with open(cert_file, 'r') as f:
+            for line in f:
+                if '-----BEGIN CERTIFICATE-----' in line:
+                    in_cert = True
+                    current = []
+                elif '-----END CERTIFICATE-----' in line:
+                    in_cert = False
+                    body = ''.join(current)
+                    if body:
+                        unique_portions.append(body[:100])
+                elif in_cert:
+                    current.append(line.strip())
+        return unique_portions
+
+    def _any_cert_present_in_file(self, cert_file, target_file):
+        """Return True if at least one certificate from cert_file is in target_file.
+
+        This is the permissive counterpart to certificate_likely_exists_in_file.
+        It tells whether brew sourced any part of a multi-certificate provider
+        bundle (e.g. Netskope's combined root plus intermediate) from the
+        keychain: a bundle holding the root but not the intermediate still counts
+        as sourced, so the intermediate can be topped up by direct append rather
+        than reported as a keychain failure.
+        """
+        if not os.path.exists(target_file) or not os.path.exists(cert_file):
+            return False
+        try:
+            unique_portions = self._cert_unique_portions(cert_file)
+            if not unique_portions:
+                return False
+            with open(target_file, 'r') as tf:
+                target_normalized = ''.join(tf.read().split())
+            return any(portion in target_normalized for portion in unique_portions)
+        except Exception as e:
+            self.print_debug(f"Error checking certificate content: {e}")
+            return False
+
     def certificate_exists_in_file(self, cert_file, target_file):
         """Check if a certificate already exists in a file.
 
@@ -1913,81 +2001,116 @@ class FumitmPython:
             self.print_error(f"Failed to append certificate to {target_file}: {e}")
             return False
 
+    def _parse_fumitm_block(self, content):
+        """Split shell-config content into foreign lines and the managed block.
+
+        Returns a tuple of (other_lines, managed) where other_lines preserves
+        every line outside fumitm's managed block verbatim (user lines and any
+        vendor block such as Aikido's), and managed is an insertion-ordered dict
+        of the var->value pairs parsed from inside the block.
+
+        The last begin marker is paired with the first end marker that follows
+        it, so a stale unmatched begin marker left earlier in the file is treated
+        as foreign content rather than being closed by a fresh block's end marker.
+        A begin marker with no following end is malformed: all content is kept
+        verbatim and the block is reported empty so a fresh one is appended.
+        """
+        lines = content.splitlines()
+        begin_idx = None
+        for i, line in enumerate(lines):
+            if line.strip() == self._FUMITM_BLOCK_BEGIN:
+                begin_idx = i
+        if begin_idx is None:
+            return lines, {}
+
+        end_idx = None
+        for i in range(begin_idx + 1, len(lines)):
+            if lines[i].strip() == self._FUMITM_BLOCK_END:
+                end_idx = i
+                break
+        if end_idx is None:
+            self.print_warn(
+                "Found an unterminated fumitm block marker in the shell config; "
+                "leaving existing content untouched and appending a fresh block"
+            )
+            return lines, {}
+
+        managed = {}
+        for line in lines[begin_idx + 1:end_idx]:
+            stripped = line.strip()
+            if not stripped.startswith('export '):
+                continue
+            try:
+                name, rhs = stripped[len('export '):].split('=', 1)
+            except ValueError:
+                continue
+            rhs = rhs.strip()
+            if (rhs.startswith('"') and rhs.endswith('"')) or \
+                    (rhs.startswith("'") and rhs.endswith("'")):
+                rhs = rhs[1:-1]
+            managed[name.strip()] = rhs
+
+        other_lines = lines[:begin_idx] + lines[end_idx + 1:]
+        return other_lines, managed
+
+    def _render_fumitm_block(self, managed):
+        """Render the managed export block as text (double-quoted values)."""
+        body = [self._FUMITM_BLOCK_BEGIN]
+        body.extend(f'export {name}="{value}"' for name, value in managed.items())
+        body.append(self._FUMITM_BLOCK_END)
+        return '\n'.join(body)
+
     def add_to_shell_config(self, var_name, var_value, shell_config):
-        """Add export to shell config."""
-        # Check if the export already exists
+        """Upsert an export into fumitm's managed, always-last shell-config block.
+
+        fumitm keeps its TLS-trust exports in a single marker-delimited block that
+        is re-emitted at the end of the file on every write. This guarantees the
+        exports sit after any earlier vendor block (e.g. Aikido) so they win by
+        last-export-wins, without ever editing the vendor's block. A user's own
+        earlier export of the same variable is preserved but overridden.
+
+        Returns:
+            bool: True when the file changed (or would change in dry-run mode),
+            False on a no-op. The gcloud setup uses this to report pre-bootstrap.
+        """
+        original = None
         if os.path.exists(shell_config):
             with open(shell_config, 'r') as f:
-                content = f.read()
+                original = f.read()
 
-            # Find the first active (non-commented) export of this variable
-            # and compare its value to what we would write. If they already
-            # match, this is a no-op and we should not warn or prompt.
-            active_line = None
-            for line in content.splitlines():
-                stripped = line.strip()
-                if stripped.startswith('#'):
-                    continue
-                if stripped.startswith(f"export {var_name}="):
-                    active_line = stripped
-                    break
+        other_lines, managed = self._parse_fumitm_block(original or "")
+        managed[var_name] = var_value
 
-            if active_line is not None:
-                rhs = active_line.split('=', 1)[1].strip()
-                if (rhs.startswith('"') and rhs.endswith('"')) or \
-                        (rhs.startswith("'") and rhs.endswith("'")):
-                    rhs = rhs[1:-1]
-                if rhs == var_value:
-                    # Already set to the desired value — quietly do nothing
-                    # so repeated runs are idempotent and we don't claim a
-                    # change in the summary or trigger a stale "reload your
-                    # shell" hint.
-                    return
+        while other_lines and other_lines[-1].strip() == '':
+            other_lines.pop()
+        prefix = ('\n'.join(other_lines) + '\n\n') if other_lines else ''
+        new = prefix + self._render_fumitm_block(managed) + '\n'
 
-                self.print_warn(f"{var_name} already exists in {shell_config}")
-                self.print_info(f"Current value: {active_line}")
+        changed = original is None or new != original
 
-                if not self.is_install_mode():
-                    self.print_action(f"Would ask to update {var_name} in {shell_config}")
-                    self.print_action(f"Would set: export {var_name}=\"{var_value}\"")
-                else:
-                    response = self._prompt("Do you want to update it? (y/N) ")
-                    if response.lower() == 'y':
-                        # Comment out old entries
-                        lines = content.splitlines()
-                        new_lines = []
-                        for line in lines:
-                            if line.strip().startswith(f"export {var_name}="):
-                                new_lines.append(f"#{line}")
-                            else:
-                                new_lines.append(line)
-                        
-                        # Add new entry
-                        new_lines.append(f'export {var_name}="{var_value}"')
-                        
-                        # Write back
-                        with open(shell_config + '.bak', 'w') as f:
-                            f.write(content)
-                        self._fix_ownership(shell_config + '.bak')
-                        with open(shell_config, 'w') as f:
-                            f.write('\n'.join(new_lines) + '\n')
-                        self._fix_ownership(shell_config)
-
-                        self.shell_modified = True
-                        self.print_info(f"Updated {var_name} in {shell_config}")
-                return
-
-        # Variable doesn't exist, add it
         if not self.is_install_mode():
-            self.print_action(f"Would add to {shell_config}:")
-            self.print_action(f'export {var_name}="{var_value}"')
-        else:
-            with open(shell_config, 'a') as f:
-                f.write(f'\nexport {var_name}="{var_value}"\n')
-            self._fix_ownership(shell_config)
-            self.shell_modified = True
-            self.print_info(f"Added {var_name} to {shell_config}")
-    
+            if changed:
+                self.print_action(f"Would add to {shell_config}:")
+                self.print_action(f'export {var_name}="{var_value}"')
+            return changed
+
+        if not changed:
+            return False
+
+        if shell_config not in self._backed_up_shell_configs:
+            if original is not None:
+                with open(shell_config + '.bak', 'w') as f:
+                    f.write(original)
+                self._fix_ownership(shell_config + '.bak')
+            self._backed_up_shell_configs.add(shell_config)
+
+        with open(shell_config, 'w') as f:
+            f.write(new)
+        self._fix_ownership(shell_config)
+        self.shell_modified = True
+        self.print_info(f"Set {var_name} in {shell_config}")
+        return True
+
     def is_devcontainer(self):
         """Check if running inside a VS Code devcontainer."""
         # Check for devcontainer environment variables
@@ -2587,6 +2710,31 @@ class FumitmPython:
                 return False
         return True
 
+    def _status_container_certs_present(self, primary_cert_path, docker_certs_dir):
+        """Status-mode check that every proxy root is present in its own file.
+
+        Install writes the primary provider root and each supplemental root to
+        separate {container_cert_name}.crt files, so each must be checked in its
+        own file rather than expecting the primary file to contain them all. The
+        primary is compared against the supplied temp cert because status mode may
+        not have written cert_path. With no supplemental roots active this reduces
+        to the single primary-file check, preserving behavior.
+        """
+        primary_dest = os.path.join(
+            docker_certs_dir, f"{self.provider['container_cert_name']}.crt"
+        )
+        if not (os.path.exists(primary_dest)
+                and self.certificate_likely_exists_in_file(primary_cert_path, primary_dest)):
+            return False
+        for entry in self.extra_roots:
+            if not entry.get('path'):
+                continue
+            dest = os.path.join(docker_certs_dir, f"{entry['container_cert_name']}.crt")
+            if not (os.path.exists(dest)
+                    and self.certificate_likely_exists_in_file(entry['path'], dest)):
+                return False
+        return True
+
     def _install_container_certs(self, docker_certs_dir):
         """Copy every proxy root into ~/.docker/certs.d as {name}.crt."""
         self._safe_makedirs(docker_certs_dir)
@@ -2658,44 +2806,13 @@ class FumitmPython:
 
         if not os.path.exists(bundle_path):
             self.print_debug(f"Homebrew CA bundle not found at {bundle_path}")
+            self.print_info("Configuring Homebrew CA certificates...")
             if not self.is_install_mode():
-                self.print_info("Configuring Homebrew CA certificates...")
                 self.print_action(
                     "Would run: brew postinstall ca-certificates"
                 )
-            else:
-                self.print_info("Configuring Homebrew CA certificates...")
-                result = subprocess.run(
-                    ['brew', 'postinstall', 'ca-certificates'],
-                    capture_output=True, text=True
-                )
-                if result.returncode == 0:
-                    if self.certificate_exists_in_file(
-                        self.cert_path, bundle_path
-                    ):
-                        self.print_info(
-                            "Homebrew CA bundle now includes "
-                            "proxy certificate"
-                        )
-                        return ToolResult('brew-cacerts', 'configured', 'Bundle regenerated with proxy certificate')
-                    else:
-                        self.print_warn(
-                            "brew postinstall succeeded but proxy "
-                            "certificate not found in bundle"
-                        )
-                        self.print_warn(
-                            "The proxy CA may not be in the "
-                            "macOS system keychain"
-                        )
-                        return ToolResult('brew-cacerts', 'failed', 'Proxy certificate not found in bundle after postinstall')
-                else:
-                    self.print_error(
-                        "brew postinstall ca-certificates failed"
-                    )
-                    if result.stderr:
-                        self.print_debug(result.stderr.strip())
-                    return ToolResult('brew-cacerts', 'failed', 'brew postinstall ca-certificates failed')
-            return ToolResult('brew-cacerts', 'skipped', 'Dry run')
+                return ToolResult('brew-cacerts', 'skipped', 'Dry run')
+            return self._run_brew_postinstall(bundle_path)
 
         if self._all_roots_present_in_file(bundle_path):
             self.print_debug(
@@ -2708,38 +2825,59 @@ class FumitmPython:
             self.print_action(
                 "Would run: brew postinstall ca-certificates"
             )
-        else:
-            self.print_info(
-                "Regenerating Homebrew CA bundle to include proxy certificate..."
+            return ToolResult('brew-cacerts', 'skipped', 'Dry run')
+        self.print_info(
+            "Regenerating Homebrew CA bundle to include proxy certificate..."
+        )
+        return self._run_brew_postinstall(bundle_path)
+
+    def _run_brew_postinstall(self, bundle_path):
+        """Regenerate the Homebrew CA bundle and verify every proxy root landed.
+
+        brew rebuilds the bundle from the macOS system keychain. Certificates
+        that live only in the maintained combined PEM are therefore dropped: a
+        provider intermediate the keychain lacks (e.g. Netskope ships root plus
+        intermediate but the keychain holds only the root) and every supplemental
+        root (e.g. Aikido). Whatever is missing is appended to the regenerated
+        bundle directly. Failure is reported only when brew sourced no part of
+        the primary proxy CA, which signals the keychain is missing it entirely;
+        appending the primary there would be wiped on the next ca-certificates
+        upgrade, so the keychain problem is surfaced instead.
+        """
+        result = subprocess.run(
+            ['brew', 'postinstall', 'ca-certificates'],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            self.print_error("brew postinstall ca-certificates failed")
+            if result.stderr:
+                self.print_debug(result.stderr.strip())
+            return ToolResult('brew-cacerts', 'failed', 'brew postinstall ca-certificates failed')
+
+        if not self._any_cert_present_in_file(self.cert_path, bundle_path):
+            self.print_warn(
+                "brew postinstall succeeded but proxy certificate "
+                "not found in bundle"
             )
-            result = subprocess.run(
-                ['brew', 'postinstall', 'ca-certificates'],
-                capture_output=True, text=True
+            self.print_warn(
+                "The proxy CA may not be in the macOS system keychain"
             )
-            if result.returncode == 0:
-                if self.certificate_exists_in_file(
-                    self.cert_path, bundle_path
-                ):
-                    self.print_info(
-                        "Homebrew CA bundle now includes proxy certificate"
-                    )
-                    return ToolResult('brew-cacerts', 'configured', 'Bundle regenerated with proxy certificate')
-                else:
-                    self.print_warn(
-                        "brew postinstall succeeded but proxy certificate "
-                        "not found in bundle"
-                    )
-                    self.print_warn(
-                        "The proxy CA may not be in the macOS system keychain"
-                    )
-                    return ToolResult('brew-cacerts', 'failed', 'Proxy certificate not found in bundle after postinstall')
-            else:
-                self.print_error(
-                    "brew postinstall ca-certificates failed"
+            return ToolResult('brew-cacerts', 'failed', 'Proxy certificate not found in bundle after postinstall')
+
+        if not self._all_roots_present_in_file(bundle_path):
+            # brew sourced the primary root from the keychain but dropped certs
+            # that live only in the combined PEM (provider intermediate and any
+            # supplemental root); append the missing ones directly.
+            self._append_all_proxy_roots(bundle_path)
+            if not self._all_roots_present_in_file(bundle_path):
+                self.print_warn(
+                    "Proxy certificate could not be added to the "
+                    "Homebrew CA bundle"
                 )
-                if result.stderr:
-                    self.print_debug(result.stderr.strip())
-                return ToolResult('brew-cacerts', 'failed', 'brew postinstall ca-certificates failed')
+                return ToolResult('brew-cacerts', 'failed', 'Proxy certificate not found in bundle after postinstall')
+
+        self.print_info("Homebrew CA bundle now includes proxy certificate")
+        return ToolResult('brew-cacerts', 'configured', 'Bundle regenerated with proxy certificate')
 
     def setup_node_cert(self):
         """Setup Node.js certificate."""
@@ -3092,6 +3230,24 @@ class FumitmPython:
         except Exception as e:
             self.print_debug(f"Error checking pnpm cafile: {e}")
 
+    def _export_python_trust_vars(self, bundle, shell_config):
+        """Point every Python-ecosystem TLS-trust var at the both-roots bundle.
+
+        Includes the vars a supplemental-root vendor (e.g. Aikido) exports at its
+        own single-root bundle — PIP_CERT, POETRY_CERTIFICATES_PYPI_CERT, and
+        BUNDLE_SSL_CA_CERT — so pip/poetry/bundler trust both proxies, not just
+        the vendor's. Returns True if any export changed the shell config.
+        """
+        trust_vars = (
+            'SSL_CERT_FILE', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE',
+            'PIP_CERT', 'POETRY_CERTIFICATES_PYPI_CERT', 'BUNDLE_SSL_CA_CERT',
+        )
+        changed = False
+        for var in trust_vars:
+            if self.add_to_shell_config(var, bundle, shell_config):
+                changed = True
+        return changed
+
     def setup_python_cert(self):
         """Setup Python certificate."""
         if not self.command_exists('python3') and not self.command_exists('python'):
@@ -3168,13 +3324,16 @@ class FumitmPython:
                     # Check if the existing bundle looks suspicious (likely just WARP CA)
                     suspicious, reason = self.is_suspicious_full_bundle(requests_ca_bundle, self.cert_path)
                     if suspicious:
+                        # Repoint at fumitm's managed bundle, then fall through to
+                        # the trust-var post-pass below rather than returning here:
+                        # an early return would leave the vendor vars
+                        # (PIP_CERT/Poetry/Bundler) pointing at the old bundle.
                         needs_setup = True
                         self.print_info("Configuring Python certificate...")
                         self.print_warn(f"REQUESTS_CA_BUNDLE looks suspiciously small ({reason})")
                         if not self.is_install_mode():
                             self.print_action(f"Would create full CA bundle at {python_bundle}")
                             self.print_action(f"Would repoint REQUESTS_CA_BUNDLE to {python_bundle}")
-                            return ToolResult('python', 'skipped', 'Dry run')
                         else:
                             self.create_bundle_with_system_certs(python_bundle)
                             self._append_all_proxy_roots(python_bundle)
@@ -3182,10 +3341,11 @@ class FumitmPython:
                             self.add_to_shell_config("SSL_CERT_FILE", python_bundle, shell_config)
                             self.add_to_shell_config("CURL_CA_BUNDLE", python_bundle, shell_config)
                             self.print_info(f"Repointed REQUESTS_CA_BUNDLE to managed bundle: {python_bundle}")
-                            return ToolResult('python', 'configured', 'Repointed suspicious REQUESTS_CA_BUNDLE')
 
-                    # Check if the file contains our certificate using normalized comparison
-                    if not self._all_roots_present_in_file(requests_ca_bundle):
+                    # Check if the file contains our certificate using normalized
+                    # comparison. Only when the bundle was not suspicious — the
+                    # suspicious branch has already abandoned it for python_bundle.
+                    elif not self._all_roots_present_in_file(requests_ca_bundle):
                         needs_setup = True
                         self.print_info("Configuring Python certificate...")
                         self.print_info(f"REQUESTS_CA_BUNDLE is already set to: {requests_ca_bundle}")
@@ -3273,6 +3433,34 @@ class FumitmPython:
                     self.add_to_shell_config("SSL_CERT_FILE", python_bundle, shell_config)
                     self.print_info(f"Repointed SSL_CERT_FILE to managed bundle: {python_bundle}")
 
+        # Reclaim the Python-ecosystem trust vars a supplemental-root vendor
+        # (e.g. Aikido) may have exported at its own single-root bundle. Earlier
+        # branches above can exit while PIP_CERT/POETRY/BUNDLE_SSL_CA_CERT still
+        # point at an Aikido-only bundle, so assert all of them at the both-roots
+        # Python bundle whenever Aikido is active or any vendor var is present.
+        vendor_trust_vars = (
+            'PIP_CERT', 'POETRY_CERTIFICATES_PYPI_CERT', 'BUNDLE_SSL_CA_CERT'
+        )
+        aikido_active = any(e['key'] == 'aikido' for e in self.extra_roots)
+        if aikido_active or any(os.environ.get(v) for v in vendor_trust_vars):
+            bundle_repaired = False
+            if self.is_install_mode():
+                # A bundle built before Aikido was active is stale and would still
+                # be missing the Aikido root, so repair it before pointing vars at it.
+                if not os.path.exists(python_bundle):
+                    self.create_bundle_with_system_certs(python_bundle)
+                    self._append_all_proxy_roots(python_bundle)
+                    bundle_repaired = True
+                elif not self._all_roots_present_in_file(python_bundle):
+                    self._append_all_proxy_roots(python_bundle)
+                    bundle_repaired = True
+            else:
+                bundle_repaired = (not os.path.exists(python_bundle)) or \
+                    (not self._all_roots_present_in_file(python_bundle))
+            exported = self._export_python_trust_vars(python_bundle, shell_config)
+            if bundle_repaired or exported:
+                needs_setup = True
+
         if not needs_setup:
             return ToolResult('python', 'already_ok', 'Python certificate already configured')
         if self.is_install_mode():
@@ -3355,6 +3543,38 @@ class FumitmPython:
                 self.print_info(f"Created {properties_file} with custom_ca_certs_file")
         return True
 
+    def _ensure_gcloud_reauth_trust(self, complete_bundle, shell_config):
+        """Make gcloud's reauth handshake trust the full proxy bundle.
+
+        The IAP tunnel and ordinary API calls read core/custom_ca_certs_file, but
+        the reauth flow — the reauth.googleapis.com session handshake gcloud runs
+        when credentials need refreshing — goes through gcloud's bundled requests
+        library, which ignores that property and trusts REQUESTS_CA_BUNDLE, then
+        CURL_CA_BUNDLE, instead. A supplemental-root vendor such as Aikido exports
+        both at its own combined bundle, which carries the public roots and the
+        vendor root but not the primary proxy root (e.g. Netskope) that actually
+        intercepts Google traffic. The reauth handshake then fails with
+        "self-signed certificate in certificate chain" even though the property is
+        correct and ``gcloud projects list`` otherwise works.
+
+        Re-assert both variables at the complete fumitm bundle (public roots plus
+        every proxy root). The always-last managed block wins over the vendor's
+        earlier export by last-export-wins. This only acts when a supplemental
+        root is active, leaving the environment of plain single-provider hosts
+        untouched.
+
+        Returns:
+            bool: True when a shell-config export changed (or would change in
+            dry-run mode), False otherwise.
+        """
+        if not self.extra_roots:
+            return False
+        changed = False
+        for var in ("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
+            if self.add_to_shell_config(var, complete_bundle, shell_config):
+                changed = True
+        return changed
+
     def setup_gcloud_cert(self):
         """Setup gcloud certificate."""
         # Pre-create the gcloud properties file so that future gcloud installs
@@ -3366,20 +3586,15 @@ class FumitmPython:
             props_changed = self._ensure_gcloud_properties(python_bundle)
             shell_type = self.detect_shell()
             shell_config = self.get_shell_config(shell_type)
-            env_var = "CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE"
-            already_in_shell = False
-            if os.path.exists(shell_config):
-                with open(shell_config, 'r') as f:
-                    already_in_shell = (
-                        f'export {env_var}="{python_bundle}"'
-                        in f.read()
-                    )
-            self.add_to_shell_config(
-                env_var,
+            shell_changed = self.add_to_shell_config(
+                "CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE",
                 python_bundle,
                 shell_config,
             )
-            pre_bootstrap = props_changed or not already_in_shell
+            reauth_changed = self._ensure_gcloud_reauth_trust(
+                python_bundle, shell_config
+            )
+            pre_bootstrap = props_changed or shell_changed or reauth_changed
 
         if not self.command_exists('gcloud'):
             self.print_info("gcloud not found, skipping gcloud setup")
@@ -3439,6 +3654,8 @@ class FumitmPython:
             needs_setup = True
 
         if not needs_setup:
+            if pre_bootstrap and self.is_install_mode():
+                return ToolResult('gcloud', 'configured', 'Configured gcloud trust environment')
             return ToolResult('gcloud', 'already_ok', 'gcloud certificate already configured')
 
         self.print_info("Configuring gcloud certificate...")
@@ -4061,6 +4278,21 @@ class FumitmPython:
             return ToolResult('dbeaver', 'configured', 'Certificate added to DBeaver keystore')
         return ToolResult('dbeaver', 'failed', 'Failed to add certificate (may require sudo)')
     
+    def _last_active_wgetrc_ca(self, content):
+        """Return the path from the last active ca_certificate= line, or None.
+
+        wget honors the last directive, so the trust check must look at the final
+        non-commented ca_certificate= entry, not the first.
+        """
+        found = None
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith('#'):
+                continue
+            if stripped.startswith('ca_certificate='):
+                found = stripped.split('=', 1)[1].strip()
+        return found
+
     def setup_wget_cert(self):
         """Setup wget certificate."""
         if not self.command_exists('wget'):
@@ -4074,67 +4306,56 @@ class FumitmPython:
             return ToolResult('wget', 'already_ok', 'Works via system trust store')
 
         wgetrc_path = os.path.expanduser("~/.wgetrc")
-        config_line = f"ca_certificate={self.cert_path}"
+        wget_bundle = os.path.join(self.bundle_dir, "wget/ca-bundle.pem")
+        config_line = f"ca_certificate={wget_bundle}"
 
+        original = ''
         if os.path.exists(wgetrc_path):
             with open(wgetrc_path, 'r') as f:
-                content = f.read()
+                original = f.read()
 
-            if "ca_certificate=" in content:
-                # Check if it's already set to our certificate
-                if self.cert_path in content:
-                    return ToolResult('wget', 'already_ok', 'wget certificate already configured')
+        already_ok = (
+            self._last_active_wgetrc_ca(original) == wget_bundle
+            and os.path.exists(wget_bundle)
+            and self._all_roots_present_in_file(wget_bundle)
+        )
+        if already_ok:
+            return ToolResult('wget', 'already_ok', 'wget certificate already configured')
 
-                self.print_info("Configuring wget certificate...")
-                self.print_warn(f"wget ca_certificate is already set in {wgetrc_path}")
-
-                # Find current setting
-                for line in content.splitlines():
-                    if line.strip().startswith("ca_certificate="):
-                        self.print_info(f"Current setting: {line.strip()}")
-                        break
-
-                if not self.is_install_mode():
-                    self.print_action(f"Would ask to update the ca_certificate in {wgetrc_path}")
-                    self.print_action(f"Would set: {config_line}")
-                    return ToolResult('wget', 'skipped', 'Dry run')
-                else:
-                    response = self._prompt("Do you want to update it? (y/N) ")
-                    if response.lower() == 'y':
-                        # Comment out old entries
-                        lines = content.splitlines()
-                        new_lines = []
-                        for line in lines:
-                            if line.strip().startswith("ca_certificate="):
-                                new_lines.append(f"#{line}")
-                            else:
-                                new_lines.append(line)
-
-                        # Add new entry
-                        new_lines.append(config_line)
-
-                        # Write back
-                        with open(wgetrc_path + '.bak', 'w') as f:
-                            f.write(content)
-                        with open(wgetrc_path, 'w') as f:
-                            f.write('\n'.join(new_lines) + '\n')
-
-                        self.print_info(f"Updated wget configuration in {wgetrc_path}")
-                        return ToolResult('wget', 'configured', 'Updated wget configuration')
-                    return ToolResult('wget', 'skipped', 'User declined')
-
-        # File doesn't exist or doesn't have ca_certificate
         self.print_info("Configuring wget certificate...")
-
         if not self.is_install_mode():
-            self.print_action(f"Would add to {wgetrc_path}: {config_line}")
+            self.print_action(f"Would create wget CA bundle at {wget_bundle}")
+            self.print_action(f"Would set in {wgetrc_path}: {config_line}")
             return ToolResult('wget', 'skipped', 'Dry run')
-        else:
-            self.print_info(f"Adding configuration to {wgetrc_path}")
-            with open(wgetrc_path, 'a') as f:
-                f.write(f"\n{config_line}\n")
-            self.print_info("Added ca_certificate to wget configuration")
-            return ToolResult('wget', 'configured', 'Added ca_certificate to wget configuration')
+
+        # Build the both-roots bundle (primary + every supplemental root) so wget
+        # trusts whichever proxy intercepts the connection.
+        self._safe_makedirs(os.path.dirname(wget_bundle))
+        self.create_bundle_with_system_certs(wget_bundle)
+        self._append_all_proxy_roots(wget_bundle)
+
+        # Deterministically rewrite ~/.wgetrc: drop any active ca_certificate
+        # directives and append ours last so wget honors the both-roots bundle.
+        kept = [
+            line for line in original.splitlines()
+            if not line.strip().startswith('ca_certificate=')
+        ]
+        while kept and kept[-1].strip() == '':
+            kept.pop()
+        new = (('\n'.join(kept) + '\n\n') if kept else '') + config_line + '\n'
+
+        if wgetrc_path not in self._backed_up_shell_configs:
+            if os.path.exists(wgetrc_path):
+                with open(wgetrc_path + '.bak', 'w') as f:
+                    f.write(original)
+                self._fix_ownership(wgetrc_path + '.bak')
+            self._backed_up_shell_configs.add(wgetrc_path)
+
+        with open(wgetrc_path, 'w') as f:
+            f.write(new)
+        self._fix_ownership(wgetrc_path)
+        self.print_info(f"Configured wget ca_certificate to: {wget_bundle}")
+        return ToolResult('wget', 'configured', 'Configured wget ca_certificate')
     
     def _podman_vm_running(self):
         """Check whether a Podman machine is currently running."""
@@ -5578,35 +5799,29 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             # First, verify if wget can actually connect
             verify_result = self.verify_connection("wget")
 
+            wgetrc_path = os.path.expanduser("~/.wgetrc")
+            configured_ca = None
+            if os.path.exists(wgetrc_path):
+                with open(wgetrc_path, 'r') as f:
+                    configured_ca = self._last_active_wgetrc_ca(f.read())
+            has_all_roots = bool(
+                configured_ca and os.path.exists(configured_ca)
+                and self._status_roots_present(temp_warp_cert, configured_ca)
+            )
+
             if verify_result == "WORKING":
                 self.print_info("  ✓ wget can connect through proxy")
-
-                # Check config status (informational only)
-                wgetrc_path = os.path.expanduser("~/.wgetrc")
-                if os.path.exists(wgetrc_path):
-                    with open(wgetrc_path, 'r') as f:
-                        content = f.read()
-                    if "ca_certificate=" in content and self.cert_path in content:
-                        self.print_info("  ✓ wget configured with proxy certificate")
-                    else:
-                        self.print_info("  - Using system certificate trust (no custom CA needed)")
+                if has_all_roots:
+                    self.print_info("  ✓ wget configured with proxy certificate")
                 else:
                     self.print_info("  - Using system certificate trust (no custom CA needed)")
             else:
                 # wget doesn't work, check configuration
-                wgetrc_path = os.path.expanduser("~/.wgetrc")
-                if os.path.exists(wgetrc_path):
-                    with open(wgetrc_path, 'r') as f:
-                        content = f.read()
-                    if "ca_certificate=" in content and self.cert_path in content:
-                        self.print_warn("  ✗ wget configured but connection test failed")
-                        has_issues = True
-                    else:
-                        self.print_warn("  ✗ wget not configured with proxy certificate")
-                        has_issues = True
+                if has_all_roots:
+                    self.print_warn("  ✗ wget configured but connection test failed")
                 else:
-                    self.print_warn("  ✗ wget not configured")
-                    has_issues = True
+                    self.print_warn("  ✗ wget not configured with proxy certificate")
+                has_issues = True
         else:
             self.print_info("  - wget not installed")
         return has_issues
@@ -5623,7 +5838,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             cert_path = os.path.join(docker_certs_dir, f"{self.provider['container_cert_name']}.crt")
 
             if os.path.exists(cert_path):
-                if self._status_roots_present(temp_warp_cert, cert_path, likely=True):
+                if self._status_container_certs_present(temp_warp_cert, docker_certs_dir):
                     self.print_info("  ✓ Certificate installed in ~/.docker/certs.d/ (persistent)")
                 else:
                     self.print_warn("  ✗ Certificate in ~/.docker/certs.d/ is outdated")
@@ -5665,7 +5880,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             cert_path = os.path.join(docker_certs_dir, f"{self.provider['container_cert_name']}.crt")
 
             if os.path.exists(cert_path):
-                if self._status_roots_present(temp_warp_cert, cert_path, likely=True):
+                if self._status_container_certs_present(temp_warp_cert, docker_certs_dir):
                     self.print_info("  ✓ Certificate installed in ~/.docker/certs.d/ (persistent)")
                 else:
                     self.print_warn("  ✗ Certificate in ~/.docker/certs.d/ is outdated")
@@ -5705,7 +5920,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             )
 
             if os.path.exists(cert_path):
-                if self._status_roots_present(temp_warp_cert, cert_path, likely=True):
+                if self._status_container_certs_present(temp_warp_cert, docker_certs_dir):
                     self.print_info("  ✓ Certificate installed in ~/.docker/certs.d/ (persistent)")
                 else:
                     self.print_warn("  ✗ Certificate in ~/.docker/certs.d/ is outdated")
@@ -5755,7 +5970,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             cert_path = os.path.join(docker_certs_dir, f"{self.provider['container_cert_name']}.crt")
 
             if os.path.exists(cert_path):
-                if self._status_roots_present(temp_warp_cert, cert_path, likely=True):
+                if self._status_container_certs_present(temp_warp_cert, docker_certs_dir):
                     self.print_info("  ✓ Certificate installed in ~/.docker/certs.d/ (persistent)")
                 else:
                     self.print_warn("  ✗ Certificate in ~/.docker/certs.d/ is outdated")
@@ -5999,7 +6214,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             docker_certs_dir = os.path.expanduser("~/.docker/certs.d")
             cert_path = os.path.join(docker_certs_dir, f"{self.provider['container_cert_name']}.crt")
             if os.path.exists(cert_path):
-                if self._container_certs_present(docker_certs_dir):
+                if self._status_container_certs_present(temp_warp_cert, docker_certs_dir):
                     self.print_info(f"  ✓ Certificate installed in {docker_certs_dir}")
                     self.print_info("    (Used by: Docker, OrbStack, Colima, Podman, Rancher Desktop, Lima)")
                     self._print_docker_build_hint()
@@ -6354,7 +6569,12 @@ def main():
                         help='MITM proxy provider (default: auto-detect)')
     parser.add_argument('--with-aikido', action='store_true',
                         help='Force-add the Aikido Endpoint Protection root CA to all '
-                             'bundles even if it is not auto-detected')
+                             'bundles even if it is not auto-detected. On hosts with no '
+                             'live Aikido agent, supply the root via --aikido-cert or a '
+                             'previously saved ~/.aikido-ca.pem')
+    parser.add_argument('--aikido-cert', metavar='PATH',
+                        help='Path to a PEM file containing the Aikido root CA, used as '
+                             'the preferred source for --with-aikido on no-agent images')
     parser.add_argument('--no-aikido', action='store_true',
                         help='Do not add the Aikido root CA even if Aikido is detected')
     parser.add_argument('--yes', '-y', action='store_true',
@@ -6433,6 +6653,8 @@ def main():
 
     if args.with_aikido and args.no_aikido:
         parser.error('--with-aikido and --no-aikido are mutually exclusive')
+    if args.aikido_cert and args.no_aikido:
+        parser.error('--aikido-cert cannot be combined with --no-aikido')
 
     mode = 'install' if args.fix else 'status'
 
@@ -6455,6 +6677,7 @@ def main():
         run_as_user=args.run_as_user,
         with_aikido=args.with_aikido,
         no_aikido=args.no_aikido,
+        aikido_cert_file=args.aikido_cert,
     )
     exit_code = fumitm_instance.main()
     sys.exit(exit_code)

@@ -304,3 +304,443 @@ class TestAikidoResolution(FumitmTestCase):
         with patch('fumitm.FumitmPython._detect_aikido', return_value=True):
             inst = self.create_fumitm_instance(provider='warp', no_aikido=False)
         assert any(e['key'] == 'aikido' for e in inst.extra_roots)
+
+    def test_explicit_cert_file_implies_aikido_active(self, tmp_path):
+        """--aikido-cert forces Aikido on without auto-detection."""
+        cert = tmp_path / 'aikido-root.pem'
+        cert.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
+        with patch('fumitm.FumitmPython._detect_aikido', return_value=False):
+            inst = self.create_fumitm_instance(provider='warp', no_aikido=False,
+                                               aikido_cert_file=str(cert))
+        assert any(e['key'] == 'aikido' for e in inst.extra_roots)
+
+
+class TestAikidoForcedSources(FumitmTestCase):
+    """--with-aikido must work without a live agent: explicit file or persisted root."""
+
+    def test_explicit_cert_file_used_when_agent_absent(self, tmp_path):
+        """An operator-supplied PEM is the preferred source and bypasses the agent."""
+        cert = tmp_path / 'aikido-root.pem'
+        cert.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True,
+                                           aikido_cert_file=str(cert))
+        # Explicit source is consulted before keychain/PEM, so the no-agent host
+        # (Linux, no keychain) still yields the root.
+        with patch('fumitm.platform.system', return_value='Linux'), \
+             patch.object(inst, '_openssl_subject', side_effect=_fake_subject):
+            result = inst._get_aikido_root_cert()
+        assert result is not None
+        assert 'AIKIDOROOT' in result
+        assert 'AIKIDOINTERMEDIATE' not in result
+
+    def test_persisted_root_used_when_agent_absent(self, tmp_path, monkeypatch):
+        """A root saved by an earlier run is used when keychain and PEM are gone."""
+        monkeypatch.setenv('HOME', str(tmp_path))
+        persisted = tmp_path / '.aikido-ca.pem'
+        persisted.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+        miss = MagicMock(returncode=1, stdout='')
+        # Keychain misses and the combined PEM is treated as absent; only the
+        # persisted ~/.aikido-ca.pem remains.
+        with patch('fumitm.platform.system', return_value='Darwin'), \
+             patch('fumitm.subprocess.run', return_value=miss), \
+             patch('fumitm.os.path.exists', side_effect=lambda p: p == str(persisted)), \
+             patch.object(inst, '_openssl_subject', side_effect=_fake_subject):
+            result = inst._get_aikido_root_cert()
+        assert result is not None
+        assert 'AIKIDOROOT' in result
+
+    def test_explicit_cert_with_no_matching_root_falls_through(self, tmp_path, monkeypatch):
+        """An explicit file lacking an Aikido root warns and yields nothing usable."""
+        monkeypatch.setenv('HOME', str(tmp_path))
+        cert = tmp_path / 'unrelated.pem'
+        cert.write_text(mock_data.MOCK_CERTIFICATE)
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True,
+                                           aikido_cert_file=str(cert))
+        miss = MagicMock(returncode=1, stdout='')
+        with patch('fumitm.platform.system', return_value='Darwin'), \
+             patch('fumitm.subprocess.run', return_value=miss), \
+             patch('fumitm.os.path.exists', side_effect=lambda p: p == str(cert)), \
+             patch.object(inst, '_openssl_subject', side_effect=_fake_subject):
+            # The primary cert's CN does not start with the Aikido prefix, so the
+            # filter drops it and no other source is available.
+            assert inst._get_aikido_root_cert() is None
+
+
+class TestAikidoContainerStatus(FumitmTestCase):
+    """Container status checks each root in its own split file, not all in one."""
+
+    def test_split_files_checked_separately(self, tmp_path):
+        certs_dir = tmp_path / 'certs.d'
+        certs_dir.mkdir()
+        primary_temp = tmp_path / 'primary_temp.pem'
+        primary_temp.write_text(mock_data.MOCK_CERTIFICATE)
+        aikido = tmp_path / 'aikido.pem'
+        aikido.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
+        inst = _aikido_instance_with_root(aikido)
+
+        # Only the primary split file is present: the supplemental root is still
+        # missing, so the persistent location is incomplete.
+        (certs_dir / 'cloudflare-warp.crt').write_text(mock_data.MOCK_CERTIFICATE)
+        assert inst._status_container_certs_present(
+            str(primary_temp), str(certs_dir)) is False
+
+        # Adding the Aikido split file completes it.
+        (certs_dir / 'aikido.crt').write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
+        assert inst._status_container_certs_present(
+            str(primary_temp), str(certs_dir)) is True
+
+    def test_reduces_to_single_root_without_aikido(self, tmp_path):
+        certs_dir = tmp_path / 'certs.d'
+        certs_dir.mkdir()
+        primary_temp = tmp_path / 'primary_temp.pem'
+        primary_temp.write_text(mock_data.MOCK_CERTIFICATE)
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+
+        assert inst._status_container_certs_present(
+            str(primary_temp), str(certs_dir)) is False
+        (certs_dir / 'cloudflare-warp.crt').write_text(mock_data.MOCK_CERTIFICATE)
+        assert inst._status_container_certs_present(
+            str(primary_temp), str(certs_dir)) is True
+
+
+class TestAikidoBrewPostinstall(FumitmTestCase):
+    """brew regenerates from the keychain; supplemental roots are appended directly."""
+
+    def test_appends_supplemental_root_brew_omitted(self, tmp_path):
+        primary = tmp_path / 'primary.pem'
+        primary.write_text(mock_data.MOCK_CERTIFICATE)
+        aikido = tmp_path / 'aikido.pem'
+        aikido.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
+        # brew rebuilds the bundle from the keychain and includes only the
+        # primary provider root (Aikido lives in the combined PEM, not the keychain).
+        bundle = tmp_path / 'cert.pem'
+        bundle.write_text(mock_data.MOCK_CERTIFICATE + '\n')
+
+        inst = _aikido_instance_with_root(aikido)
+        inst.cert_path = str(primary)
+        inst.mode = 'install'
+
+        ok = MagicMock(returncode=0, stdout='', stderr='')
+        with patch('fumitm.subprocess.run', return_value=ok):
+            result = inst._run_brew_postinstall(str(bundle))
+
+        assert result.status == 'configured'
+        body = bundle.read_text()
+        assert mock_data.MOCK_CERTIFICATE.strip() in body
+        assert mock_data.MOCK_AIKIDO_ROOT_CERT.strip() in body
+
+    def test_fails_when_primary_root_absent(self, tmp_path):
+        primary = tmp_path / 'primary.pem'
+        primary.write_text(mock_data.MOCK_CERTIFICATE)
+        # brew succeeds but the proxy CA is not in the keychain, so the bundle
+        # never gains the primary root.
+        bundle = tmp_path / 'cert.pem'
+        bundle.write_text('-----BEGIN CERTIFICATE-----\nOTHER\n-----END CERTIFICATE-----\n')
+
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+        inst.cert_path = str(primary)
+        inst.mode = 'install'
+
+        ok = MagicMock(returncode=0, stdout='', stderr='')
+        with patch('fumitm.subprocess.run', return_value=ok):
+            result = inst._run_brew_postinstall(str(bundle))
+        assert result.status == 'failed'
+
+    def test_appends_provider_intermediate_brew_omitted(self, tmp_path):
+        # Netskope's cert_path is a combined root+intermediate PEM. brew rebuilds
+        # the bundle from the keychain, which holds only the root, so the
+        # intermediate is dropped. Because the root *was* sourced, this is not a
+        # keychain failure: the intermediate must be topped up, not reported as
+        # failed. The second block stands in for a provider intermediate.
+        combined = tmp_path / 'combined.pem'
+        combined.write_text(
+            mock_data.MOCK_CERTIFICATE + '\n'
+            + mock_data.MOCK_AIKIDO_INTERMEDIATE_CERT
+        )
+        bundle = tmp_path / 'cert.pem'
+        bundle.write_text(mock_data.MOCK_CERTIFICATE + '\n')
+
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+        inst.cert_path = str(combined)
+        inst.mode = 'install'
+
+        ok = MagicMock(returncode=0, stdout='', stderr='')
+        with patch('fumitm.subprocess.run', return_value=ok):
+            result = inst._run_brew_postinstall(str(bundle))
+
+        assert result.status == 'configured'
+        body = bundle.read_text()
+        assert mock_data.MOCK_CERTIFICATE.strip() in body
+        assert mock_data.MOCK_AIKIDO_INTERMEDIATE_CERT.strip() in body
+
+
+def _seed_system_certs(path):
+    """Stand-in for create_bundle_with_system_certs: seed a public-root marker."""
+    with open(path, 'w') as f:
+        f.write('-----BEGIN CERTIFICATE-----\nSYSTEMROOT\n-----END CERTIFICATE-----\n')
+    return True
+
+
+class TestAikidoPythonTrustVars(FumitmTestCase):
+    """With Aikido active, setup_python_cert reclaims the vendor-set Python vars."""
+
+    def test_vendor_vars_exported_to_both_roots_bundle(self, tmp_path, monkeypatch):
+        home = tmp_path / 'home'
+        home.mkdir()
+        monkeypatch.setenv('HOME', str(home))
+        for var in ('REQUESTS_CA_BUNDLE', 'SSL_CERT_FILE', 'CURL_CA_BUNDLE',
+                    'PIP_CERT', 'POETRY_CERTIFICATES_PYPI_CERT', 'BUNDLE_SSL_CA_CERT'):
+            monkeypatch.delenv(var, raising=False)
+
+        primary = tmp_path / 'primary.pem'
+        primary.write_text(mock_data.MOCK_CERTIFICATE)
+        aikido = tmp_path / 'aikido.pem'
+        aikido.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
+        shell_config = home / '.zshrc'
+
+        inst = _aikido_instance_with_root(aikido)
+        inst.mode = 'install'
+        inst.cert_path = str(primary)
+
+        with patch.object(inst, 'command_exists', side_effect=lambda c: c == 'python3'), \
+             patch.object(inst, 'detect_shell', return_value='zsh'), \
+             patch.object(inst, 'get_shell_config', return_value=str(shell_config)), \
+             patch.object(inst, 'create_bundle_with_system_certs',
+                          side_effect=_seed_system_certs):
+            result = inst.setup_python_cert()
+
+        python_bundle = str(home / '.python-ca-bundle.pem')
+        content = shell_config.read_text()
+        for var in ('SSL_CERT_FILE', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE',
+                    'PIP_CERT', 'POETRY_CERTIFICATES_PYPI_CERT', 'BUNDLE_SSL_CA_CERT'):
+            assert f'export {var}="{python_bundle}"' in content
+        # All six live in a single managed block.
+        assert content.count(inst._FUMITM_BLOCK_BEGIN) == 1
+        assert result.status == 'configured'
+
+    def test_suspicious_requests_bundle_still_reclaims_vendor_vars(
+            self, tmp_path, monkeypatch):
+        # A writable but suspicious REQUESTS_CA_BUNDLE used to return early after
+        # repointing only the three core vars, leaving PIP_CERT/Poetry/Bundler at
+        # the vendor bundle. The suspicious path must now fall through to the
+        # trust-var post-pass so every Python var lands on the both-roots bundle.
+        home = tmp_path / 'home'
+        home.mkdir()
+        monkeypatch.setenv('HOME', str(home))
+
+        suspicious = tmp_path / 'vendor-only.pem'
+        suspicious.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)  # single cert -> suspicious
+        monkeypatch.setenv('REQUESTS_CA_BUNDLE', str(suspicious))
+        monkeypatch.setenv('PIP_CERT', str(suspicious))
+        for var in ('SSL_CERT_FILE', 'CURL_CA_BUNDLE',
+                    'POETRY_CERTIFICATES_PYPI_CERT', 'BUNDLE_SSL_CA_CERT'):
+            monkeypatch.delenv(var, raising=False)
+
+        primary = tmp_path / 'primary.pem'
+        primary.write_text(mock_data.MOCK_CERTIFICATE)
+        aikido = tmp_path / 'aikido.pem'
+        aikido.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
+        shell_config = home / '.zshrc'
+
+        inst = _aikido_instance_with_root(aikido)
+        inst.mode = 'install'
+        inst.cert_path = str(primary)
+
+        with patch.object(inst, 'command_exists', side_effect=lambda c: c == 'python3'), \
+             patch.object(inst, 'detect_shell', return_value='zsh'), \
+             patch.object(inst, 'get_shell_config', return_value=str(shell_config)), \
+             patch.object(inst, 'create_bundle_with_system_certs',
+                          side_effect=_seed_system_certs):
+            result = inst.setup_python_cert()
+
+        python_bundle = str(home / '.python-ca-bundle.pem')
+        content = shell_config.read_text()
+        for var in ('SSL_CERT_FILE', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE',
+                    'PIP_CERT', 'POETRY_CERTIFICATES_PYPI_CERT', 'BUNDLE_SSL_CA_CERT'):
+            assert f'export {var}="{python_bundle}"' in content
+        # The vendor bundle is no longer referenced by any managed export.
+        assert str(suspicious) not in content
+        assert result.status == 'configured'
+
+
+class TestAikidoGcloudReauthTrust(FumitmTestCase):
+    """With Aikido active, setup_gcloud_cert reclaims the reauth trust vars.
+
+    gcloud's reauth handshake runs through the bundled requests library, which
+    honors REQUESTS_CA_BUNDLE then CURL_CA_BUNDLE rather than
+    core/custom_ca_certs_file. Aikido exports both at its own bundle, which lacks
+    the primary proxy root, so reauth fails with "self-signed certificate in
+    certificate chain" even when the gcloud property is correct. The gcloud setup
+    must therefore re-assert both vars at the both-roots bundle.
+    """
+
+    def test_reauth_vars_reclaimed_when_aikido_active(self, tmp_path, monkeypatch):
+        home = tmp_path / 'home'
+        home.mkdir()
+        monkeypatch.setenv('HOME', str(home))
+        python_bundle = home / '.python-ca-bundle.pem'
+        python_bundle.write_text(mock_data.MOCK_CERTIFICATE)
+        aikido = tmp_path / 'aikido.pem'
+        aikido.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
+        shell_config = home / '.zshrc'
+
+        inst = _aikido_instance_with_root(aikido)
+        inst.mode = 'install'
+
+        # gcloud already points at the both-roots bundle, so the property path is
+        # a no-op; the reauth env vars are the only thing left to fix.
+        get_value = MagicMock(returncode=0, stdout=str(python_bundle))
+        with patch.object(inst, 'command_exists', return_value=True), \
+             patch.object(inst, '_ensure_gcloud_properties', return_value=False), \
+             patch.object(inst, 'detect_shell', return_value='zsh'), \
+             patch.object(inst, 'get_shell_config', return_value=str(shell_config)), \
+             patch.object(inst, 'is_suspicious_full_bundle', return_value=(False, None)), \
+             patch.object(inst, '_all_roots_present_in_file', return_value=True), \
+             patch('fumitm.subprocess.run', return_value=get_value):
+            result = inst.setup_gcloud_cert()
+
+        content = shell_config.read_text()
+        for var in ('REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE'):
+            assert f'export {var}="{python_bundle}"' in content
+        # The reclaimed vars live in the always-last managed block so they win
+        # over Aikido's earlier vendor export by last-export-wins.
+        assert content.count(inst._FUMITM_BLOCK_BEGIN) == 1
+        # A reauth-only change must be reported, not masked as already_ok.
+        assert result.status == 'configured'
+
+    def test_reauth_vars_untouched_without_supplemental_root(
+            self, tmp_path, monkeypatch):
+        home = tmp_path / 'home'
+        home.mkdir()
+        monkeypatch.setenv('HOME', str(home))
+        python_bundle = home / '.python-ca-bundle.pem'
+        python_bundle.write_text(mock_data.MOCK_CERTIFICATE)
+        shell_config = home / '.zshrc'
+
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+        inst.mode = 'install'
+
+        get_value = MagicMock(returncode=0, stdout=str(python_bundle))
+        with patch.object(inst, 'command_exists', return_value=True), \
+             patch.object(inst, '_ensure_gcloud_properties', return_value=False), \
+             patch.object(inst, 'detect_shell', return_value='zsh'), \
+             patch.object(inst, 'get_shell_config', return_value=str(shell_config)), \
+             patch.object(inst, 'is_suspicious_full_bundle', return_value=(False, None)), \
+             patch.object(inst, '_all_roots_present_in_file', return_value=True), \
+             patch('fumitm.subprocess.run', return_value=get_value):
+            inst.setup_gcloud_cert()
+
+        content = shell_config.read_text()
+        # Plain single-provider hosts keep only the gcloud property var; the
+        # Python/curl trust vars are left to setup_python_cert.
+        assert 'CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE' in content
+        assert 'REQUESTS_CA_BUNDLE' not in content
+        assert 'CURL_CA_BUNDLE' not in content
+
+
+class TestAikidoWget(FumitmTestCase):
+    """wget gets a both-roots bundle; the status check reads the last directive."""
+
+    def test_setup_wget_writes_both_roots_bundle(self, tmp_path, monkeypatch):
+        home = tmp_path / 'home'
+        home.mkdir()
+        monkeypatch.setenv('HOME', str(home))
+        primary = tmp_path / 'primary.pem'
+        primary.write_text(mock_data.MOCK_CERTIFICATE)
+        aikido = tmp_path / 'aikido.pem'
+        aikido.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
+
+        inst = _aikido_instance_with_root(aikido)
+        inst.mode = 'install'
+        inst.cert_path = str(primary)
+        inst.bundle_dir = str(home / '.netskope')
+
+        with patch.object(inst, 'command_exists', side_effect=lambda c: c == 'wget'), \
+             patch.object(inst, 'verify_connection', return_value='FAILED'), \
+             patch.object(inst, 'create_bundle_with_system_certs',
+                          side_effect=_seed_system_certs):
+            result = inst.setup_wget_cert()
+
+        wget_bundle = home / '.netskope' / 'wget' / 'ca-bundle.pem'
+        wgetrc = home / '.wgetrc'
+        assert result.status == 'configured'
+        assert wget_bundle.exists()
+        body = wget_bundle.read_text()
+        assert mock_data.MOCK_CERTIFICATE.strip() in body
+        assert mock_data.MOCK_AIKIDO_ROOT_CERT.strip() in body
+        assert f'ca_certificate={wget_bundle}' in wgetrc.read_text()
+
+    def test_last_active_wgetrc_ca_picks_last_uncommented(self):
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+        content = (
+            '#ca_certificate=/commented.pem\n'
+            'ca_certificate=/first.pem\n'
+            'ca_certificate=/second.pem\n'
+        )
+        assert inst._last_active_wgetrc_ca(content) == '/second.pem'
+        assert inst._last_active_wgetrc_ca('# nothing here\n') is None
+
+
+class TestAikidoCertFileExpansion(FumitmTestCase):
+    """--aikido-cert is stored raw and expanded at read time, after user targeting
+    may have rewritten HOME (sudo / --run-as-user)."""
+
+    def test_stored_raw_not_expanded_at_construction(self):
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True,
+                                           aikido_cert_file='~/aikido-root.pem')
+        assert inst.aikido_cert_file == '~/aikido-root.pem'
+
+    def test_expanded_against_current_home_at_read_time(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('HOME', str(tmp_path))
+        cert = tmp_path / 'aikido-root.pem'
+        cert.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True,
+                                           aikido_cert_file='~/aikido-root.pem')
+        # Linux skips the keychain; the tilde must resolve under the (mocked) HOME.
+        with patch('fumitm.platform.system', return_value='Linux'), \
+             patch.object(inst, '_openssl_subject', side_effect=_fake_subject):
+            result = inst._get_aikido_root_cert()
+        assert result is not None
+        assert 'AIKIDOROOT' in result
+
+
+class TestMultiRootMatching(FumitmTestCase):
+    """A multi-certificate source is reported present only when every cert is in
+    the bundle (e.g. several Aikido roots returned during a rotation)."""
+
+    def test_every_block_must_be_present(self, tmp_path):
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+        two_roots = tmp_path / 'two_roots.pem'
+        two_roots.write_text(
+            mock_data.MOCK_AIKIDO_ROOT_CERT + '\n'
+            + mock_data.MOCK_AIKIDO_INTERMEDIATE_CERT
+        )
+
+        # Bundle holds only the first root -> the second is missing.
+        first_only = tmp_path / 'first_only.pem'
+        first_only.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
+        assert inst.certificate_likely_exists_in_file(
+            str(two_roots), str(first_only)) is False
+        assert inst.certificate_exists_in_file(
+            str(two_roots), str(first_only)) is False
+
+        # Bundle holds both -> complete.
+        both = tmp_path / 'both.pem'
+        both.write_text(
+            mock_data.MOCK_AIKIDO_ROOT_CERT + '\n'
+            + mock_data.MOCK_AIKIDO_INTERMEDIATE_CERT
+        )
+        assert inst.certificate_likely_exists_in_file(
+            str(two_roots), str(both)) is True
+
+    def test_single_cert_behaviour_unchanged(self, tmp_path):
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+        single = tmp_path / 'single.pem'
+        single.write_text(mock_data.MOCK_CERTIFICATE)
+        bundle = tmp_path / 'bundle.pem'
+        bundle.write_text('PREFIX\n' + mock_data.MOCK_CERTIFICATE + '\nSUFFIX\n')
+        assert inst.certificate_likely_exists_in_file(str(single), str(bundle)) is True
+        empty = tmp_path / 'empty.pem'
+        empty.write_text('')
+        assert inst.certificate_likely_exists_in_file(str(single), str(empty)) is False

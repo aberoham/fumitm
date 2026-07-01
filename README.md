@@ -98,10 +98,12 @@ the primary provider's root — never replacing it, since traffic Aikido does no
 intercept still presents the underlying provider's certificate. This matters for
 rustls clients such as `uv`, which honor `SSL_CERT_FILE`: a bundle missing the
 Aikido root fails Aikido-intercepted hosts with `invalid peer certificate:
-UnknownIssuer`. Use `--with-aikido` to force the supplemental root on (handy in
-CI where the detection signals are absent) or `--no-aikido` to skip it. Aikido
-support currently targets macOS/Linux (`fumitm.py`); the Windows port does not
-yet add the Aikido root.
+UnknownIssuer`. Use `--with-aikido` to force the supplemental root on or
+`--no-aikido` to skip it. On a CI or no-agent image where the live detection
+signals are absent, supply the root with `--aikido-cert /path/to/aikido-root.pem`
+(it implies `--with-aikido`); fumitm also reuses a root persisted at
+`~/.aikido-ca.pem` from an earlier run. Aikido support currently targets
+macOS/Linux (`fumitm.py`); the Windows port does not yet add the Aikido root.
 
 ### Windows-Specific
 - `warp-cli.exe` command must be available 
