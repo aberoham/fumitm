@@ -42,6 +42,12 @@ chmod +x ./fumitm.py
 ./fumitm.py --fix --provider warp
 ./fumitm.py --fix --provider netskope
 
+# Aikido Endpoint Protection (supplemental TLS interception) is auto-detected
+# and its root CA is added to every bundle alongside the primary provider.
+# Force it on (e.g. in CI where detection signals are absent) or off:
+./fumitm.py --fix --with-aikido
+./fumitm.py --fix --no-aikido
+
 # Running in a devcontainer/WSL?
 # See the "VS Code Devcontainers / WSL" section below.
 ```
@@ -81,6 +87,23 @@ The act of toggling your MITM off also seriously hints that you have no clue wha
 - Cloudflare WARP or Netskope Client should be installed and connected
 - `warp-cli` is needed for WARP flows. Netskope auto-detection uses known certificate paths or a running STAgent process (`nsdiag` is optional)
 - Python 3 (macOS/Linux, Windows/WSL)
+
+### Supplemental root CAs (Aikido)
+
+Some environments run **Aikido Endpoint Protection** performing *selective* TLS
+interception on top of the primary provider. fumitm auto-detects Aikido (via its
+`AikidoSecurity` support directory, combined PEM, or System Keychain entry) and
+adds the **Aikido root CA** to every bundle and keystore it manages, alongside
+the primary provider's root — never replacing it, since traffic Aikido does not
+intercept still presents the underlying provider's certificate. This matters for
+rustls clients such as `uv`, which honor `SSL_CERT_FILE`: a bundle missing the
+Aikido root fails Aikido-intercepted hosts with `invalid peer certificate:
+UnknownIssuer`. Use `--with-aikido` to force the supplemental root on or
+`--no-aikido` to skip it. On a CI or no-agent image where the live detection
+signals are absent, supply the root with `--aikido-cert /path/to/aikido-root.pem`
+(it implies `--with-aikido`); fumitm also reuses a root persisted at
+`~/.aikido-ca.pem` from an earlier run. Aikido support currently targets
+macOS/Linux (`fumitm.py`); the Windows port does not yet add the Aikido root.
 
 ### Windows-Specific
 - `warp-cli.exe` command must be available 

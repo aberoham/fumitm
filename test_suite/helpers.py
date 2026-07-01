@@ -197,11 +197,14 @@ class FumitmTestCase:
                                selected_tools=None, provider='warp',
                                auto_yes=False, no_color=False,
                                headless=False, skip_update_check=False,
-                               run_as_user=None, **kwargs):
+                               run_as_user=None, no_aikido=True, **kwargs):
         """Create a FumitmPython instance with proper mocking.
 
         Defaults to provider='warp' to skip auto-detection, which would
         otherwise trigger subprocess calls (pgrep) that consume mock responses.
+        Defaults to no_aikido=True so supplemental-root detection does not run
+        against the host (which may actually have Aikido installed); tests that
+        exercise Aikido pass no_aikido=False or with_aikido=True explicitly.
         """
         import fumitm
         with patch('platform.system', return_value='Darwin'):
@@ -215,6 +218,7 @@ class FumitmTestCase:
                 headless=headless,
                 skip_update_check=skip_update_check,
                 run_as_user=run_as_user,
+                no_aikido=no_aikido,
                 **kwargs,
             )
 
