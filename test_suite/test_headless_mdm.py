@@ -121,20 +121,30 @@ class TestNonInteractiveError(FumitmTestCase):
             assert result == 'y'
 
     def test_main_catches_non_interactive_error(self):
-        """NonInteractiveError in main() returns exit code 2."""
+        """NonInteractiveError raised during a setup makes main() return exit code 2."""
         instance = self.create_fumitm_instance(mode='install')
+
+        # Replace the registry with a single tool whose setup deterministically
+        # needs interactive input, so the test does not depend on the host's
+        # real tools happening to prompt. The real _prompt raises
+        # NonInteractiveError because stdin is not a TTY and --yes is off.
+        def prompting_setup():
+            instance._prompt("Continue? (y/N) ")
+
+        instance.tools_registry = {
+            'fake': {
+                'name': 'Fake Tool', 'tags': [], 'scope': 'system',
+                'setup_func': prompting_setup, 'check_func': None,
+            }
+        }
+
         with patch.object(instance, 'check_for_updates'), \
              patch.object(instance, 'is_devcontainer', return_value=False), \
              patch.object(instance, 'check_environment_sanity'), \
              patch.object(instance, 'check_ownership_sanity'), \
              patch.object(instance, 'download_certificate', return_value=True), \
-             patch.object(
-                 instance, '_prompt',
-                 side_effect=NonInteractiveError("stdin not a TTY")
-             ), \
              patch('sys.stdin') as mock_stdin:
             mock_stdin.isatty.return_value = False
-            # Force a code path that calls _prompt
             exit_code = instance.main()
             assert exit_code == 2
 

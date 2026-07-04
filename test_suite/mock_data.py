@@ -160,6 +160,31 @@ NETSKOPE_CERT_PATHS_LINUX = ['/opt/netskope/stagent/data/nscacert.pem']
 # Netskope mock certificate (reuses the same cert format for testing)
 MOCK_NETSKOPE_CERTIFICATE = MOCK_CERTIFICATE
 
+# Aikido Endpoint Protection (supplemental root CA) test data.
+AIKIDO_SUPPORT_DIR = '/Library/Application Support/AikidoSecurity/'
+AIKIDO_COMBINED_PEM = (
+    '/Library/Application Support/AikidoSecurity/'
+    'EndpointProtection/run/endpoint-protection-pip-combined-ca.pem'
+)
+# The keychain/subject CN starts with this prefix; the org suffix varies.
+AIKIDO_ROOT_CN = 'Aikido Endpoint Protection Root CA - org-101951'
+# The interception intermediate has an ephemeral hex CN that must be rejected.
+AIKIDO_INTERMEDIATE_CN = '9679a1b2c3d4e5f600112233445566778899aabbccddeeff00112233679dd'
+
+# Distinct body markers let mocked openssl map a PEM block back to its subject.
+MOCK_AIKIDO_ROOT_CERT = """-----BEGIN CERTIFICATE-----
+AIKIDOROOTMIIEjTCCA3WgAwIBAgISA2Q1Q5XQHgYE8xhA9PkyCgypMA0GCSqGSIb3
+DQEBCwUAMDIxCzAJBgNVBAYTAlVTAIKIDOROOTBODYAAAAAAAAAAAAAAAAAAAAAAAA
+-----END CERTIFICATE-----"""
+
+MOCK_AIKIDO_INTERMEDIATE_CERT = """-----BEGIN CERTIFICATE-----
+AIKIDOINTERMEDIATEMIIEjTCCA3WgAwIBAgISA2Q1Q5XQHgYE8xhA9PkyCgypMA0G
+CSqGSIb3DQEBCwUAMDIxCzAJBgNVBAYTAlVTAIKIDOINTERMEDIATEBODYAAAAAAAA
+-----END CERTIFICATE-----"""
+
+# Concatenation as returned by `security find-certificate -a` or the combined PEM.
+MOCK_AIKIDO_KEYCHAIN_OUTPUT = MOCK_AIKIDO_ROOT_CERT + "\n" + MOCK_AIKIDO_INTERMEDIATE_CERT
+
 # Shell detection outputs
 SHELL_PS_BASH = "/bin/bash"
 SHELL_PS_ZSH = "/bin/zsh"

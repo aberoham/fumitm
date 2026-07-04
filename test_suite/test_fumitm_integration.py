@@ -806,7 +806,8 @@ class TestCLIAndWorkflow(FumitmTestCase):
     _DEFAULT_NEW_KWARGS = dict(
         no_color=False, headless=False, skip_update_check=False,
         log_file=None, log_dir=None, json_log_file=None, json_log_dir=None,
-        run_as_user=None,
+        run_as_user=None, with_aikido=False, no_aikido=False,
+        aikido_cert_file=None,
     )
 
     @patch('fumitm.sys.argv', ['fumitm.py', '--fix'])
@@ -1261,14 +1262,17 @@ class TestBundleCreation(FumitmTestCase):
         with patch('platform.system', return_value='Darwin'):
             instance = fumitm.FumitmPython(mode='install')
 
-            # Mock os.path.exists: neither system cert location exists
+            # Mock os.path.exists: neither system cert location exists.
+            # The assertions run outside this patch because Python 3.13's
+            # pathlib.Path.exists() delegates to os.path.exists(), so a global
+            # patch would otherwise mask the file the method actually created.
             with patch('os.path.exists', return_value=False):
                 result = instance.create_bundle_with_system_certs(str(target_bundle))
 
-                # Should create empty file and return False
-                assert result is False
-                assert target_bundle.exists()
-                assert target_bundle.read_text() == ""
+            # Should create empty file and return False
+            assert result is False
+            assert target_bundle.exists()
+            assert target_bundle.read_text() == ""
 
     def test_returns_true_when_system_certs_copied(self, tmp_path):
         """Test return value indicates whether system certs were found."""
@@ -3330,7 +3334,9 @@ class TestBareReturnsFixed(FumitmTestCase):
              patch.object(instance, 'add_to_shell_config') as mock_shell:
             result = instance.setup_python_cert()
             assert result.status == 'configured'
-            mock_shell.assert_called_with('SSL_CERT_FILE', bundle_path, '/tmp/.zshrc')
+            # assert_any_call (not assert_called_with): the Aikido/vendor-var
+            # post-pass may append further trust-var calls after this one.
+            mock_shell.assert_any_call('SSL_CERT_FILE', bundle_path, '/tmp/.zshrc')
 
     def test_gcloud_pre_bootstrap_without_gcloud_returns_configured(self):
         """setup_gcloud_cert returns configured when pre-bootstrap changes config."""
@@ -3373,7 +3379,7 @@ class TestBareReturnsFixed(FumitmTestCase):
              patch.object(instance, 'detect_shell', return_value='zsh'), \
              patch.object(instance, 'get_shell_config', return_value=shell_config), \
              patch('builtins.open', mock_open_obj), \
-             patch.object(instance, 'add_to_shell_config'):
+             patch.object(instance, 'add_to_shell_config', return_value=False):
             result = instance.setup_gcloud_cert()
             assert result.status == 'skipped'
             assert result.tool == 'gcloud'
@@ -3966,58 +3972,63 @@ class TestGitTlsBackend(FumitmTestCase):
 
 
 class TestShellConfigIdempotency(FumitmTestCase):
-    """Ensure add_to_shell_config is a no-op when the active export already
-    matches the desired value.
+    """add_to_shell_config maintains a trailing managed block and is a no-op only
+    when that block is already present and correct at the end of the file.
 
-    Regression: previously the function only checked whether `export VAR=`
-    appeared anywhere in the file and prompted the user even when the
-    existing value was correct. Saying "y" rewrote the file with an
-    identical line, falsely flagged shell_modified, and produced a
-    "1 configured" entry plus a "source ~/.zshrc" hint on every run.
+    The managed block wins by last-export-wins, so a user's earlier export is
+    preserved verbatim but overridden — never commented out, never prompted.
     """
 
-    def test_idempotent_when_value_matches(self, tmp_path):
+    def test_idempotent_when_block_already_correct(self, tmp_path):
         instance = self.create_fumitm_instance(mode='install')
         rc = tmp_path / '.zshrc'
         original = (
             '# user prologue\n'
             'export PATH="/usr/local/bin:$PATH"\n'
+            '\n'
+            f'{instance._FUMITM_BLOCK_BEGIN}\n'
             'export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE="/Users/test/.python-ca-bundle.pem"\n'
-            '# user epilogue\n'
+            f'{instance._FUMITM_BLOCK_END}\n'
         )
         rc.write_text(original)
 
-        with patch.object(instance, '_prompt') as prompt:
-            instance.add_to_shell_config(
-                'CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE',
-                '/Users/test/.python-ca-bundle.pem',
-                str(rc),
-            )
+        changed = instance.add_to_shell_config(
+            'CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE',
+            '/Users/test/.python-ca-bundle.pem',
+            str(rc),
+        )
 
-        assert prompt.call_count == 0, "should not prompt when value already matches"
+        assert changed is False
         assert rc.read_text() == original, "file should be untouched"
         assert getattr(instance, 'shell_modified', False) is False
+        assert not (tmp_path / '.zshrc.bak').exists()
 
-    def test_prompts_and_rewrites_when_value_differs(self, tmp_path):
+    def test_overrides_differing_value_without_prompt(self, tmp_path):
         instance = self.create_fumitm_instance(mode='install')
         rc = tmp_path / '.zshrc'
         rc.write_text(
             'export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE="/old/path.pem"\n'
         )
 
-        with patch.object(instance, '_prompt', return_value='y'):
-            instance.add_to_shell_config(
+        with patch.object(instance, '_prompt') as prompt:
+            changed = instance.add_to_shell_config(
                 'CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE',
                 '/new/path.pem',
                 str(rc),
             )
 
         new_content = rc.read_text()
-        assert '#export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE="/old/path.pem"' in new_content
-        assert 'export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE="/new/path.pem"' in new_content
+        assert prompt.call_count == 0, "managed block is authoritative; no prompt"
+        # The user's earlier line is preserved (never commented), and the managed
+        # block at EOF carries the new value, winning by last-export-wins.
+        assert 'export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE="/old/path.pem"' in new_content
+        assert '#export' not in new_content
+        assert new_content.rstrip().endswith(instance._FUMITM_BLOCK_END)
+        assert new_content.index('/new/path.pem') > new_content.index('/old/path.pem')
+        assert changed is True
         assert instance.shell_modified is True
 
-    def test_appends_when_only_commented_export_exists(self, tmp_path):
+    def test_value_lands_inside_managed_block(self, tmp_path):
         instance = self.create_fumitm_instance(mode='install')
         rc = tmp_path / '.zshrc'
         rc.write_text('#export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE="/old/path.pem"\n')
@@ -4029,25 +4040,178 @@ class TestShellConfigIdempotency(FumitmTestCase):
                 str(rc),
             )
 
+        content = rc.read_text()
         assert prompt.call_count == 0, "commented-out lines should not trigger a prompt"
-        assert 'export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE="/new/path.pem"' in rc.read_text()
+        begin = content.index(instance._FUMITM_BLOCK_BEGIN)
+        export = content.index('export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE="/new/path.pem"')
+        end = content.index(instance._FUMITM_BLOCK_END)
+        assert begin < export < end
         assert instance.shell_modified is True
 
-    def test_idempotent_with_unquoted_existing_value(self, tmp_path):
+    def test_plain_user_export_preserved_and_overridden(self, tmp_path):
+        # A pre-existing unquoted user export is foreign content: preserved
+        # verbatim, with a managed block appended that overrides it.
         instance = self.create_fumitm_instance(mode='install')
         rc = tmp_path / '.zshrc'
         original = 'export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE=/Users/test/bundle.pem\n'
         rc.write_text(original)
 
-        with patch.object(instance, '_prompt') as prompt:
-            instance.add_to_shell_config(
-                'CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE',
-                '/Users/test/bundle.pem',
-                str(rc),
-            )
+        changed = instance.add_to_shell_config(
+            'CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE',
+            '/Users/test/bundle.pem',
+            str(rc),
+        )
 
-        assert prompt.call_count == 0
-        assert rc.read_text() == original
+        content = rc.read_text()
+        assert changed is True
+        assert original.strip() in content, "user line preserved"
+        assert instance._FUMITM_BLOCK_BEGIN in content
+        assert content.rstrip().endswith(instance._FUMITM_BLOCK_END)
+
+
+class TestShellConfigManagedBlock(FumitmTestCase):
+    """The managed block is always re-emitted last, after any vendor (Aikido)
+    block, and relocates itself there on every run.
+    """
+
+    def _aikido_block(self):
+        return (
+            '# >>> aikido-endpoint start >>>\n'
+            'export SSL_CERT_FILE="/aikido/only.pem"\n'
+            'export REQUESTS_CA_BUNDLE="/aikido/only.pem"\n'
+            '# <<< aikido-endpoint end <<<\n'
+        )
+
+    def test_order_wins_over_aikido(self, tmp_path):
+        instance = self.create_fumitm_instance(mode='install')
+        rc = tmp_path / '.zshrc'
+        aikido = self._aikido_block()
+        # An earlier fumitm export followed by Aikido's block, which currently wins.
+        rc.write_text(
+            'export SSL_CERT_FILE="/fumitm/bundle.pem"\n\n' + aikido
+        )
+
+        instance.add_to_shell_config('SSL_CERT_FILE', '/fumitm/bundle.pem', str(rc))
+        instance.add_to_shell_config('REQUESTS_CA_BUNDLE', '/fumitm/bundle.pem', str(rc))
+
+        content = rc.read_text()
+        # Aikido's block is preserved verbatim, and the fumitm block sits after it.
+        assert aikido.strip() in content
+        assert content.index(instance._FUMITM_BLOCK_BEGIN) > content.index('aikido-endpoint end')
+        # The managed-block copy (last occurrence) wins over Aikido's earlier line.
+        assert content.rindex('export SSL_CERT_FILE="/fumitm/bundle.pem"') \
+            > content.index('export SSL_CERT_FILE="/aikido/only.pem"')
+        assert 'export REQUESTS_CA_BUNDLE="/fumitm/bundle.pem"' in content
+
+        # Second pass is byte-identical (idempotent).
+        before = rc.read_text()
+        changed = instance.add_to_shell_config('SSL_CERT_FILE', '/fumitm/bundle.pem', str(rc))
+        assert changed is False
+        assert rc.read_text() == before
+
+    def test_relocates_block_to_eof_when_mid_file(self, tmp_path):
+        instance = self.create_fumitm_instance(mode='install')
+        rc = tmp_path / '.zshrc'
+        rc.write_text(
+            f'{instance._FUMITM_BLOCK_BEGIN}\n'
+            'export SSL_CERT_FILE="/fumitm/bundle.pem"\n'
+            f'{instance._FUMITM_BLOCK_END}\n'
+            '\n'
+            'export LATER_USER_VAR="kept"\n'
+        )
+
+        changed = instance.add_to_shell_config('REQUESTS_CA_BUNDLE', '/fumitm/bundle.pem', str(rc))
+
+        content = rc.read_text()
+        assert changed is True
+        assert 'export LATER_USER_VAR="kept"' in content
+        assert content.index('LATER_USER_VAR') < content.index(instance._FUMITM_BLOCK_BEGIN)
+        assert content.rstrip().endswith(instance._FUMITM_BLOCK_END)
+
+    def test_multiple_vars_accumulate_in_one_block(self, tmp_path):
+        instance = self.create_fumitm_instance(mode='install')
+        rc = tmp_path / '.zshrc'
+        instance.add_to_shell_config('SSL_CERT_FILE', '/b.pem', str(rc))
+        instance.add_to_shell_config('REQUESTS_CA_BUNDLE', '/b.pem', str(rc))
+
+        content = rc.read_text()
+        assert content.count(instance._FUMITM_BLOCK_BEGIN) == 1
+        assert content.count(instance._FUMITM_BLOCK_END) == 1
+        assert 'export SSL_CERT_FILE="/b.pem"' in content
+        assert 'export REQUESTS_CA_BUNDLE="/b.pem"' in content
+
+    def test_per_run_backup_holds_pre_run_original(self, tmp_path):
+        instance = self.create_fumitm_instance(mode='install')
+        rc = tmp_path / '.zshrc'
+        original = 'export USER_VAR="original"\n'
+        rc.write_text(original)
+
+        instance.add_to_shell_config('SSL_CERT_FILE', '/b.pem', str(rc))
+        instance.add_to_shell_config('REQUESTS_CA_BUNDLE', '/b.pem', str(rc))
+
+        bak = tmp_path / '.zshrc.bak'
+        assert bak.exists()
+        assert bak.read_text() == original, "bak must hold the true pre-run original"
+
+    def test_missing_file_creates_block_no_bak(self, tmp_path):
+        instance = self.create_fumitm_instance(mode='install')
+        rc = tmp_path / '.zshrc'  # does not exist
+
+        changed = instance.add_to_shell_config('SSL_CERT_FILE', '/b.pem', str(rc))
+
+        assert changed is True
+        content = rc.read_text()
+        assert content.startswith(instance._FUMITM_BLOCK_BEGIN)
+        assert content.endswith(instance._FUMITM_BLOCK_END + '\n')
+        assert not (tmp_path / '.zshrc.bak').exists()
+        # A second var in the same run must not back up the intermediate file.
+        instance.add_to_shell_config('REQUESTS_CA_BUNDLE', '/b.pem', str(rc))
+        assert not (tmp_path / '.zshrc.bak').exists()
+
+    def test_returns_false_on_noop(self, tmp_path):
+        instance = self.create_fumitm_instance(mode='install')
+        rc = tmp_path / '.zshrc'
+        assert instance.add_to_shell_config('SSL_CERT_FILE', '/b.pem', str(rc)) is True
+        assert instance.add_to_shell_config('SSL_CERT_FILE', '/b.pem', str(rc)) is False
+
+    def test_stray_begin_marker_preserves_content(self, tmp_path):
+        instance = self.create_fumitm_instance(mode='install')
+        rc = tmp_path / '.zshrc'
+        rc.write_text(
+            f'{instance._FUMITM_BLOCK_BEGIN}\n'
+            'export USER_IMPORTANT="keepme"\n'  # no end marker
+        )
+
+        with patch.object(instance, 'print_warn') as warn:
+            changed = instance.add_to_shell_config('SSL_CERT_FILE', '/b.pem', str(rc))
+
+        content = rc.read_text()
+        assert changed is True
+        assert 'export USER_IMPORTANT="keepme"' in content, "no content swallowed to EOF"
+        assert warn.call_count >= 1
+        assert content.rstrip().endswith(instance._FUMITM_BLOCK_END)
+
+    def test_stale_begin_then_fresh_block(self, tmp_path):
+        # A stale unmatched begin marker followed by a valid fresh block: the
+        # fresh block's end must not be read as closing the stale begin.
+        instance = self.create_fumitm_instance(mode='install')
+        rc = tmp_path / '.zshrc'
+        rc.write_text(
+            f'{instance._FUMITM_BLOCK_BEGIN}\n'
+            'export STALE_LEFTOVER="x"\n'
+            '\n'
+            f'{instance._FUMITM_BLOCK_BEGIN}\n'
+            'export SSL_CERT_FILE="/old.pem"\n'
+            f'{instance._FUMITM_BLOCK_END}\n'
+        )
+
+        instance.add_to_shell_config('SSL_CERT_FILE', '/new.pem', str(rc))
+
+        content = rc.read_text()
+        # The fresh block was updated; the stale begin + its line stay as foreign.
+        assert 'export STALE_LEFTOVER="x"' in content
+        assert 'export SSL_CERT_FILE="/new.pem"' in content
+        assert 'export SSL_CERT_FILE="/old.pem"' not in content
 
 
 if __name__ == '__main__':
