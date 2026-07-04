@@ -19,7 +19,7 @@ from datetime import datetime
 # Version and metadata
 __description__ = "MITM Certificate Fixer Upper for Windows"
 __author__ = "Ingersoll & Claude"
-__version__ = "2026.5.9"  # CalVer: YYYY.MM.DD (auto-updated on release)
+__version__ = "2026.7.4"  # CalVer: YYYY.MM.DD (auto-updated on release)
 
 
 def parse_calver(version_str):
