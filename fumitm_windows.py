@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
 
-import os
-import sys
-import subprocess
-import tempfile
-import shutil
 import argparse
+import os
 import platform
-import json
+import shutil
 import ssl
-import hashlib
-import urllib.request
+import subprocess
+import sys
+import tempfile
 import urllib.error
+import urllib.request
 import winreg
 from pathlib import Path
-from datetime import datetime
 
 # Version and metadata
 __description__ = "MITM Certificate Fixer Upper for Windows"
@@ -59,7 +56,7 @@ def get_version_info():
             cwd=script_dir,
             capture_output=True,
             text=True,
-        )
+        check=False)
 
         if result.returncode == 0:
             # Get commit hash (short)
@@ -68,7 +65,7 @@ def get_version_info():
                 cwd=script_dir,
                 capture_output=True,
                 text=True,
-            )
+            check=False)
             if result.returncode == 0:
                 version_info["commit"] = result.stdout.strip()
 
@@ -78,7 +75,7 @@ def get_version_info():
                 cwd=script_dir,
                 capture_output=True,
                 text=True,
-            )
+            check=False)
             if result.returncode == 0:
                 version_info["date"] = result.stdout.strip()
 
@@ -88,7 +85,7 @@ def get_version_info():
                 cwd=script_dir,
                 capture_output=True,
                 text=True,
-            )
+            check=False)
             if result.returncode == 0:
                 version_info["branch"] = result.stdout.strip()
 
@@ -98,7 +95,7 @@ def get_version_info():
                 cwd=script_dir,
                 capture_output=True,
                 text=True,
-            )
+            check=False)
             if result.returncode == 0 and result.stdout.strip():
                 version_info["dirty"] = True
 
@@ -109,7 +106,7 @@ def get_version_info():
                 capture_output=True,
                 text=True,
                 stderr=subprocess.DEVNULL,
-            )
+            check=False)
             if result.returncode == 0 and result.stdout.strip():
                 version_info["version"] = result.stdout.strip()
             else:
@@ -119,7 +116,7 @@ def get_version_info():
                     cwd=script_dir,
                     capture_output=True,
                     text=True,
-                )
+                check=False)
                 if result.returncode == 0 and result.stdout.strip():
                     count = result.stdout.strip()
                     version_info["version"] = f"0.{count}.0"
@@ -337,7 +334,7 @@ class FumitmWindows:
                 ["tasklist", "/FI", "IMAGENAME eq STAgent.exe"],
                 capture_output=True,
                 text=True,
-            )
+            check=False)
             if result.returncode == 0 and "STAgent.exe" in result.stdout:
                 return True
         except Exception:
@@ -388,7 +385,7 @@ class FumitmWindows:
             return list(self.tools_registry.keys())
 
         selected = []
-        for tool_key, tool_info in self.tools_registry.items():
+        for tool_key in self.tools_registry:
             if self.should_process_tool(tool_key):
                 selected.append(tool_key)
 
@@ -522,7 +519,7 @@ class FumitmWindows:
                 ["warp-cli", "certs", "--no-paginate"],
                 capture_output=True,
                 text=True,
-            )
+            check=False)
 
             if result.returncode != 0 or not result.stdout.strip():
                 self.print_error("Failed to get certificate from warp-cli")
@@ -626,7 +623,7 @@ class FumitmWindows:
                         ["warp-cli", "status"],
                         capture_output=True,
                         text=True,
-                    )
+                    check=False)
                     warp_status = result.stdout if result.returncode == 0 else "unknown"
                     if "Connected" in warp_status:
                         self.print_info(f"  ✓ {short_name} is connected")
@@ -648,7 +645,7 @@ class FumitmWindows:
                 ["tasklist", "/FI", "IMAGENAME eq STAgent.exe"],
                 capture_output=True,
                 text=True,
-            )
+            check=False)
             if result.returncode == 0 and "STAgent.exe" in result.stdout:
                 self.print_info("  ✓ STAgent is running")
                 return False
@@ -706,7 +703,7 @@ class FumitmWindows:
                     ],
                     capture_output=True,
                     text=True,
-                )
+                check=False)
                 if result.returncode == 0:
                     fingerprint = result.stdout.strip().split("=")[1]
                     if cert_path == CERT_PATH:
@@ -733,7 +730,7 @@ class FumitmWindows:
                     ["powershell", "-Command", ps_command],
                     capture_output=True,
                     text=True,
-                )
+                check=False)
 
                 if result.returncode == 0 and result.stdout.strip():
                     fingerprint = result.stdout.strip()
@@ -785,23 +782,22 @@ class FumitmWindows:
         existing_bundle = self.find_existing_bundle(tool_name)
 
         # Check if bundle already exists and is current
-        if os.path.exists(bundle_path):
-            if self.certificate_exists_in_file(CERT_PATH, bundle_path):
-                self.print_debug(
-                    f"{tool_name} bundle already contains current certificate"
-                )
-                # Bundle is healthy — still ensure all env vars are set in the registry,
-                # since they may have been missed on a previous run.
-                if env_vars:
-                    for env_var in env_vars:
-                        if not self.get_environment_variable(env_var):
-                            if not self.is_install_mode():
-                                self.print_action(
-                                    f"Would set {env_var} to {bundle_path}"
-                                )
-                            else:
-                                self.set_environment_variable(env_var, bundle_path)
-                return bundle_path
+        if os.path.exists(bundle_path) and self.certificate_exists_in_file(CERT_PATH, bundle_path):
+            self.print_debug(
+                f"{tool_name} bundle already contains current certificate"
+            )
+            # Bundle is healthy — still ensure all env vars are set in the registry,
+            # since they may have been missed on a previous run.
+            if env_vars:
+                for env_var in env_vars:
+                    if not self.get_environment_variable(env_var):
+                        if not self.is_install_mode():
+                            self.print_action(
+                                f"Would set {env_var} to {bundle_path}"
+                            )
+                        else:
+                            self.set_environment_variable(env_var, bundle_path)
+            return bundle_path
 
         # Handle existing bundle
         if existing_bundle:
@@ -837,7 +833,7 @@ class FumitmWindows:
                         self.append_certificate_if_missing(CERT_PATH, bundle_path)
                     else:
                         self.print_debug(
-                            f"Copied bundle already contains current certificate, skipping append"
+                            "Copied bundle already contains current certificate, skipping append"
                         )
                 else:
                     return None
@@ -1051,7 +1047,7 @@ class FumitmWindows:
             HWND_BROADCAST = 0xFFFF
             WM_SETTINGCHANGE = 0x001A
             SMTO_ABORTIFHUNG = 0x0002
-            result = ctypes.windll.user32.SendMessageTimeoutW(
+            ctypes.windll.user32.SendMessageTimeoutW(
                 HWND_BROADCAST,
                 WM_SETTINGCHANGE,
                 0,
@@ -1120,7 +1116,7 @@ class FumitmWindows:
             """
 
             result = subprocess.run(
-                ["powershell", "-Command", ps_command], capture_output=True, text=True
+                ["powershell", "-Command", ps_command], capture_output=True, text=True, check=False
             )
 
             if result.returncode == 0:
@@ -1156,7 +1152,7 @@ class FumitmWindows:
             """
 
             result = subprocess.run(
-                ["powershell", "-Command", ps_command], capture_output=True, text=True
+                ["powershell", "-Command", ps_command], capture_output=True, text=True, check=False
             )
 
             return result.returncode == 0 and "Found" in result.stdout
@@ -1194,11 +1190,11 @@ class FumitmWindows:
             result = subprocess.run(
                 ["openssl", "x509", "-noout", "-in", temp_cert_path],
                 capture_output=True,
-            )
+            check=False)
             if result.returncode == 0:
                 self.print_debug("Certificate verified with openssl")
             else:
-                raise Exception("OpenSSL verification failed")
+                raise RuntimeError("OpenSSL verification failed")
         except Exception as e:
             self.print_debug(
                 f"OpenSSL not available, trying PowerShell verification: {e}"
@@ -1225,7 +1221,7 @@ class FumitmWindows:
                     ["powershell", "-Command", ps_command],
                     capture_output=True,
                     text=True,
-                )
+                check=False)
 
                 if result.returncode != 0:
                     self.print_error("Retrieved file is not a valid PEM certificate")
@@ -1299,7 +1295,7 @@ class FumitmWindows:
             """
 
             result = subprocess.run(
-                ["powershell", "-Command", ps_command], capture_output=True, text=True
+                ["powershell", "-Command", ps_command], capture_output=True, text=True, check=False
             )
 
             if result.returncode == 0 and result.stdout.strip():
@@ -1346,7 +1342,7 @@ class FumitmWindows:
                             ["powershell", "-Command", ps_command],
                             capture_output=True,
                             text=True,
-                        )
+                        check=False)
 
                         if result.returncode == 0:
                             self.print_info(
@@ -1383,7 +1379,7 @@ class FumitmWindows:
                     self.append_certificate_if_missing(CERT_PATH, node_extra_ca_certs)
             else:
                 self.print_info(
-                    f"NODE_EXTRA_CA_CERTS already contains current certificate"
+                    "NODE_EXTRA_CA_CERTS already contains current certificate"
                 )
         else:
             # Use consistent bundle management
@@ -1405,7 +1401,7 @@ class FumitmWindows:
                 ["npm", "config", "get", "cafile"],
                 capture_output=True,
                 text=True,
-            )
+            check=False)
             current_cafile = result.stdout.strip() if result.returncode == 0 else ""
         except Exception:
             current_cafile = ""
@@ -1492,7 +1488,7 @@ class FumitmWindows:
                     ["gcloud", "config", "get-value", "core/custom_ca_certs_file"],
                     capture_output=True,
                     text=True,
-                )
+                check=False)
                 current_ca_file = (
                     result.stdout.strip() if result.returncode == 0 else ""
                 )
@@ -1515,7 +1511,7 @@ class FumitmWindows:
                                     "core/custom_ca_certs_file",
                                 ],
                                 capture_output=True,
-                            )
+                            check=False)
                             self.print_info(
                                 "Configured gcloud to use Windows certificate store"
                             )
@@ -1541,7 +1537,7 @@ class FumitmWindows:
                 ["gcloud", "config", "get-value", "core/custom_ca_certs_file"],
                 capture_output=True,
                 text=True,
-            )
+            check=False)
             current_ca_file = result.stdout.strip() if result.returncode == 0 else ""
         except Exception:
             current_ca_file = ""
@@ -1565,7 +1561,7 @@ class FumitmWindows:
             result = subprocess.run(
                 ["gcloud", "config", "set", "core/custom_ca_certs_file", bundle_path],
                 capture_output=True,
-            )
+            check=False)
             if result.returncode == 0:
                 self.print_info(f"gcloud configured to use CA bundle: {bundle_path}")
             else:
@@ -1588,7 +1584,7 @@ class FumitmWindows:
             try:
                 # Try to find Java installation
                 result = subprocess.run(
-                    ["where", "java"], capture_output=True, text=True
+                    ["where", "java"], capture_output=True, text=True, check=False
                 )
                 if result.returncode == 0:
                     java_path = result.stdout.strip().split("\n")[0]
@@ -1630,7 +1626,7 @@ class FumitmWindows:
                     "changeit",
                 ],
                 capture_output=True,
-            )
+            check=False)
             if (
                 result.returncode == 0
                 and self.get_keytool_alias() in result.stdout.decode()
@@ -1664,7 +1660,7 @@ class FumitmWindows:
                     "-noprompt",
                 ],
                 capture_output=True,
-            )
+            check=False)
             if result.returncode == 0:
                 self.print_info("Certificate added to Java keystore successfully")
             else:
@@ -1755,7 +1751,7 @@ class FumitmWindows:
                 ["podman", "machine", "list"],
                 capture_output=True,
                 text=True,
-            )
+            check=False)
             if "Currently running" not in result.stdout:
                 self.print_warn("No Podman machine is currently running")
                 self.print_info(
@@ -1788,14 +1784,14 @@ class FumitmWindows:
                 input=cert_content,
                 text=True,
                 capture_output=True,
-            )
+            check=False)
 
             if result.returncode == 0:
                 # Update CA trust
                 result = subprocess.run(
                     ["podman", "machine", "ssh", "sudo update-ca-trust"],
                     capture_output=True,
-                )
+                check=False)
                 if result.returncode == 0:
                     self.print_info("Podman certificate installed successfully")
                 else:
@@ -1832,14 +1828,14 @@ class FumitmWindows:
                 input=cert_content,
                 text=True,
                 capture_output=True,
-            )
+            check=False)
 
             if result.returncode == 0:
                 # Update CA certificates
                 result = subprocess.run(
                     ["rdctl", "shell", "sudo update-ca-certificates"],
                     capture_output=True,
-                )
+                check=False)
                 if result.returncode == 0:
                     self.print_info("Rancher certificate installed successfully")
                 else:
@@ -1860,7 +1856,7 @@ class FumitmWindows:
                 ["git", "config", "--global", "--get", "http.sslCAInfo"],
                 capture_output=True,
                 text=True,
-            )
+            check=False)
             current_ca_info = result.stdout.strip() if result.returncode == 0 else ""
         except Exception:
             current_ca_info = ""
@@ -1935,7 +1931,7 @@ class FumitmWindows:
                                     bundle_path,
                                 ],
                                 capture_output=True,
-                            )
+                            check=False)
                             if result.returncode == 0:
                                 self.print_info(
                                     f"Git reconfigured to use CA bundle: {bundle_path}"
@@ -1972,7 +1968,7 @@ class FumitmWindows:
                 result = subprocess.run(
                     ["git", "config", "--global", "http.sslCAInfo", bundle_path],
                     capture_output=True,
-                )
+                check=False)
                 if result.returncode == 0:
                     self.print_info(f"Git configured to use CA bundle: {bundle_path}")
                 else:
@@ -2017,7 +2013,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                         ["node", "-e", node_script],
                         capture_output=True,
                         text=True,
-                    )
+                    check=False)
 
                     if proc_result.returncode == 0:
                         result = "WORKING"
@@ -2052,7 +2048,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     result = "WORKING"
 
                     # Additional validation - check SSL context
-                    context = ssl.create_default_context()
+                    ssl.create_default_context()
                     self.print_debug(
                         f"Python SSL default verify paths: {ssl.get_default_verify_paths()}"
                     )
@@ -2098,12 +2094,12 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                             ["curl", "-v", "-s", "-o", "nul", test_url],
                             capture_output=True,
                             text=True,
-                        )
+                        check=False)
                     else:
                         curl_result = subprocess.run(
                             ["curl", "-s", "-o", "nul", test_url],
                             capture_output=True,
-                        )
+                        check=False)
 
                     if curl_result.returncode == 0:
                         result = "WORKING"
@@ -2198,7 +2194,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                         ["npm", "config", "get", "cafile"],
                         capture_output=True,
                         text=True,
-                    )
+                    check=False)
                     npm_cafile = result.stdout.strip() if result.returncode == 0 else ""
 
                     if npm_cafile and npm_cafile not in ["null", "undefined"]:
@@ -2324,18 +2320,17 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                         )
                         has_issues = True
 
-                if not python_configured:
-                    if not requests_ca_bundle and not ssl_cert_file:
-                        self.print_warn(
-                            "  ✗ Python does not trust system certificate by default"
-                        )
-                        self.print_warn(
-                            "  ✗ No Python certificate environment variables configured"
-                        )
-                        self.print_action(
-                            "    Run with --fix --tools python to configure certificate bundle"
-                        )
-                        has_issues = True
+                if not python_configured and not requests_ca_bundle and not ssl_cert_file:
+                    self.print_warn(
+                        "  ✗ Python does not trust system certificate by default"
+                    )
+                    self.print_warn(
+                        "  ✗ No Python certificate environment variables configured"
+                    )
+                    self.print_action(
+                        "    Run with --fix --tools python to configure certificate bundle"
+                    )
+                    has_issues = True
         else:
             self.print_info("  - Python not installed")
         return has_issues
@@ -2349,7 +2344,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     ["gcloud", "config", "get-value", "core/custom_ca_certs_file"],
                     capture_output=True,
                     text=True,
-                )
+                check=False)
                 gcloud_ca = result.stdout.strip() if result.returncode == 0 else ""
 
                 if gcloud_ca and os.path.exists(gcloud_ca):
@@ -2402,7 +2397,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                             "changeit",
                         ],
                         capture_output=True,
-                    )
+                    check=False)
                     if (
                         result.returncode == 0
                         and self.get_keytool_alias() in result.stdout.decode()
@@ -2456,7 +2451,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     ["podman", "machine", "list"],
                     capture_output=True,
                     text=True,
-                )
+                check=False)
                 if "Currently running" in result.stdout:
                     # Check if certificate exists in Podman VM
                     result = subprocess.run(
@@ -2467,7 +2462,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                             f"test -f /etc/pki/ca-trust/source/anchors/{self.get_container_cert_name()}",
                         ],
                         capture_output=True,
-                    )
+                    check=False)
                     if result.returncode == 0:
                         self.print_info(
                             f"  ✓ Podman VM has {self.get_provider_short_name()} certificate installed"
@@ -2491,7 +2486,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             try:
                 # Try to check if Rancher is running
                 result = subprocess.run(
-                    ["rdctl", "version"], capture_output=True, text=True
+                    ["rdctl", "version"], capture_output=True, text=True, check=False
                 )
                 if "rdctl" in result.stdout:
                     # Check if certificate exists in Rancher VM
@@ -2502,7 +2497,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                             f"test -f /usr/local/share/ca-certificates/{self.get_container_cert_name()}",
                         ],
                         capture_output=True,
-                    )
+                    check=False)
                     if result.returncode == 0:
                         self.print_info(
                             f"  ✓ Rancher Desktop VM has {self.get_provider_short_name()} certificate installed"
@@ -2531,7 +2526,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     ["git", "config", "--global", "--get", "http.sslCAInfo"],
                     capture_output=True,
                     text=True,
-                )
+                check=False)
                 git_ca_info = result.stdout.strip() if result.returncode == 0 else ""
 
                 if git_ca_info and os.path.exists(git_ca_info):
@@ -2606,11 +2601,11 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     temp_warp_cert,
                 ],
                 capture_output=True,
-            )
+            check=False)
             if result.returncode == 0:
                 self.print_info(f"  ✓ {short_name} certificate is valid")
             else:
-                raise Exception("OpenSSL validation failed")
+                raise RuntimeError("OpenSSL validation failed")
         except Exception as e:
             self.print_debug(
                 f"OpenSSL not available, trying PowerShell validation: {e}"
@@ -2640,7 +2635,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     ["powershell", "-Command", ps_command],
                     capture_output=True,
                     text=True,
-                )
+                check=False)
 
                 if result.returncode == 0:
                     self.print_info(f"  ✓ {short_name} certificate is valid")
@@ -2679,10 +2674,10 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             "SSL_CERT_FILE",
         ]:
             env_value = self.get_environment_variable(env_var)
-            if env_value and os.path.exists(env_value):
-                if self.certificate_exists_in_file(temp_warp_cert, env_value):
-                    cert_locations.append(f"    - {env_value} ({env_var})")
-                    cert_found = True
+            if (env_value and os.path.exists(env_value)
+                    and self.certificate_exists_in_file(temp_warp_cert, env_value)):
+                cert_locations.append(f"    - {env_value} ({env_var})")
+                cert_found = True
 
         if cert_found:
             self.print_info(f"  ✓ {short_name} certificate found in:")
@@ -2770,7 +2765,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 )
                 if VERSION_INFO["dirty"]:
                     self.print_debug("Working directory has uncommitted changes")
-                self.print_debug(f"Script: Windows implementation")
+                self.print_debug("Script: Windows implementation")
                 self.print_debug(f"Running on: {platform.platform()}")
                 self.print_debug(f"Python version: {sys.version}")
                 self.print_debug(f"Home directory: {os.path.expanduser('~')}")
@@ -2826,9 +2821,8 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     print()
 
                 for tool_key, tool_info in self.tools_registry.items():
-                    if self.should_process_tool(tool_key):
-                        if tool_info.get("setup_func"):
-                            tool_info["setup_func"]()
+                    if self.should_process_tool(tool_key) and tool_info.get("setup_func"):
+                        tool_info["setup_func"]()
 
                 # Final message
                 print()

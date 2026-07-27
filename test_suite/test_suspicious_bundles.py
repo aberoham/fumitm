@@ -4,11 +4,11 @@ Tests for detecting suspiciously small CA bundles.
 These tests focus on the helper heuristics introduced to catch cases where
 users accidentally point full-bundle env vars at a single WARP CA cert.
 """
-import pytest
 
-from helpers import MockBuilder, mock_fumitm_environment, FumitmTestCase
-from unittest.mock import patch, ANY
+from unittest.mock import ANY, patch
+
 import mock_data
+from helpers import FumitmTestCase, MockBuilder, mock_fumitm_environment
 
 
 class TestSuspiciousBundles(FumitmTestCase):
@@ -42,7 +42,7 @@ class TestSuspiciousBundles(FumitmTestCase):
 
         with mock_fumitm_environment(mock_config):
             instance = self.create_fumitm_instance()
-            suspicious, reason = instance.is_suspicious_full_bundle(bundle_path, None)
+            suspicious, _reason = instance.is_suspicious_full_bundle(bundle_path, None)
             assert suspicious is False
 
     def test_npm_repoint_on_suspicious_existing(self):

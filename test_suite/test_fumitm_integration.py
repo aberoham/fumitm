@@ -6,17 +6,20 @@ by mocking external dependencies and testing realistic scenarios.
 """
 import os
 import subprocess
-import sys
 import urllib.error
-from unittest.mock import patch, MagicMock, call, mock_open
+from typing import ClassVar
+from unittest.mock import MagicMock, call, mock_open, patch
+
+import mock_data
 import pytest
 
 # Import test utilities
 from helpers import (
-    MockBuilder, mock_fumitm_environment, assert_subprocess_called_with,
-    assert_file_written, FumitmTestCase
+    FumitmTestCase,
+    MockBuilder,
+    assert_subprocess_called_with,
+    mock_fumitm_environment,
 )
-import mock_data
 
 # Import the fumitm module
 import fumitm
@@ -328,7 +331,6 @@ class TestBrewCacerts(FumitmTestCase):
     def test_setup_postinstall_success_but_cert_not_in_bundle(self):
         """setup_brew_cacerts warns when postinstall succeeds but cert not in bundle."""
         brew_prefix = '/opt/homebrew'
-        bundle_path = f'{brew_prefix}/etc/ca-certificates/cert.pem'
 
         mock_config = (MockBuilder()
             .with_certificate()
@@ -464,9 +466,7 @@ class TestJavaMultiInstallation(FumitmTestCase):
                 if path == '/usr/libexec/java_home':
                     return True
                 # Mock cacerts files exist for all Java homes
-                if 'lib/security/cacerts' in path:
-                    return True
-                return False
+                return 'lib/security/cacerts' in path
 
             mock_exists.side_effect = exists_side_effect
             mock_isfile.side_effect = lambda path: 'lib/security/cacerts' in path
@@ -632,16 +632,12 @@ class TestJavaMultiInstallation(FumitmTestCase):
         def isfile_side_effect(path):
             if path == sdkman_java_dir:
                 return False
-            if 'lib/security/cacerts' in path:
-                return True
-            return False
+            return 'lib/security/cacerts' in path
 
         def isdir_side_effect(path):
             if path == sdkman_java_dir:
                 return True
-            if any(v in path for v in sdkman_versions):
-                return True
-            return False
+            return bool(any(v in path for v in sdkman_versions))
 
         with patch('platform.system', return_value='Darwin'), \
              patch.dict(os.environ, {'JAVA_HOME': '', 'SDKMAN_DIR': ''}, clear=False), \
@@ -685,7 +681,7 @@ class TestJavaMultiInstallation(FumitmTestCase):
 
         current_path = os.path.join(sdkman_java_dir, 'current')
         assert current_path not in java_homes, \
-            f"'current' symlink should not appear as a separate entry in java_homes"
+            "'current' symlink should not appear as a separate entry in java_homes"
 
     def test_find_all_java_homes_sdkman_absent(self):
         """find_all_java_homes does not fail when ~/.sdkman/candidates/java does not exist."""
@@ -768,14 +764,10 @@ class TestJavaMultiInstallation(FumitmTestCase):
                 return True
             if path == default_sdkman_java_dir:
                 return False
-            if '21.0.2-tem' in path:
-                return True
-            return False
+            return '21.0.2-tem' in path
 
         def isfile_side_effect(path):
-            if 'lib/security/cacerts' in path and '21.0.2-tem' in path:
-                return True
-            return False
+            return bool('lib/security/cacerts' in path and '21.0.2-tem' in path)
 
         env = {'SDKMAN_DIR': custom_sdkman_root, 'JAVA_HOME': ''}
         with patch('platform.system', return_value='Darwin'), \
@@ -803,12 +795,12 @@ class TestCLIAndWorkflow(FumitmTestCase):
     """Tests for CLI argument parsing and complete workflows."""
     
     # Default kwargs for new headless/MDM flags, used by CLI constructor tests
-    _DEFAULT_NEW_KWARGS = dict(
-        no_color=False, headless=False, skip_update_check=False,
-        log_file=None, log_dir=None, json_log_file=None, json_log_dir=None,
-        run_as_user=None, with_aikido=False, no_aikido=False,
-        aikido_cert_file=None,
-    )
+    _DEFAULT_NEW_KWARGS: ClassVar[dict] = {
+        'no_color': False, 'headless': False, 'skip_update_check': False,
+        'log_file': None, 'log_dir': None, 'json_log_file': None, 'json_log_dir': None,
+        'run_as_user': None, 'with_aikido': False, 'no_aikido': False,
+        'aikido_cert_file': None,
+    }
 
     @patch('fumitm.sys.argv', ['fumitm.py', '--fix'])
     def test_cli_fix_mode(self):
@@ -973,15 +965,15 @@ class TestErrorScenarios(FumitmTestCase):
             .with_tools('openssl')
             .build())
         
-        with mock_fumitm_environment(mock_config):
-            with patch('fumitm.shutil.copy') as mock_copy:
-                mock_copy.side_effect = PermissionError(mock_data.PERMISSION_DENIED_ERROR)
-                
-                instance = self.create_fumitm_instance(mode='install')
-                # The download_certificate method doesn't catch PermissionError
-                # so we expect it to raise
-                with pytest.raises(PermissionError):
-                    instance.download_certificate()
+        with mock_fumitm_environment(mock_config), \
+                patch('fumitm.shutil.copy') as mock_copy:
+            mock_copy.side_effect = PermissionError(mock_data.PERMISSION_DENIED_ERROR)
+
+            instance = self.create_fumitm_instance(mode='install')
+            # The download_certificate method doesn't catch PermissionError
+            # so we expect it to raise
+            with pytest.raises(PermissionError):
+                instance.download_certificate()
     
     def test_malformed_certificate_handling(self):
         """Test handling of malformed certificates from warp-cli."""
@@ -1080,7 +1072,7 @@ class TestPlatformSpecific(FumitmTestCase):
     def test_platform_specific_paths(self, platform, expected_path):
         """Test that platform-specific paths are used correctly."""
         with patch('platform.system', return_value=platform):
-            instance = fumitm.FumitmPython(mode='status')
+            fumitm.FumitmPython(mode='status')
 
             # Check that instance is aware of platform
             # This would need actual implementation testing
@@ -1282,10 +1274,10 @@ class TestBundleCreation(FumitmTestCase):
             instance = fumitm.FumitmPython(mode='install')
 
             # Test True case (system certs exist)
-            with patch('os.path.exists', side_effect=lambda p: p == "/etc/ssl/cert.pem"):
-                with patch('shutil.copy'):
-                    result = instance.create_bundle_with_system_certs(str(target_bundle))
-                    assert result is True
+            with patch('os.path.exists', side_effect=lambda p: p == "/etc/ssl/cert.pem"), \
+                    patch('shutil.copy'):
+                result = instance.create_bundle_with_system_certs(str(target_bundle))
+                assert result is True
 
             # Test False case (no system certs)
             with patch('os.path.exists', return_value=False):
@@ -1508,14 +1500,14 @@ class TestCodeQuality:
                 continue
 
             # Check for unsafe patterns
-            if re.search(r"with\s+open\s*\([^)]*['\"]a['\"]\s*\)", line, re.IGNORECASE):
-                if 'bundle' in line.lower() or 'cert' in line.lower() or 'ca' in line.lower():
-                    unsafe_lines.append(f"Line {i}: {line.strip()}")
+            if (re.search(r"with\s+open\s*\([^)]*['\"]a['\"]\s*\)", line, re.IGNORECASE)
+                    and ('bundle' in line.lower() or 'cert' in line.lower() or 'ca' in line.lower())):
+                unsafe_lines.append(f"Line {i}: {line.strip()}")
 
         assert not unsafe_lines, (
-            f"Found unsafe certificate append patterns in fumitm_windows.py:\n"
+            "Found unsafe certificate append patterns in fumitm_windows.py:\n"
             + "\n".join(unsafe_lines) + "\n\n"
-            f"Use self.append_certificate_if_missing(cert_path, target_path) instead"
+            "Use self.append_certificate_if_missing(cert_path, target_path) instead"
         )
 
     def test_no_unused_globals_in_fumitm(self):
@@ -1660,9 +1652,9 @@ class TestCodeQuality:
                 bare_excepts.append(f"Line {i}: {line.strip()}")
 
         assert not bare_excepts, (
-            f"Found bare 'except:' clauses in fumitm.py:\n"
+            "Found bare 'except:' clauses in fumitm.py:\n"
             + "\n".join(bare_excepts) + "\n\n"
-            f"Replace with 'except Exception:' or a more specific exception type."
+            "Replace with 'except Exception:' or a more specific exception type."
         )
 
     def test_no_raw_cert_comparisons_in_fumitm(self):
@@ -1705,7 +1697,7 @@ class TestCodeQuality:
                     violations.append(f"Line {i}: {line.strip()} ({description})")
 
         assert not violations, (
-            f"Found raw certificate comparisons in fumitm.py:\n"
+            "Found raw certificate comparisons in fumitm.py:\n"
             + "\n".join(violations) + "\n\n"
             "Setup functions must use self.certificate_exists_in_file(CERT_PATH, target)\n"
             "instead of raw 'cert_content in file_content' comparisons.\n"
@@ -1751,7 +1743,7 @@ class TestCodeQuality:
                 violations.append(f"Line {i}: {stripped}")
 
         assert not violations, (
-            f"Found raw os.makedirs() calls outside _safe_makedirs in fumitm.py:\n"
+            "Found raw os.makedirs() calls outside _safe_makedirs in fumitm.py:\n"
             + "\n".join(violations) + "\n\n"
             "Use self._safe_makedirs(path) instead to ensure correct ownership under sudo."
         )
@@ -1830,7 +1822,6 @@ class TestOwnershipProtection(FumitmTestCase):
 
     def test_home_correction_under_sudo_linux(self):
         """Verify HOME is corrected when sudo sets it to /root."""
-        import pwd
 
         mock_pw = MagicMock()
         mock_pw.pw_dir = '/home/realuser'
@@ -1839,7 +1830,7 @@ class TestOwnershipProtection(FumitmTestCase):
              patch.dict(os.environ, {'SUDO_USER': 'realuser', 'HOME': '/root'}), \
              patch('pwd.getpwnam', return_value=mock_pw), \
              patch('platform.system', return_value='Linux'):
-            instance = fumitm.FumitmPython(mode='status', provider='warp')
+            fumitm.FumitmPython(mode='status', provider='warp')
             assert os.environ['HOME'] == '/home/realuser'
 
     def test_check_ownership_sanity_detects_root_files(self, tmp_path):
@@ -2009,7 +2000,7 @@ class TestPerformance(FumitmTestCase):
 
         with patch('subprocess.run') as mock_subprocess:
             # Check if certificate exists in bundle
-            result = instance.certificate_likely_exists_in_file(
+            instance.certificate_likely_exists_in_file(
                 str(cert_file), str(bundle_file)
             )
 
@@ -2030,17 +2021,17 @@ class TestPerformance(FumitmTestCase):
             instance = fumitm.FumitmPython(mode='install')
 
         # Mock the CERT_PATH to our test file
-        with patch.object(fumitm, 'CERT_PATH', str(cert_file)):
-            with patch('subprocess.run') as mock_subprocess:
+        with patch.object(fumitm, 'CERT_PATH', str(cert_file)), \
+                patch('subprocess.run') as mock_subprocess:
                 mock_subprocess.return_value = MagicMock(
                     returncode=0,
                     stdout="SHA256 Fingerprint=AA:BB:CC:DD"
                 )
 
                 # Call get_cert_fingerprint multiple times
-                fp1 = instance.get_cert_fingerprint(str(cert_file))
-                fp2 = instance.get_cert_fingerprint(str(cert_file))
-                fp3 = instance.get_cert_fingerprint(str(cert_file))
+                instance.get_cert_fingerprint(str(cert_file))
+                instance.get_cert_fingerprint(str(cert_file))
+                instance.get_cert_fingerprint(str(cert_file))
 
                 # Should only call subprocess once (cached after first call)
                 # Note: current implementation caches only for CERT_PATH
@@ -2570,7 +2561,6 @@ class TestToolResultAccuracy(FumitmTestCase):
 
             # keytool -list says not installed, keytool -import fails (permission denied)
             def run_side_effect(*args, **kwargs):
-                cmd = args[0]
                 result = MagicMock()
                 result.returncode = 1
                 result.stdout = b'Permission denied'
@@ -2701,9 +2691,7 @@ class TestToolResultAccuracy(FumitmTestCase):
         def isfile_side_effect(path):
             if path == modern_path:
                 return False  # it's a directory, not a file
-            if path == legacy_path:
-                return True
-            return False
+            return path == legacy_path
 
         with patch('os.path.isfile', side_effect=isfile_side_effect):
             result = instance.find_java_cacerts(java_home)
@@ -3286,8 +3274,6 @@ class TestBareReturnsFixed(FumitmTestCase):
     def test_brew_cacerts_status_mode_returns_skipped(self):
         """setup_brew_cacerts returns skipped in dry-run mode when bundle missing."""
         instance = self.create_fumitm_instance(mode='status')
-        brew_prefix = instance._get_brew_prefix()
-        bundle_path = os.path.join(brew_prefix, 'etc', 'ca-certificates', 'cert.pem')
         with patch.object(instance, 'command_exists', return_value=True), \
              patch('subprocess.run') as mock_run, \
              patch('os.path.exists', return_value=False):
@@ -3366,9 +3352,7 @@ class TestBareReturnsFixed(FumitmTestCase):
         def exists_side_effect(path):
             if path == python_bundle:
                 return True
-            if path == shell_config:
-                return True
-            return False
+            return path == shell_config
 
         shell_content = f'export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE="{python_bundle}"\n'
         mock_open_obj = mock_open(read_data=shell_content)
@@ -3410,9 +3394,7 @@ class TestBareReturnsFixed(FumitmTestCase):
         def exists_side_effect(path):
             if path == python_bundle:
                 return True
-            if path == shell_config:
-                return True
-            return False
+            return path == shell_config
 
         stale = 'export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE="/wrong/path.pem"\n'
         mock_open_obj = mock_open(read_data=stale)

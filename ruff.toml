@@ -1,0 +1,12 @@
+# Ruff runs with its default ruleset, minus rules that conflict with
+# deliberate patterns in this codebase:
+#
+# - BLE001 (blind-except): fumitm probes many external tools and environments
+#   on a best-effort basis and wraps those probes in broad `except Exception`
+#   handlers by design. The test suite's TestCodeQuality enforces this exact
+#   form over bare `except:`.
+# - S110 (try-except-pass): those same probes intentionally swallow failures
+#   and fall back to degraded behavior rather than aborting a run part-way.
+
+[lint]
+ignore = ["BLE001", "S110"]
