@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 
-import os
-import re
-import sys
-import subprocess
-import tempfile
-import shutil
 import argparse
-import platform
 import json
-import ssl
+import os
+import platform
 import pwd
-import urllib.request
+import re
+import shutil
+import ssl
+import subprocess
+import sys
+import tempfile
 import urllib.error
+import urllib.request
 from collections import namedtuple
 from datetime import datetime, timezone
 from pathlib import Path
@@ -59,7 +59,7 @@ def get_version_info():
             ['git', 'rev-parse', '--git-dir'],
             cwd=script_dir,
             capture_output=True,
-            text=True
+            text=True, check=False
         )
         
         if result.returncode == 0:
@@ -68,7 +68,7 @@ def get_version_info():
                 ['git', 'rev-parse', '--short', 'HEAD'],
                 cwd=script_dir,
                 capture_output=True,
-                text=True
+                text=True, check=False
             )
             if result.returncode == 0:
                 version_info['commit'] = result.stdout.strip()
@@ -78,7 +78,7 @@ def get_version_info():
                 ['git', 'log', '-1', '--format=%cd', '--date=short'],
                 cwd=script_dir,
                 capture_output=True,
-                text=True
+                text=True, check=False
             )
             if result.returncode == 0:
                 version_info['date'] = result.stdout.strip()
@@ -88,7 +88,7 @@ def get_version_info():
                 ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
                 cwd=script_dir,
                 capture_output=True,
-                text=True
+                text=True, check=False
             )
             if result.returncode == 0:
                 version_info['branch'] = result.stdout.strip()
@@ -98,7 +98,7 @@ def get_version_info():
                 ['git', 'status', '--porcelain'],
                 cwd=script_dir,
                 capture_output=True,
-                text=True
+                text=True, check=False
             )
             if result.returncode == 0 and result.stdout.strip():
                 version_info['dirty'] = True
@@ -109,7 +109,7 @@ def get_version_info():
                 cwd=script_dir,
                 capture_output=True,
                 text=True,
-                stderr=subprocess.DEVNULL
+                stderr=subprocess.DEVNULL, check=False
             )
             if result.returncode == 0 and result.stdout.strip():
                 version_info['version'] = result.stdout.strip()
@@ -119,7 +119,7 @@ def get_version_info():
                     ['git', 'rev-list', '--count', 'HEAD'],
                     cwd=script_dir,
                     capture_output=True,
-                    text=True
+                    text=True, check=False
                 )
                 if result.returncode == 0 and result.stdout.strip():
                     count = result.stdout.strip()
@@ -543,7 +543,7 @@ class FumitmPython:
             proc_pattern = 'Netskope Client' if plat == 'Darwin' else 'STAgent'
             result = subprocess.run(
                 ['pgrep', '-f', proc_pattern],
-                capture_output=True, text=True
+                capture_output=True, text=True, check=False
             )
             if result.returncode == 0 and result.stdout.strip():
                 return True
@@ -592,7 +592,7 @@ class FumitmPython:
                     ['security', 'find-certificate', '-c',
                      descriptor['keychain_label_prefix'],
                      '/Library/Keychains/System.keychain'],
-                    capture_output=True, text=True
+                    capture_output=True, text=True, check=False
                 )
                 if result.returncode == 0:
                     return True
@@ -635,7 +635,7 @@ class FumitmPython:
                 result = subprocess.run(
                     ['security', 'find-certificate', '-a', '-c', prefix, '-p',
                      '/Library/Keychains/System.keychain'],
-                    capture_output=True, text=True
+                    capture_output=True, text=True, check=False
                 )
                 if result.returncode == 0 and '-----BEGIN CERTIFICATE-----' in result.stdout:
                     roots = self._filter_certs_by_cn_prefix(result.stdout, prefix)
@@ -716,7 +716,7 @@ class FumitmPython:
         try:
             result = subprocess.run(
                 ['openssl', 'x509', '-noout', '-subject', '-in', tmp_path],
-                capture_output=True, text=True
+                capture_output=True, text=True, check=False
             )
             if result.returncode != 0:
                 return None
@@ -786,7 +786,7 @@ class FumitmPython:
             return list(self.tools_registry.keys())
         
         selected = []
-        for tool_key, tool_info in self.tools_registry.items():
+        for tool_key in self.tools_registry:
             if self.should_process_tool(tool_key):
                 selected.append(tool_key)
         
@@ -832,14 +832,14 @@ class FumitmPython:
         Directory mode (--log-dir / --json-log-dir): generates timestamped
         filenames and maintains a 'fumitm-latest' symlink to the most recent.
         """
-        ts = datetime.now().strftime('%Y%m%d-%H%M%S')
+        ts = datetime.now(timezone.utc).astimezone().strftime('%Y%m%d-%H%M%S')
         pid = os.getpid()
 
         if self._log_dir:
             try:
                 os.makedirs(self._log_dir, exist_ok=True)
                 path = os.path.join(self._log_dir, f"fumitm-{ts}-{pid}.log")
-                self._log_file_handle = open(path, 'w')
+                self._log_file_handle = open(path, 'w')  # noqa: SIM115 (closed in _close_log_files)
                 symlink = os.path.join(self._log_dir, 'fumitm-latest.log')
                 self._update_symlink(symlink, path)
             except OSError as e:
@@ -852,7 +852,7 @@ class FumitmPython:
                 parent = os.path.dirname(self._log_file_path)
                 if parent:
                     os.makedirs(parent, exist_ok=True)
-                self._log_file_handle = open(self._log_file_path, 'w')
+                self._log_file_handle = open(self._log_file_path, 'w')  # noqa: SIM115 (closed in _close_log_files)
             except OSError as e:
                 print(
                     f"[WARN] Cannot open log file {self._log_file_path}: {e}",
@@ -865,7 +865,7 @@ class FumitmPython:
                 path = os.path.join(
                     self._json_log_dir, f"fumitm-{ts}-{pid}.jsonl",
                 )
-                self._json_log_file_handle = open(path, 'w')
+                self._json_log_file_handle = open(path, 'w')  # noqa: SIM115 (closed in _close_log_files)
                 symlink = os.path.join(
                     self._json_log_dir, 'fumitm-latest.jsonl',
                 )
@@ -881,7 +881,7 @@ class FumitmPython:
                 parent = os.path.dirname(self._json_log_file_path)
                 if parent:
                     os.makedirs(parent, exist_ok=True)
-                self._json_log_file_handle = open(
+                self._json_log_file_handle = open(  # noqa: SIM115 (closed in _close_log_files)
                     self._json_log_file_path, 'w',
                 )
             except OSError as e:
@@ -943,7 +943,7 @@ class FumitmPython:
 
         # Text log: always strip ANSI, add timestamp
         if self._log_file_handle:
-            ts = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+            ts = datetime.now(timezone.utc).astimezone().strftime('%Y-%m-%dT%H:%M:%S')
             plain = self._strip_ansi(message)
             self._log_file_handle.write(
                 f"{ts} [{level.upper()}] {plain}\n"
@@ -1101,7 +1101,7 @@ class FumitmPython:
             result = subprocess.run(
                 ['git', 'version'],
                 capture_output=True, text=True, timeout=5,
-            )
+            check=False)
             return 'Apple Git' in result.stdout
         except Exception:
             return False
@@ -1372,14 +1372,14 @@ class FumitmPython:
 
         for var_name, var_value in broken_vars:
             self.print_error(f"  {var_name}={var_value}")
-            self.print_error(f"    FILE DOES NOT EXIST")
+            self.print_error("    FILE DOES NOT EXIST")
             print()
 
         # Provide remediation steps
         self.print_info("To fix in your CURRENT shell session:")
         for var_name, _ in broken_vars:
             if var_name.startswith('JAVA_OPTS'):
-                self.print_info(f"  unset JAVA_OPTS  # (or edit to remove trustStore)")
+                self.print_info("  unset JAVA_OPTS  # (or edit to remove trustStore)")
             else:
                 self.print_info(f"  unset {var_name}")
         print()
@@ -1512,7 +1512,7 @@ class FumitmPython:
             try:
                 result = subprocess.run(
                     ['openssl', 'x509', '-in', cert_path, '-noout', '-fingerprint', '-sha256'],
-                    capture_output=True, text=True
+                    capture_output=True, text=True, check=False
                 )
                 if result.returncode == 0:
                     fingerprint = result.stdout.strip().split('=')[1]
@@ -1530,14 +1530,14 @@ class FumitmPython:
         if not java_home and self.command_exists('java'):
             try:
                 if platform.system() == 'Darwin' and os.path.exists('/usr/libexec/java_home'):
-                    result = subprocess.run(['/usr/libexec/java_home'], capture_output=True, text=True)
+                    result = subprocess.run(['/usr/libexec/java_home'], capture_output=True, text=True, check=False)
                     if result.returncode == 0:
                         java_home = result.stdout.strip()
 
                 if not java_home:
                     result = subprocess.run(
                         ['java', '-XshowSettings:properties', '-version'],
-                        capture_output=True, text=True, stderr=subprocess.STDOUT
+                        capture_output=True, text=True, stderr=subprocess.STDOUT, check=False
                     )
                     for line in result.stdout.splitlines():
                         if 'java.home' in line:
@@ -1586,7 +1586,7 @@ class FumitmPython:
                         ['/usr/libexec/java_home', '-V'],
                         stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,
-                        text=True
+                        text=True, check=False
                     )
                     for line in result.stdout.splitlines():
                         if line and '/' in line and '/Contents/Home' in line:
@@ -1618,7 +1618,7 @@ class FumitmPython:
                 result = subprocess.run(
                     ['update-alternatives', '--list', 'java'],
                     capture_output=True,
-                    text=True
+                    text=True, check=False
                 )
                 if result.returncode == 0:
                     for line in result.stdout.splitlines():
@@ -2155,14 +2155,14 @@ class FumitmPython:
         self.print_info("The proxy certificate needs to be obtained from your Windows host machine.")
         print()
         self.print_info("QUICKEST METHOD:")
-        self.print_info(f"1. On your Windows host, open PowerShell/Terminal and run:")
+        self.print_info("1. On your Windows host, open PowerShell/Terminal and run:")
         self.print_info(f"   {BLUE}warp-cli certs --no-paginate{NC}")
-        self.print_info(f"2. Copy the entire output (including BEGIN/END lines)")
-        self.print_info(f"3. Come back here and paste it")
+        self.print_info("2. Copy the entire output (including BEGIN/END lines)")
+        self.print_info("3. Come back here and paste it")
         print()
         self.print_info("ALTERNATIVE METHOD:")
-        self.print_info(f"1. Save the certificate to a file accessible from this container")
-        self.print_info(f"2. Run: ./fumitm.py --fix --cert-file /path/to/cert.pem")
+        self.print_info("1. Save the certificate to a file accessible from this container")
+        self.print_info("2. Run: ./fumitm.py --fix --cert-file /path/to/cert.pem")
         print()
         
         if self.auto_yes:
@@ -2241,7 +2241,7 @@ class FumitmPython:
         try:
             result = subprocess.run(
                 ['warp-cli', 'certs', '--no-paginate'],
-                capture_output=True, text=True
+                capture_output=True, text=True, check=False
             )
             if result.returncode != 0 or not result.stdout.strip():
                 self.print_error("Failed to get certificate from warp-cli")
@@ -2324,7 +2324,7 @@ class FumitmPython:
             result = subprocess.run(
                 ['security', 'find-certificate', '-c', 'certadmin', '-p',
                  '/Library/Keychains/System.keychain'],
-                capture_output=True, text=True
+                capture_output=True, text=True, check=False
             )
             if result.returncode == 0 and '-----BEGIN CERTIFICATE-----' in result.stdout:
                 certs.append(result.stdout.strip())
@@ -2342,7 +2342,7 @@ class FumitmPython:
             result = subprocess.run(
                 ['security', 'find-certificate', '-c', 'goskope', '-p',
                  '/Library/Keychains/System.keychain'],
-                capture_output=True, text=True
+                capture_output=True, text=True, check=False
             )
             if result.returncode == 0 and '-----BEGIN CERTIFICATE-----' in result.stdout:
                 certs.append(result.stdout.strip())
@@ -2436,7 +2436,7 @@ class FumitmPython:
         try:
             result = subprocess.run(
                 ['openssl', 'x509', '-noout', '-in', temp_cert_path],
-                capture_output=True
+                capture_output=True, check=False
             )
             if result.returncode != 0:
                 self.print_error("Retrieved file is not a valid PEM certificate")
@@ -2522,7 +2522,7 @@ class FumitmPython:
             return False
         try:
             result = subprocess.run(
-                ['openssl', 'x509', '-noout', '-in', tmp], capture_output=True
+                ['openssl', 'x509', '-noout', '-in', tmp], capture_output=True, check=False
             )
             return result.returncode == 0
         except Exception:
@@ -2644,7 +2644,7 @@ class FumitmPython:
             result = subprocess.run(
                 [keytool_bin, '-list', '-alias', alias,
                  '-keystore', keystore, '-storepass', 'changeit'],
-                capture_output=True
+                capture_output=True, check=False
             )
             return result.returncode == 0 and alias in result.stdout.decode()
         except Exception:
@@ -2671,7 +2671,7 @@ class FumitmPython:
                 [keytool_bin, '-import', '-trustcacerts', '-alias', alias,
                  '-file', cert_path, '-keystore', keystore, '-storepass', 'changeit',
                  '-noprompt'],
-                capture_output=True, text=True
+                capture_output=True, text=True, check=False
             )
             if result.returncode == 0:
                 self.print_info(f"    ✓ {label}: {alias} added successfully")
@@ -2760,7 +2760,7 @@ class FumitmPython:
         try:
             result = subprocess.run(
                 ['brew', '--prefix'],
-                capture_output=True, text=True
+                capture_output=True, text=True, check=False
             )
             prefix = result.stdout.strip()
             if result.returncode == 0 and prefix:
@@ -2791,7 +2791,7 @@ class FumitmPython:
         try:
             result = subprocess.run(
                 ['brew', 'list', 'ca-certificates'],
-                capture_output=True, text=True
+                capture_output=True, text=True, check=False
             )
             if result.returncode != 0:
                 self.print_debug("Homebrew ca-certificates formula not installed")
@@ -2846,7 +2846,7 @@ class FumitmPython:
         """
         result = subprocess.run(
             ['brew', 'postinstall', 'ca-certificates'],
-            capture_output=True, text=True
+            capture_output=True, text=True, check=False
         )
         if result.returncode != 0:
             self.print_error("brew postinstall ca-certificates failed")
@@ -3002,7 +3002,7 @@ class FumitmPython:
         try:
             result = subprocess.run(
                 ['npm', 'config', 'get', 'cafile'],
-                capture_output=True, text=True
+                capture_output=True, text=True, check=False
             )
             current_cafile = result.stdout.strip() if result.returncode == 0 else ""
         except Exception:
@@ -3024,7 +3024,7 @@ class FumitmPython:
                     self._safe_makedirs(os.path.dirname(npm_bundle))
                     self.create_bundle_with_system_certs(npm_bundle)
                     self._append_all_proxy_roots(npm_bundle)
-                    subprocess.run(['npm', 'config', 'set', 'cafile', npm_bundle])
+                    subprocess.run(['npm', 'config', 'set', 'cafile', npm_bundle], check=False)
                     self.print_info(f"Migrated npm cafile to: {npm_bundle}")
                 return
 
@@ -3041,7 +3041,7 @@ class FumitmPython:
                         self._safe_makedirs(os.path.dirname(npm_bundle))
                         self.create_bundle_with_system_certs(npm_bundle)
                         self._append_all_proxy_roots(npm_bundle)
-                        subprocess.run(['npm', 'config', 'set', 'cafile', npm_bundle])
+                        subprocess.run(['npm', 'config', 'set', 'cafile', npm_bundle], check=False)
                         self.print_info(f"Repointed npm cafile to managed bundle: {npm_bundle}")
                     return
 
@@ -3062,16 +3062,16 @@ class FumitmPython:
                         else:
                             self._safe_makedirs(os.path.dirname(npm_bundle))
                             # Create a full bundle with system certs
-                            if not self.create_bundle_with_system_certs(npm_bundle):
+                            if (not self.create_bundle_with_system_certs(npm_bundle)
+                                    and os.path.exists(current_cafile)):
                                 # Copy existing bundle if available
-                                if os.path.exists(current_cafile):
-                                    shutil.copy(current_cafile, npm_bundle)
-                                    self._fix_ownership(npm_bundle)
+                                shutil.copy(current_cafile, npm_bundle)
+                                self._fix_ownership(npm_bundle)
 
                             # Append certificate to bundle
                             self._append_all_proxy_roots(npm_bundle)
 
-                            subprocess.run(['npm', 'config', 'set', 'cafile', npm_bundle])
+                            subprocess.run(['npm', 'config', 'set', 'cafile', npm_bundle], check=False)
                             self.print_info(f"Created new npm cafile at {npm_bundle}")
                     else:
                         if not self.is_install_mode():
@@ -3094,7 +3094,7 @@ class FumitmPython:
                         self._safe_makedirs(os.path.dirname(npm_bundle))
                         self.create_bundle_with_system_certs(npm_bundle)
                         self._append_all_proxy_roots(npm_bundle)
-                        subprocess.run(['npm', 'config', 'set', 'cafile', npm_bundle])
+                        subprocess.run(['npm', 'config', 'set', 'cafile', npm_bundle], check=False)
                         self.print_info(f"Created and configured npm cafile at {npm_bundle}")
         else:
             self.print_info("Configuring npm certificate...")
@@ -3110,14 +3110,14 @@ class FumitmPython:
                     if not self.create_bundle_with_system_certs(npm_bundle):
                         self.print_warn("Could not find system CA bundle, creating new bundle with only proxy certificate")
                     self._append_all_proxy_roots(npm_bundle)
-                    subprocess.run(['npm', 'config', 'set', 'cafile', npm_bundle])
+                    subprocess.run(['npm', 'config', 'set', 'cafile', npm_bundle], check=False)
                     self.print_info(f"Configured npm cafile to: {npm_bundle}")
                     
                     # Verify the setting
                     try:
                         result = subprocess.run(
                             ['npm', 'config', 'get', 'cafile'],
-                            capture_output=True, text=True
+                            capture_output=True, text=True, check=False
                         )
                         verify_cafile = result.stdout.strip()
                         if verify_cafile == npm_bundle:
@@ -3139,7 +3139,7 @@ class FumitmPython:
 
         try:
             # Detect yarn version (v1 vs Berry/v2+)
-            result = subprocess.run(['yarn', '--version'], capture_output=True, text=True)
+            result = subprocess.run(['yarn', '--version'], capture_output=True, text=True, check=False)
             yarn_version = result.stdout.strip()
             if not yarn_version:
                 return
@@ -3154,7 +3154,7 @@ class FumitmPython:
                 delete_cmd = ['yarn', 'config', 'delete', 'cafile']
 
             result = subprocess.run(['yarn', 'config', 'get', config_key],
-                                   capture_output=True, text=True)
+                                   capture_output=True, text=True, check=False)
             current_cafile = result.stdout.strip()
 
             # Check if set to something problematic
@@ -3181,7 +3181,7 @@ class FumitmPython:
                 self.print_action(f"Would remove yarn {config_key} config")
                 self.print_action("NODE_EXTRA_CA_CERTS will handle certificate trust for yarn")
             else:
-                subprocess.run(delete_cmd, capture_output=True)
+                subprocess.run(delete_cmd, capture_output=True, check=False)
                 self.print_info(f"Removed yarn {config_key} config")
                 self.print_info("yarn will now use NODE_EXTRA_CA_CERTS for certificate trust")
         except Exception as e:
@@ -3198,7 +3198,7 @@ class FumitmPython:
 
         try:
             result = subprocess.run(['pnpm', 'config', 'get', 'cafile'],
-                                   capture_output=True, text=True)
+                                   capture_output=True, text=True, check=False)
             current_cafile = result.stdout.strip()
 
             if not current_cafile or current_cafile in ['undefined', '']:
@@ -3224,7 +3224,7 @@ class FumitmPython:
                 self.print_action("Would remove pnpm cafile config")
                 self.print_action("NODE_EXTRA_CA_CERTS will handle certificate trust for pnpm")
             else:
-                subprocess.run(['pnpm', 'config', 'delete', 'cafile'], capture_output=True)
+                subprocess.run(['pnpm', 'config', 'delete', 'cafile'], capture_output=True, check=False)
                 self.print_info("Removed pnpm cafile config")
                 self.print_info("pnpm will now use NODE_EXTRA_CA_CERTS for certificate trust")
         except Exception as e:
@@ -3620,7 +3620,7 @@ class FumitmPython:
         try:
             result = subprocess.run(
                 ['gcloud', 'config', 'get-value', 'core/custom_ca_certs_file'],
-                capture_output=True, text=True
+                capture_output=True, text=True, check=False
             )
             current_ca_file = result.stdout.strip() if result.returncode == 0 else ""
         except Exception:
@@ -3642,7 +3642,7 @@ class FumitmPython:
                     self._safe_makedirs(gcloud_cert_dir)
                     self.create_bundle_with_system_certs(gcloud_bundle)
                     self._append_all_proxy_roots(gcloud_bundle)
-                    subprocess.run(['gcloud', 'config', 'set', 'core/custom_ca_certs_file', gcloud_bundle], capture_output=True, timeout=30)
+                    subprocess.run(['gcloud', 'config', 'set', 'core/custom_ca_certs_file', gcloud_bundle], capture_output=True, timeout=30, check=False)
                     self.print_info(f"Repointed gcloud custom CA file to managed bundle: {gcloud_bundle}")
                     return ToolResult('gcloud', 'configured', 'Repointed suspicious gcloud CA file')
                 return ToolResult('gcloud', 'skipped', 'Dry run')
@@ -3699,7 +3699,8 @@ class FumitmPython:
             result = subprocess.run(
                 ['gcloud', 'config', 'set', 'core/custom_ca_certs_file', gcloud_bundle],
                 capture_output=True,
-                timeout=30  # Add timeout to prevent hanging
+                timeout=30,  # Add timeout to prevent hanging
+                check=False
             )
             if result.returncode == 0:
                 self.print_info("gcloud configured successfully")
@@ -3707,7 +3708,7 @@ class FumitmPython:
                 if needs_setup and not self.is_devcontainer():
                     self.print_info("Running gcloud diagnostics...")
                     try:
-                        subprocess.run(['gcloud', 'info', '--run-diagnostics'], timeout=10)
+                        subprocess.run(['gcloud', 'info', '--run-diagnostics'], timeout=10, check=False)
                     except subprocess.TimeoutExpired:
                         self.print_warn("gcloud diagnostics timed out, skipping")
                 return ToolResult('gcloud', 'configured', 'Configured gcloud certificate')
@@ -3722,7 +3723,7 @@ class FumitmPython:
         git_bundle = os.path.join(self.bundle_dir, "git/ca-bundle.pem")
         # Check current setting
         try:
-            result = subprocess.run(['git', 'config', '--global', 'http.sslCAInfo'], capture_output=True, text=True)
+            result = subprocess.run(['git', 'config', '--global', 'http.sslCAInfo'], capture_output=True, text=True, check=False)
             current_ca = result.stdout.strip() if result.returncode == 0 else ""
         except Exception:
             current_ca = ""
@@ -3773,7 +3774,7 @@ class FumitmPython:
         self._safe_makedirs(os.path.dirname(git_bundle))
         self.create_bundle_with_system_certs(git_bundle)
         self._append_all_proxy_roots(git_bundle)
-        subprocess.run(['git', 'config', '--global', 'http.sslCAInfo', git_bundle], capture_output=True, text=True)
+        subprocess.run(['git', 'config', '--global', 'http.sslCAInfo', git_bundle], capture_output=True, text=True, check=False)
         self.print_info(f"Configured git http.sslCAInfo to: {git_bundle}")
         return ToolResult('git', 'configured', f'Set http.sslCAInfo to {git_bundle}')
 
@@ -3931,7 +3932,7 @@ class FumitmPython:
         has_issues = False
         if self.command_exists('git'):
             try:
-                result = subprocess.run(['git', 'config', '--global', 'http.sslCAInfo'], capture_output=True, text=True)
+                result = subprocess.run(['git', 'config', '--global', 'http.sslCAInfo'], capture_output=True, text=True, check=False)
                 git_ca = result.stdout.strip() if result.returncode == 0 else ""
                 if git_ca:
                     self.print_info(f"  http.sslCAInfo is set to: {git_ca}")
@@ -3981,7 +3982,7 @@ class FumitmPython:
 
                 # Check if it's using SecureTransport (macOS system curl)
                 try:
-                    result = subprocess.run(['curl', '--version'], capture_output=True, text=True)
+                    result = subprocess.run(['curl', '--version'], capture_output=True, text=True, check=False)
                     if 'SecureTransport' in result.stdout:
                         self.print_info("  ✓ Using macOS system curl with SecureTransport (uses system keychain)")
                     elif os.environ.get('CURL_CA_BUNDLE'):
@@ -4096,7 +4097,7 @@ class FumitmPython:
                 ['jenv', 'versions', '--verbose'],
                 capture_output=True,
                 text=True,
-                timeout=10
+                timeout=10, check=False
             )
 
             if result.returncode != 0:
@@ -4118,7 +4119,7 @@ class FumitmPython:
                     if os.path.exists(cacerts) or os.path.exists(jre_cacerts):
                         java_homes.add(path)
 
-            return sorted(list(java_homes))
+            return sorted(java_homes)
         except Exception as e:
             self.print_debug(f"Error getting jenv Java homes: {e}")
             return []
@@ -4362,7 +4363,7 @@ class FumitmPython:
         try:
             result = subprocess.run(
                 ['podman', 'machine', 'list'],
-                capture_output=True, text=True
+                capture_output=True, text=True, check=False
             )
             return 'Currently running' in result.stdout
         except Exception:
@@ -4375,7 +4376,7 @@ class FumitmPython:
                 result = subprocess.run(
                     ['podman', 'machine', 'ssh',
                      f'test -f /etc/pki/ca-trust/source/anchors/{cert_name}.pem'],
-                    capture_output=True
+                    capture_output=True, check=False
                 )
                 if result.returncode != 0:
                     return False
@@ -4399,14 +4400,14 @@ class FumitmPython:
                 result = subprocess.run(
                     ['podman', 'machine', 'ssh',
                      f'sudo tee /etc/pki/ca-trust/source/anchors/{cert_name}.pem'],
-                    input=cert_content, text=True, capture_output=True
+                    input=cert_content, text=True, capture_output=True, check=False
                 )
                 if result.returncode != 0:
                     return False, 'Failed to copy certificate into VM'
 
             result = subprocess.run(
                 ['podman', 'machine', 'ssh', 'sudo update-ca-trust'],
-                capture_output=True
+                capture_output=True, check=False
             )
             if result.returncode == 0:
                 return True, 'Certificate installed in Podman VM'
@@ -4486,7 +4487,7 @@ class FumitmPython:
                 result = subprocess.run(
                     ['rdctl', 'shell', 'test', '-f',
                      f'/usr/local/share/ca-certificates/{cert_name}.crt'],
-                    capture_output=True
+                    capture_output=True, check=False
                 )
                 if result.returncode != 0:
                     return False
@@ -4507,14 +4508,14 @@ class FumitmPython:
                 result = subprocess.run(
                     ['rdctl', 'shell', 'sudo', 'tee',
                      f'/usr/local/share/ca-certificates/{cert_name}.crt'],
-                    input=cert_content, text=True, capture_output=True
+                    input=cert_content, text=True, capture_output=True, check=False
                 )
                 if result.returncode != 0:
                     return False, 'Failed to copy certificate into VM'
 
             result = subprocess.run(
                 ['rdctl', 'shell', 'sudo', 'update-ca-certificates'],
-                capture_output=True
+                capture_output=True, check=False
             )
             if result.returncode == 0:
                 return True, 'Certificate installed in Rancher Desktop VM'
@@ -4539,7 +4540,7 @@ class FumitmPython:
         vm_is_running = False
         vm_needs_cert = False
         try:
-            result = subprocess.run(['rdctl', 'version'], capture_output=True, text=True)
+            result = subprocess.run(['rdctl', 'version'], capture_output=True, text=True, check=False)
             vm_is_running = result.returncode == 0
             if vm_is_running:
                 vm_needs_cert = not self._check_cert_in_rancher_vm()
@@ -4600,7 +4601,7 @@ class FumitmPython:
 
         # Check if any emulator is running
         try:
-            result = subprocess.run(['adb', 'devices'], capture_output=True, text=True)
+            result = subprocess.run(['adb', 'devices'], capture_output=True, text=True, check=False)
             running_devices = sum(1 for line in result.stdout.splitlines() if 'emulator-' in line)
 
             if running_devices == 0:
@@ -4625,14 +4626,14 @@ class FumitmPython:
                 self.print_info("Installing certificate on Android emulator...")
 
                 # Restart ADB with root
-                result = subprocess.run(['adb', 'root'], capture_output=True)
+                result = subprocess.run(['adb', 'root'], capture_output=True, check=False)
                 if result.returncode != 0:
                     self.print_error("Failed to restart ADB with root permissions")
                     self.print_info("Make sure your emulator doesn't have Google Play Store")
                     return ToolResult('android', 'failed', 'Failed to restart ADB with root permissions')
 
                 # Remount system partition
-                result = subprocess.run(['adb', 'remount'], capture_output=True)
+                result = subprocess.run(['adb', 'remount'], capture_output=True, check=False)
                 if result.returncode != 0:
                     self.print_error("Failed to remount system partition")
                     self.print_info("Make sure emulator was started with -writable-system flag")
@@ -4643,17 +4644,17 @@ class FumitmPython:
                 for cert_name, cert_path in self._all_container_certs():
                     dest = f'/system/etc/security/cacerts/{cert_name}.pem'
                     result = subprocess.run(
-                        ['adb', 'push', cert_path, dest], capture_output=True
+                        ['adb', 'push', cert_path, dest], capture_output=True, check=False
                     )
                     if result.returncode != 0:
                         push_failed = True
                         break
                     subprocess.run(
-                        ['adb', 'shell', 'chmod', '644', dest], capture_output=True
+                        ['adb', 'shell', 'chmod', '644', dest], capture_output=True, check=False
                     )
                 if not push_failed:
                     self.print_info("Certificate installed. Rebooting emulator...")
-                    subprocess.run(['adb', 'reboot'], capture_output=True)
+                    subprocess.run(['adb', 'reboot'], capture_output=True, check=False)
                     self.print_info("Android emulator certificate installed successfully")
                     return ToolResult('android', 'configured', 'Certificate installed on emulator')
                 else:
@@ -4669,7 +4670,7 @@ class FumitmPython:
                 result = subprocess.run(
                     ['colima', 'ssh', '--', 'test', '-f',
                      f'/usr/local/share/ca-certificates/{cert_name}.crt'],
-                    capture_output=True
+                    capture_output=True, check=False
                 )
                 if result.returncode != 0:
                     return False
@@ -4690,14 +4691,14 @@ class FumitmPython:
                 result = subprocess.run(
                     ['colima', 'ssh', '--', 'sudo', 'tee',
                      f'/usr/local/share/ca-certificates/{cert_name}.crt'],
-                    input=cert_content, text=True, capture_output=True
+                    input=cert_content, text=True, capture_output=True, check=False
                 )
                 if result.returncode != 0:
                     return False, 'Failed to copy certificate into VM'
 
             result = subprocess.run(
                 ['colima', 'ssh', '--', 'sudo', 'update-ca-certificates'],
-                capture_output=True
+                capture_output=True, check=False
             )
             if result.returncode == 0:
                 return True, 'Certificate installed in Colima VM'
@@ -4723,7 +4724,7 @@ class FumitmPython:
         vm_is_running = False
         vm_needs_cert = False
         try:
-            status_result = subprocess.run(['colima', 'status'], capture_output=True)
+            status_result = subprocess.run(['colima', 'status'], capture_output=True, check=False)
             vm_is_running = (status_result.returncode == 0)
             if vm_is_running:
                 vm_needs_cert = not self._check_cert_in_colima_vm()
@@ -4780,7 +4781,7 @@ class FumitmPython:
         try:
             result = subprocess.run(
                 ['docker', 'info'],
-                capture_output=True, text=True, timeout=10
+                capture_output=True, text=True, timeout=10, check=False
             )
             return result.returncode == 0
         except Exception:
@@ -4802,12 +4803,13 @@ class FumitmPython:
             try:
                 result = subprocess.run(
                     ['docker', 'image', 'inspect', image],
-                    capture_output=True, timeout=5
+                    capture_output=True, timeout=5, check=False
                 )
                 if result.returncode == 0:
                     self.print_debug(f"Using locally cached image: {image}")
                     return image
             except Exception:
+                self.print_debug(f"Image inspect failed for {image}")
                 continue
         return None
 
@@ -4827,7 +4829,7 @@ class FumitmPython:
             try:
                 pull = subprocess.run(
                     ['docker', 'pull', 'alpine:latest'],
-                    capture_output=True, timeout=30
+                    capture_output=True, timeout=30, check=False
                 )
                 if pull.returncode == 0:
                     image = 'alpine:latest'
@@ -4844,7 +4846,7 @@ class FumitmPython:
         kwargs = {'capture_output': True, 'text': True, 'timeout': timeout}
         if stdin_data is not None:
             kwargs['input'] = stdin_data
-        return subprocess.run(cmd, **kwargs)
+        return subprocess.run(cmd, **kwargs, check=False)
 
     def _check_cert_in_docker_vm(self):
         """Check whether the proxy CA cert exists in the Docker VM.
@@ -4920,7 +4922,7 @@ class FumitmPython:
             if self.command_exists(tool):
                 try:
                     result = subprocess.run(
-                        cmd, capture_output=True, timeout=30
+                        cmd, capture_output=True, timeout=30, check=False
                     )
                     if result.returncode == 0:
                         self.print_info("Docker engine restarted")
@@ -5091,7 +5093,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 try:
                     proc_result = subprocess.run(
                         ['node', '-e', node_script],
-                        capture_output=True, text=True
+                        capture_output=True, text=True, check=False
                     )
                     
                     if proc_result.returncode == 0:
@@ -5155,7 +5157,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     # Check curl version for SecureTransport
                     version_result = subprocess.run(
                         ['curl', '--version'],
-                        capture_output=True, text=True
+                        capture_output=True, text=True, check=False
                     )
                     self.print_debug(f"curl version: {version_result.stdout.splitlines()[0]}")
                     
@@ -5163,12 +5165,12 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     if self.is_debug_mode():
                         curl_result = subprocess.run(
                             ['curl', '-v', '-s', '-o', '/dev/null', test_url],
-                            capture_output=True, text=True
+                            capture_output=True, text=True, check=False
                         )
                     else:
                         curl_result = subprocess.run(
                             ['curl', '-s', '-o', '/dev/null', test_url],
-                            capture_output=True
+                            capture_output=True, check=False
                         )
                     
                     if curl_result.returncode == 0:
@@ -5198,12 +5200,12 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     if self.is_debug_mode():
                         wget_result = subprocess.run(
                             ['wget', '--debug', '-O', '/dev/null', test_url],
-                            capture_output=True, text=True
+                            capture_output=True, text=True, check=False
                         )
                     else:
                         wget_result = subprocess.run(
                             ['wget', '-q', '-O', '/dev/null', test_url],
-                            capture_output=True
+                            capture_output=True, check=False
                         )
                     
                     if wget_result.returncode == 0:
@@ -5235,7 +5237,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     # SSL issues.
                     aws_result = subprocess.run(
                         ['aws', '--no-sign-request', 'sts', 'get-caller-identity'],
-                        capture_output=True, text=True, timeout=15
+                        capture_output=True, text=True, timeout=15, check=False
                     )
 
                     stderr_lower = aws_result.stderr.lower()
@@ -5271,7 +5273,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     # to succeed.
                     gcloud_result = subprocess.run(
                         ['gcloud', 'projects', 'list', '--limit=1'],
-                        capture_output=True, text=True, timeout=15
+                        capture_output=True, text=True, timeout=15, check=False
                     )
 
                     # Check for SSL-specific errors in stderr
@@ -5310,7 +5312,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         try:
             result = subprocess.run(
                 ['brew', 'list', 'ca-certificates'],
-                capture_output=True, text=True
+                capture_output=True, text=True, check=False
             )
             if result.returncode != 0:
                 self.print_info(
@@ -5386,7 +5388,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             # Check npm
             if self.command_exists('npm'):
                 try:
-                    result = subprocess.run(['npm', 'config', 'get', 'cafile'], capture_output=True, text=True)
+                    result = subprocess.run(['npm', 'config', 'get', 'cafile'], capture_output=True, text=True, check=False)
                     npm_cafile = result.stdout.strip() if result.returncode == 0 else ""
                     
                     if npm_cafile and npm_cafile not in ["null", "undefined"]:
@@ -5418,13 +5420,13 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             # Check yarn for stale cafile config
             if self.command_exists('yarn'):
                 try:
-                    result = subprocess.run(['yarn', '--version'], capture_output=True, text=True)
+                    result = subprocess.run(['yarn', '--version'], capture_output=True, text=True, check=False)
                     yarn_version = result.stdout.strip()
                     is_berry = yarn_version and yarn_version[0] in ('2', '3', '4')
                     config_key = 'httpsCaFilePath' if is_berry else 'cafile'
 
                     result = subprocess.run(['yarn', 'config', 'get', config_key],
-                                           capture_output=True, text=True)
+                                           capture_output=True, text=True, check=False)
                     yarn_cafile = result.stdout.strip()
 
                     if yarn_cafile and yarn_cafile not in ['undefined', '']:
@@ -5456,7 +5458,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             if self.command_exists('pnpm'):
                 try:
                     result = subprocess.run(['pnpm', 'config', 'get', 'cafile'],
-                                           capture_output=True, text=True)
+                                           capture_output=True, text=True, check=False)
                     pnpm_cafile = result.stdout.strip()
 
                     if pnpm_cafile and pnpm_cafile not in ['undefined', '']:
@@ -5503,15 +5505,15 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 # a required root (e.g. the Aikido supplemental root) leaves uv
                 # broken even though Python itself works, so flag it explicitly.
                 ssl_cert_file = os.environ.get('SSL_CERT_FILE', '')
-                if ssl_cert_file and os.path.exists(ssl_cert_file):
-                    if not self._status_roots_present(temp_warp_cert, ssl_cert_file):
-                        self.print_warn(
-                            f"  ✗ SSL_CERT_FILE ({ssl_cert_file}) is missing a required root"
-                        )
-                        self.print_action(
-                            "    Run with --fix to add all roots (needed by uv/rustls clients)"
-                        )
-                        has_issues = True
+                if (ssl_cert_file and os.path.exists(ssl_cert_file)
+                        and not self._status_roots_present(temp_warp_cert, ssl_cert_file)):
+                    self.print_warn(
+                        f"  ✗ SSL_CERT_FILE ({ssl_cert_file}) is missing a required root"
+                    )
+                    self.print_action(
+                        "    Run with --fix to add all roots (needed by uv/rustls clients)"
+                    )
+                    has_issues = True
             else:
                 # Python doesn't trust system cert, check environment variables
                 python_configured = False
@@ -5538,15 +5540,15 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 ssl_cert_file = os.environ.get('SSL_CERT_FILE', '')
                 if ssl_cert_file:
                     self.print_info(f"  SSL_CERT_FILE is set to: {ssl_cert_file}")
-                    if os.path.exists(ssl_cert_file):
-                        if self._status_roots_present(temp_warp_cert, ssl_cert_file):
-                            self.print_info("  ✓ SSL_CERT_FILE contains current certificate")
-                            suspicious, reason = self.is_suspicious_full_bundle(ssl_cert_file, None)
-                            if suspicious:
-                                self.print_warn(f"  ⚠ SSL_CERT_FILE looks suspiciously small ({reason})")
-                                self.print_action("    Run with --fix to repoint to a full CA bundle")
-                                has_issues = True
-                            python_configured = True
+                    if (os.path.exists(ssl_cert_file)
+                            and self._status_roots_present(temp_warp_cert, ssl_cert_file)):
+                        self.print_info("  ✓ SSL_CERT_FILE contains current certificate")
+                        suspicious, reason = self.is_suspicious_full_bundle(ssl_cert_file, None)
+                        if suspicious:
+                            self.print_warn(f"  ⚠ SSL_CERT_FILE looks suspiciously small ({reason})")
+                            self.print_action("    Run with --fix to repoint to a full CA bundle")
+                            has_issues = True
+                        python_configured = True
                 
                 if not python_configured:
                     if not requests_ca_bundle and not ssl_cert_file:
@@ -5576,7 +5578,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 try:
                     result = subprocess.run(
                         ['gcloud', 'config', 'get-value', 'core/custom_ca_certs_file'],
-                        capture_output=True, text=True
+                        capture_output=True, text=True, check=False
                     )
                     gcloud_ca = result.stdout.strip() if result.returncode == 0 else ""
 
@@ -5600,7 +5602,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 try:
                     result = subprocess.run(
                         ['gcloud', 'config', 'get-value', 'core/custom_ca_certs_file'],
-                        capture_output=True, text=True
+                        capture_output=True, text=True, check=False
                     )
                     gcloud_ca = result.stdout.strip() if result.returncode == 0 else ""
 
@@ -5626,7 +5628,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 try:
                     result = subprocess.run(
                         ['gcloud', 'config', 'get-value', 'core/custom_ca_certs_file'],
-                        capture_output=True, text=True
+                        capture_output=True, text=True, check=False
                     )
                     gcloud_ca = result.stdout.strip() if result.returncode == 0 else ""
 
@@ -5682,7 +5684,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 result = subprocess.run(
                     ['keytool', '-list', '-alias', self.provider['keytool_alias'],
                      '-keystore', cacerts, '-storepass', 'changeit'],
-                    capture_output=True
+                    capture_output=True, check=False
                 )
                 if result.returncode == 0:
                     self.print_info(f"  ✓ {version_name}: Certificate installed")
@@ -5723,7 +5725,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 result = subprocess.run(
                     ['keytool', '-list', '-alias', self.provider['keytool_alias'],
                      '-keystore', cacerts, '-storepass', 'changeit'],
-                    capture_output=True
+                    capture_output=True, check=False
                 )
                 if result.returncode == 0 and self.provider['keytool_alias'] in result.stdout.decode():
                     self.print_info(f"    ✓ {version_name}: Certificate installed")
@@ -5776,7 +5778,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     result = subprocess.run(
                         [dbeaver_keytool, '-list', '-alias', self.provider['keytool_alias'],
                          '-keystore', dbeaver_cacerts, '-storepass', 'changeit'],
-                        capture_output=True
+                        capture_output=True, check=False
                     )
                     if result.returncode == 0 and self.provider['keytool_alias'] in result.stdout.decode():
                         self.print_info("  ✓ DBeaver keystore contains proxy certificate")
@@ -5849,12 +5851,12 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
 
             # Check VM status if running
             try:
-                result = subprocess.run(['podman', 'machine', 'list'], capture_output=True, text=True)
+                result = subprocess.run(['podman', 'machine', 'list'], capture_output=True, text=True, check=False)
                 if 'Currently running' in result.stdout:
                     # VM is running - also check certificate in VM
                     result = subprocess.run(
                         ['podman', 'machine', 'ssh', f'test -f /etc/pki/ca-trust/source/anchors/{self.provider["container_cert_name"]}.pem'],
-                        capture_output=True
+                        capture_output=True, check=False
                     )
                     if result.returncode == 0:
                         self.print_info("  ✓ Certificate installed in running VM")
@@ -5891,7 +5893,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
 
             # Check VM status if running
             try:
-                version_result = subprocess.run(['rdctl', 'version'], capture_output=True, text=True)
+                version_result = subprocess.run(['rdctl', 'version'], capture_output=True, text=True, check=False)
                 if version_result.returncode == 0:
                     if self._check_cert_in_rancher_vm():
                         self.print_info("  ✓ Certificate installed in running VM")
@@ -5945,7 +5947,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         has_issues = False
         if self.command_exists('adb') and self.command_exists('emulator'):
             try:
-                result = subprocess.run(['adb', 'devices'], capture_output=True, text=True)
+                result = subprocess.run(['adb', 'devices'], capture_output=True, text=True, check=False)
                 running_emulators = sum(1 for line in result.stdout.splitlines() if 'emulator-' in line)
                 if running_emulators > 0:
                     self.print_info("  - Android emulator detected (manual installation available)")
@@ -5981,7 +5983,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
 
             # Check VM status if running
             try:
-                status_result = subprocess.run(['colima', 'status'], capture_output=True)
+                status_result = subprocess.run(['colima', 'status'], capture_output=True, check=False)
                 if status_result.returncode == 0:
                     if self._check_cert_in_colima_vm():
                         self.print_info("  ✓ Certificate installed in running VM")
@@ -6010,7 +6012,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             try:
                 result = subprocess.run(
                     ['warp-cli', 'certs', '--no-paginate'],
-                    capture_output=True, text=True
+                    capture_output=True, text=True, check=False
                 )
                 if result.returncode == 0 and result.stdout.strip():
                     with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as tf:
@@ -6054,7 +6056,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             self.print_status(f"{provider_name} Connection:")
             if self.command_exists('warp-cli'):
                 try:
-                    result = subprocess.run(['warp-cli', 'status'], capture_output=True, text=True)
+                    result = subprocess.run(['warp-cli', 'status'], capture_output=True, text=True, check=False)
                     warp_status = result.stdout if result.returncode == 0 else "unknown"
                     if "Connected" in warp_status:
                         self.print_info(f"  ✓ {short} is connected")
@@ -6079,7 +6081,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             try:
                 result = subprocess.run(
                     ['pgrep', '-f', proc_pattern],
-                    capture_output=True, text=True
+                    capture_output=True, text=True, check=False
                 )
                 if result.returncode == 0 and result.stdout.strip():
                     self.print_info(f"  ✓ {proc_label} is running")
@@ -6135,7 +6137,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         try:
             result = subprocess.run(
                 ['openssl', 'x509', '-noout', '-checkend', '86400', '-in', temp_warp_cert],
-                capture_output=True
+                capture_output=True, check=False
             )
             if result.returncode == 0:
                 self.print_info(f"  ✓ {short} certificate is valid")
@@ -6156,24 +6158,24 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 
                 # Check NODE_EXTRA_CA_CERTS
                 node_extra_ca_certs = os.environ.get('NODE_EXTRA_CA_CERTS', '')
-                if node_extra_ca_certs and os.path.exists(node_extra_ca_certs):
-                    if self.certificate_exists_in_file(temp_warp_cert, node_extra_ca_certs):
-                        cert_locations.append(f"    - {node_extra_ca_certs} (NODE_EXTRA_CA_CERTS)")
-                        cert_found = True
+                if (node_extra_ca_certs and os.path.exists(node_extra_ca_certs)
+                        and self.certificate_exists_in_file(temp_warp_cert, node_extra_ca_certs)):
+                    cert_locations.append(f"    - {node_extra_ca_certs} (NODE_EXTRA_CA_CERTS)")
+                    cert_found = True
                 
                 # Check REQUESTS_CA_BUNDLE
                 requests_ca_bundle = os.environ.get('REQUESTS_CA_BUNDLE', '')
-                if requests_ca_bundle and os.path.exists(requests_ca_bundle):
-                    if self.certificate_exists_in_file(temp_warp_cert, requests_ca_bundle):
-                        cert_locations.append(f"    - {requests_ca_bundle} (REQUESTS_CA_BUNDLE)")
-                        cert_found = True
+                if (requests_ca_bundle and os.path.exists(requests_ca_bundle)
+                        and self.certificate_exists_in_file(temp_warp_cert, requests_ca_bundle)):
+                    cert_locations.append(f"    - {requests_ca_bundle} (REQUESTS_CA_BUNDLE)")
+                    cert_found = True
                 
                 # Check SSL_CERT_FILE
                 ssl_cert_file = os.environ.get('SSL_CERT_FILE', '')
-                if ssl_cert_file and os.path.exists(ssl_cert_file):
-                    if self.certificate_exists_in_file(temp_warp_cert, ssl_cert_file):
-                        cert_locations.append(f"    - {ssl_cert_file} (SSL_CERT_FILE)")
-                        cert_found = True
+                if (ssl_cert_file and os.path.exists(ssl_cert_file)
+                        and self.certificate_exists_in_file(temp_warp_cert, ssl_cert_file)):
+                    cert_locations.append(f"    - {ssl_cert_file} (SSL_CERT_FILE)")
+                    cert_found = True
                 
                 if cert_found:
                     self.print_info(f"  ✓ {short} certificate found in:")

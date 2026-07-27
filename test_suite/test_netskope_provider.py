@@ -6,12 +6,12 @@ and verifies that provider-specific values flow through to bundle paths,
 keytool aliases, and container certificate filenames.
 """
 import os
-import sys
-from unittest.mock import patch, MagicMock, mock_open
-import pytest
+from typing import ClassVar
+from unittest.mock import MagicMock, mock_open, patch
 
-from helpers import FumitmTestCase, MockBuilder
 import mock_data
+import pytest
+from helpers import FumitmTestCase
 
 import fumitm
 
@@ -279,12 +279,12 @@ class TestProviderCLI(FumitmTestCase):
     """Tests for --provider CLI argument."""
 
     # Default kwargs for new headless/MDM flags
-    _DEFAULT_NEW_KWARGS = dict(
-        no_color=False, headless=False, skip_update_check=False,
-        log_file=None, log_dir=None, json_log_file=None, json_log_dir=None,
-        run_as_user=None, with_aikido=False, no_aikido=False,
-        aikido_cert_file=None,
-    )
+    _DEFAULT_NEW_KWARGS: ClassVar[dict] = {
+        'no_color': False, 'headless': False, 'skip_update_check': False,
+        'log_file': None, 'log_dir': None, 'json_log_file': None, 'json_log_dir': None,
+        'run_as_user': None, 'with_aikido': False, 'no_aikido': False,
+        'aikido_cert_file': None,
+    }
 
     @patch('fumitm.sys.argv', ['fumitm.py', '--provider', 'netskope'])
     def test_cli_provider_netskope(self):

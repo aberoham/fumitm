@@ -4,19 +4,19 @@ Integration tests for fumitm_windows.py
 These tests verify the Windows port's functionality, particularly the
 certificate appending logic and newline handling fix for issue #13.
 """
-import sys
 import re
-import pytest
+import sys
 from unittest.mock import patch
+
+import pytest
 
 # Skip entire module on non-Windows platforms
 if sys.platform != 'win32':
     pytest.skip("Windows-only tests", allow_module_level=True)
 
 # Import test utilities
-from helpers import import_fumitm_windows
 import mock_data
-
+from helpers import import_fumitm_windows
 
 # Import the Windows module using our helper
 fumitm_windows = import_fumitm_windows()

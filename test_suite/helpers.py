@@ -3,9 +3,9 @@ Test helpers and utilities for fumitm tests.
 
 This module provides helper classes and functions to simplify test setup and assertions.
 """
-from unittest.mock import MagicMock, patch, mock_open
-from pathlib import Path
 from contextlib import contextmanager
+from unittest.mock import MagicMock, mock_open, patch
+
 import mock_data
 
 

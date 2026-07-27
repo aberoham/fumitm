@@ -4,10 +4,9 @@ Pytest configuration for fumitm integration tests.
 This module provides shared fixtures and configuration for all tests.
 """
 import sys
-import os
 from pathlib import Path
+
 import pytest
-from unittest.mock import MagicMock, patch
 
 # Add parent directory to path so we can import fumitm.py
 sys.path.insert(0, str(Path(__file__).parent.parent))

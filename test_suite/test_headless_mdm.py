@@ -7,14 +7,14 @@ accuracy, exit codes, and orchestrator environment simulations.
 """
 import json
 import os
-import sys
 import tempfile
 from datetime import datetime
-from unittest.mock import patch, MagicMock
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
-
 from helpers import FumitmTestCase
+
 import fumitm
 from fumitm import NonInteractiveError, ToolResult
 
@@ -163,7 +163,7 @@ class TestLogFile(FumitmTestCase):
             instance.print_info("test message")
             instance._close_log_files()
 
-            content = open(path).read()
+            content = Path(path).read_text()
             assert '[INFO] test message' in content
             assert '\033[' not in content
         finally:
@@ -180,7 +180,7 @@ class TestLogFile(FumitmTestCase):
             instance.print_info("hello")
             instance._close_log_files()
 
-            line = open(path).readline()
+            line = Path(path).read_text().splitlines()[0]
             # Format: 2026-03-03T14:30:00 [INFO] hello
             assert line[4] == '-' and line[10] == 'T'
         finally:
@@ -201,7 +201,7 @@ class TestLogFile(FumitmTestCase):
             # Symlink points to a real file with content
             target = os.path.join(tmpdir, os.readlink(symlink))
             assert os.path.isfile(target)
-            content = open(target).read()
+            content = Path(target).read_text()
             assert 'run one' in content
 
     def test_log_dir_symlink_updates_on_second_run(self):
@@ -211,8 +211,8 @@ class TestLogFile(FumitmTestCase):
                 no_color=True, log_dir=tmpdir
             )
             with patch('fumitm.datetime') as mock_dt:
-                mock_dt.now.return_value.strftime.return_value = '20260101-000001'
-                mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+                mock_dt.now.return_value.astimezone.return_value.strftime.return_value = '20260101-000001'
+                mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # noqa: DTZ001 (mock passthrough)
                 inst1._open_log_files()
             inst1.print_info("first")
             inst1._close_log_files()
@@ -224,8 +224,8 @@ class TestLogFile(FumitmTestCase):
                 no_color=True, log_dir=tmpdir
             )
             with patch('fumitm.datetime') as mock_dt:
-                mock_dt.now.return_value.strftime.return_value = '20260101-000002'
-                mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+                mock_dt.now.return_value.astimezone.return_value.strftime.return_value = '20260101-000002'
+                mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # noqa: DTZ001 (mock passthrough)
                 inst2._open_log_files()
             inst2.print_info("second")
             inst2._close_log_files()
@@ -235,7 +235,7 @@ class TestLogFile(FumitmTestCase):
             assert first_target != second_target
             assert os.path.isfile(os.path.join(tmpdir, first_target))
             assert os.path.isfile(os.path.join(tmpdir, second_target))
-            assert 'second' in open(os.path.join(tmpdir, second_target)).read()
+            assert 'second' in Path(tmpdir, second_target).read_text()
 
 
     def test_unwritable_log_path_warns_continues(self, capsys):
@@ -296,7 +296,7 @@ class TestJsonLogFile(FumitmTestCase):
             instance.print_error("bad thing")
             instance._close_log_files()
 
-            lines = open(path).readlines()
+            lines = Path(path).read_text().splitlines()
             assert len(lines) == 2
             for line in lines:
                 event = json.loads(line)
@@ -326,7 +326,7 @@ class TestJsonLogFile(FumitmTestCase):
             instance.print_error("error msg")
             instance._close_log_files()
 
-            lines = [json.loads(l) for l in open(path)]
+            lines = [json.loads(l) for l in Path(path).read_text().splitlines()]
             assert lines[0]['level'] == 'info'
             assert lines[1]['level'] == 'warn'
             assert lines[2]['level'] == 'error'
@@ -345,7 +345,7 @@ class TestJsonLogFile(FumitmTestCase):
             symlink = os.path.join(tmpdir, 'fumitm-latest.jsonl')
             assert os.path.islink(symlink)
             target = os.path.join(tmpdir, os.readlink(symlink))
-            event = json.loads(open(target).readline())
+            event = json.loads(Path(target).read_text().splitlines()[0])
             assert 'hello json' in event['message']
 
     def test_json_log_no_ansi(self):
@@ -359,7 +359,7 @@ class TestJsonLogFile(FumitmTestCase):
             instance.print_info("clean")
             instance._close_log_files()
 
-            event = json.loads(open(path).readline())
+            event = json.loads(Path(path).read_text().splitlines()[0])
             assert '\033[' not in event['message']
         finally:
             os.unlink(path)
@@ -382,7 +382,7 @@ class TestJsonLogFile(FumitmTestCase):
             instance._run_setup('test-tool', failing_setup)
             instance._close_log_files()
 
-            events = [json.loads(line) for line in open(path)]
+            events = [json.loads(line) for line in Path(path).read_text().splitlines()]
             error_events = [e for e in events if e['level'] == 'error']
             assert len(error_events) >= 1
             assert error_events[0]['phase'] == 'tool'
@@ -587,10 +587,10 @@ class TestRunAsUser(FumitmTestCase):
 
     def test_run_as_user_requires_root(self):
         """--run-as-user from non-root must fail at argparse level."""
-        with patch('fumitm.sys.argv', ['fumitm.py', '--run-as-user', 'bob']):
-            with patch('os.getuid', return_value=1000):
-                with pytest.raises(SystemExit):
-                    fumitm.main()
+        with patch('fumitm.sys.argv', ['fumitm.py', '--run-as-user', 'bob']), \
+                patch('os.getuid', return_value=1000), \
+                pytest.raises(SystemExit):
+            fumitm.main()
 
     def test_apply_target_user_sets_home(self):
         """_apply_target_user sets HOME to target user's home dir."""
@@ -681,9 +681,9 @@ class TestRunAsUser(FumitmTestCase):
     def test_apply_target_user_upn_both_fail(self):
         """UPN fallback exits when both full and short name fail."""
         instance = self.create_fumitm_instance()
-        with patch('fumitm.pwd.getpwnam', side_effect=KeyError('nope')):
-            with pytest.raises(SystemExit):
-                instance._apply_target_user('ghost@domain.com')
+        with patch('fumitm.pwd.getpwnam', side_effect=KeyError('nope')), \
+                pytest.raises(SystemExit):
+            instance._apply_target_user('ghost@domain.com')
 
     def test_apply_target_user_augments_path_arm64(self):
         """_apply_target_user prepends /opt/homebrew/bin on Apple Silicon."""
