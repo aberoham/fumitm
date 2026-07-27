@@ -3778,6 +3778,158 @@ class FumitmPython:
         self.print_info(f"Configured git http.sslCAInfo to: {git_bundle}")
         return ToolResult('git', 'configured', f'Set http.sslCAInfo to {git_bundle}')
 
+    def _find_effective_curlrc(self):
+        """Return the config file curl would read, or None if there is none.
+
+        curl uses only the first file found, checking $CURL_HOME/.curlrc,
+        then $XDG_CONFIG_HOME/curlrc, then ~/.curlrc.
+        """
+        candidates = []
+        if os.environ.get('CURL_HOME'):
+            candidates.append(os.path.join(os.environ['CURL_HOME'], '.curlrc'))
+        if os.environ.get('XDG_CONFIG_HOME'):
+            candidates.append(os.path.join(os.environ['XDG_CONFIG_HOME'], 'curlrc'))
+        candidates.append(os.path.join(os.path.expanduser('~'), '.curlrc'))
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
+        return None
+
+    def _parse_curlrc_cacert(self, content):
+        """Return (path, in_fumitm_block) for the effective cacert directive.
+
+        curlrc entries behave like command-line options, which outrank the
+        CURL_CA_BUNDLE environment variable, and for single-value options the
+        last occurrence wins. Accepts the separators curl allows (whitespace,
+        '=' or ':'), an optional leading '--', and optional quotes around the
+        value. Returns (None, False) when no directive is present.
+        """
+        result = (None, False)
+        in_block = False
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped == self._FUMITM_BLOCK_BEGIN:
+                in_block = True
+                continue
+            if stripped == self._FUMITM_BLOCK_END:
+                in_block = False
+                continue
+            match = re.match(r'(?:--)?cacert(?:\s*[=:]\s*|\s+)(.+)$', stripped)
+            if not match:
+                continue
+            value = match.group(1).strip()
+            if len(value) > 1 and value[0] in '"\'' and value.endswith(value[0]):
+                value = value[1:-1]
+            if value:
+                result = (value, in_block)
+        return result
+
+    def _effective_curlrc_cacert(self):
+        """Return (curlrc_path, cacert_path, in_fumitm_block) for curl's config.
+
+        Returns (None, None, False) when no curlrc exists, it is unreadable,
+        or it contains no cacert directive.
+        """
+        curlrc = self._find_effective_curlrc()
+        if not curlrc:
+            return None, None, False
+        try:
+            with open(curlrc, 'r') as f:
+                content = f.read()
+        except OSError:
+            return None, None, False
+        cacert, in_block = self._parse_curlrc_cacert(content)
+        if cacert is None:
+            return None, None, False
+        return curlrc, cacert, in_block
+
+    def _set_curlrc_cacert(self, curlrc, bundle_path):
+        """Upsert a fumitm-managed cacert block at the end of curlrc.
+
+        Mirrors add_to_shell_config: the block is re-emitted last on every
+        write so its cacert wins by last-directive-wins over any earlier
+        vendor block (e.g. Aikido's), which is left untouched.
+
+        Returns:
+            bool: True when the file changed (or would change in dry-run mode).
+        """
+        original = None
+        if os.path.exists(curlrc):
+            with open(curlrc, 'r') as f:
+                original = f.read()
+
+        other_lines, _ = self._parse_fumitm_block(original or "")
+        while other_lines and other_lines[-1].strip() == '':
+            other_lines.pop()
+        prefix = ('\n'.join(other_lines) + '\n\n') if other_lines else ''
+        block = '\n'.join([
+            self._FUMITM_BLOCK_BEGIN,
+            f'cacert "{bundle_path}"',
+            self._FUMITM_BLOCK_END,
+        ])
+        new = prefix + block + '\n'
+
+        changed = original is None or new != original
+        if not self.is_install_mode():
+            if changed:
+                self.print_action(f'Would set cacert "{bundle_path}" in {curlrc} (fumitm block, kept last)')
+            return changed
+        if not changed:
+            return False
+
+        if curlrc not in self._backed_up_shell_configs and original is not None:
+            with open(curlrc + '.bak', 'w') as f:
+                f.write(original)
+            self._fix_ownership(curlrc + '.bak')
+            self._backed_up_shell_configs.add(curlrc)
+
+        with open(curlrc, 'w') as f:
+            f.write(new)
+        self._fix_ownership(curlrc)
+        self.print_info(f"Set cacert in {curlrc} to: {bundle_path}")
+        return True
+
+    def _fix_curlrc_override(self, target_bundle):
+        """Handle a curlrc cacert directive that overrides CURL_CA_BUNDLE.
+
+        A vendor agent (e.g. Aikido) may write a cacert directive into curlrc
+        pointing at a bundle that lacks the primary proxy CA; that directive
+        outranks the environment variable, so curl keeps failing after --fix.
+        The fix appends a fumitm-managed block whose cacert points at
+        target_bundle, kept last so it wins. If curlrc is not writable, falls
+        back to appending the proxy roots into the referenced bundle when that
+        is writable.
+
+        Returns:
+            ToolResult when a directive was found and handled, or None when no
+            override is in play (caller continues its normal flow).
+        """
+        curlrc, rc_cacert, in_block = self._effective_curlrc_cacert()
+        if rc_cacert is None:
+            return None
+        if in_block and rc_cacert == target_bundle:
+            return None
+        self.print_info(f"cacert directive in {curlrc} overrides CURL_CA_BUNDLE")
+        self.print_info(f"  curl's effective trust store: {rc_cacert}")
+        if not self.is_install_mode():
+            self._set_curlrc_cacert(curlrc, target_bundle)
+            return ToolResult('curl', 'skipped', 'Dry run')
+        try:
+            changed = self._set_curlrc_cacert(curlrc, target_bundle)
+        except OSError as e:
+            self.print_warn(f"Cannot write {curlrc}: {e}")
+            if (os.path.isfile(rc_cacert) and os.access(rc_cacert, os.W_OK)
+                    and self._append_all_proxy_roots(rc_cacert)):
+                self.print_info(f"Appended proxy roots to {rc_cacert} instead")
+                return ToolResult('curl', 'configured', f'Appended proxy roots to {rc_cacert}')
+            self.print_info(f'Fix manually: point the cacert line in {curlrc} at {target_bundle}')
+            return ToolResult('curl', 'failed', f'Could not update {curlrc}')
+        if changed:
+            self.print_info("Vendor cacert block left untouched; the file's manager may rewrite it, "
+                            "in which case re-run fumitm")
+            return ToolResult('curl', 'configured', f'Set cacert in {curlrc} to {target_bundle}')
+        return ToolResult('curl', 'already_ok', f'cacert in {curlrc} already points at {target_bundle}')
+
     def setup_curl_cert(self):
         """Setup curl certificate configuration.
 
@@ -3786,6 +3938,7 @@ class FumitmPython:
         2. CURL_CA_BUNDLE points to suspicious/broken bundle - fix it
         3. CURL_CA_BUNDLE points to non-existent file - fix it
         4. curl fails with no CURL_CA_BUNDLE set - configure it
+        5. curlrc cacert directive overrides CURL_CA_BUNDLE - fix the curlrc
         """
         if not self.command_exists('curl'):
             return ToolResult('curl', 'skipped', 'curl not found in PATH')
@@ -3827,8 +3980,11 @@ class FumitmPython:
                         self.print_action(f"Would repoint CURL_CA_BUNDLE to {curl_bundle}")
                         return ToolResult('curl', 'skipped', 'Dry run')
                 else:
-                    # Bundle exists and looks OK but curl still doesn't work
-                    # This might be a different issue - don't touch it
+                    # Bundle looks OK but curl still fails — a curlrc cacert
+                    # directive outranks CURL_CA_BUNDLE and may be the cause
+                    rc_result = self._fix_curlrc_override(curl_env)
+                    if rc_result is not None:
+                        return rc_result
                     self.print_warn("curl connection failed but CURL_CA_BUNDLE looks valid")
                     self.print_info("This may require manual investigation")
                     return ToolResult('curl', 'already_ok', 'CURL_CA_BUNDLE looks valid; may need manual investigation')
@@ -3847,6 +4003,9 @@ class FumitmPython:
         shell_type = self.detect_shell()
         shell_config = self.get_shell_config(shell_type)
         self.add_to_shell_config("CURL_CA_BUNDLE", curl_bundle, shell_config)
+        rc_result = self._fix_curlrc_override(curl_bundle)
+        if rc_result is not None and rc_result.status == 'failed':
+            return rc_result
         self.print_info(f"Configured CURL_CA_BUNDLE to: {curl_bundle}")
         return ToolResult('curl', 'configured', f'Set CURL_CA_BUNDLE to {curl_bundle}')
 
@@ -4007,7 +4166,18 @@ class FumitmPython:
             else:
                 # curl doesn't work, check configuration
                 curl_bundle = os.environ.get('CURL_CA_BUNDLE', '')
-                if curl_bundle:
+                curlrc, rc_cacert, _ = self._effective_curlrc_cacert()
+                rc_covered = (
+                    rc_cacert is not None and os.path.exists(rc_cacert)
+                    and self._status_roots_present(temp_warp_cert, rc_cacert, likely=True)
+                )
+                if rc_cacert is not None and not rc_covered:
+                    self.print_warn(f"  ✗ cacert directive in {curlrc} overrides CURL_CA_BUNDLE")
+                    self.print_info(f"    curl's effective trust store: {rc_cacert}")
+                    self.print_warn("    it is missing the proxy CA certificate (or does not exist)")
+                    self.print_action("    Run with --fix to point it at a fumitm-managed bundle")
+                    has_issues = True
+                elif curl_bundle:
                     other_provider = self._path_belongs_to_other_provider(curl_bundle)
                     if other_provider:
                         self.print_warn(f"  ✗ CURL_CA_BUNDLE points to a previous provider's path ({other_provider})")
