@@ -5,6 +5,7 @@ These tests verify the core workflows and functionality of the fumitm script
 by mocking external dependencies and testing realistic scenarios.
 """
 import os
+import shutil
 import subprocess
 import urllib.error
 from pathlib import Path
@@ -4346,6 +4347,27 @@ class TestShellStartupFileCoverage(FumitmTestCase):
             assert not (isolate_home / name).exists()
         assert inst.shell_modified is False
 
+    def test_dry_run_reports_each_file_once_across_vars(self, isolate_home):
+        # Nothing persists in a dry run, so every var re-detects the same
+        # pending file changes; without dedup a multi-var setup floods the
+        # output with identical "Would update" lines per file.
+        inst = self.create_fumitm_instance(mode='status')
+
+        with patch.object(inst, 'detect_shell', return_value='zsh'), \
+                patch.object(inst, 'print_action') as action:
+            for var in ('SSL_CERT_FILE', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE'):
+                inst.add_to_shell_config(var, '/new/bundle.pem')
+
+        would_update = [c.args[0] for c in action.call_args_list
+                        if c.args[0].startswith('Would update')]
+        assert len(would_update) == len(set(would_update)), \
+            f'duplicate dry-run lines: {would_update}'
+        # env file + three startup files, once each; one export line per var.
+        assert len(would_update) == 4
+        exports = [c.args[0] for c in action.call_args_list
+                   if c.args[0].startswith('export ')]
+        assert len(exports) == 3
+
     def test_rerun_restores_a_stub_deleted_from_one_file(self, isolate_home):
         inst = self._install(isolate_home, 'zsh')
         (isolate_home / '.zlogin').write_text('# user wiped the stub\n')
@@ -4355,6 +4377,68 @@ class TestShellStartupFileCoverage(FumitmTestCase):
 
         assert changed is True
         assert inst._FUMITM_ENV_FILE_SHELL in (isolate_home / '.zlogin').read_text()
+
+    def test_zdotdir_overrides_home_for_zsh_targets(
+            self, isolate_home, monkeypatch, tmp_path):
+        # zsh reads its per-user startup files from $ZDOTDIR when set, not
+        # $HOME. Writing to HOME files a custom-dotdir zsh never reads would
+        # recreate the exact non-interactive-login gap this scheme fixes.
+        zdot = tmp_path / 'zdot'
+        zdot.mkdir()
+        monkeypatch.setenv('ZDOTDIR', str(zdot))
+        inst = self.create_fumitm_instance(mode='install')
+
+        assert inst.get_shell_configs('zsh') == [
+            str(zdot / '.zshenv'), str(zdot / '.zshrc'), str(zdot / '.zlogin')]
+        assert inst.get_shell_config('zsh') == str(zdot / '.zshrc')
+
+        with patch.object(inst, 'detect_shell', return_value='zsh'):
+            inst.add_to_shell_config('SSL_CERT_FILE', '/new/bundle.pem')
+
+        for name in ('.zshenv', '.zshrc', '.zlogin'):
+            assert inst._FUMITM_ENV_FILE_SHELL in (zdot / name).read_text(), \
+                f'{name} missing stub under ZDOTDIR'
+            assert not (isolate_home / name).exists(), \
+                f'HOME {name} written despite ZDOTDIR — zsh never reads it'
+        # The env file itself is not a zsh startup file; it stays under HOME.
+        assert Path(inst._env_file_path()).exists()
+
+    def test_zdotdir_unset_or_empty_falls_back_to_home(
+            self, isolate_home, monkeypatch):
+        inst = self.create_fumitm_instance(mode='install')
+        expected = [str(isolate_home / n) for n in ('.zshenv', '.zshrc', '.zlogin')]
+
+        assert inst.get_shell_configs('zsh') == expected
+        monkeypatch.setenv('ZDOTDIR', '')
+        assert inst.get_shell_configs('zsh') == expected
+
+    @pytest.mark.skipif(shutil.which('zsh') is None, reason='zsh not installed')
+    def test_real_zsh_login_shell_with_zdotdir_gets_fumitm_value(
+            self, isolate_home, monkeypatch, tmp_path):
+        # End-to-end reproduction of the review finding on PR #99: vendor
+        # export in $ZDOTDIR/.zprofile, fumitm configured, then every zsh
+        # invocation mode must resolve fumitm's bundle - including the
+        # non-interactive login shell that reads .zprofile but not .zshrc.
+        zdot = tmp_path / 'zdot'
+        zdot.mkdir()
+        (zdot / '.zprofile').write_text(
+            'export SSL_CERT_FILE="/vendor/aikido.pem"\n')
+        monkeypatch.setenv('ZDOTDIR', str(zdot))
+
+        inst = self.create_fumitm_instance(mode='install')
+        with patch.object(inst, 'detect_shell', return_value='zsh'):
+            inst.add_to_shell_config('SSL_CERT_FILE', '/fumitm/bundle.pem')
+
+        shell_env = {'HOME': str(isolate_home), 'ZDOTDIR': str(zdot),
+                     'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
+        for flags in ('-c', '-ic', '-lc', '-lic'):
+            proc = subprocess.run(
+                ['zsh', flags, 'echo $SSL_CERT_FILE'],
+                capture_output=True, text=True, env=shell_env, timeout=30,
+                check=False)  # interactive modes may exit non-zero without a tty
+            lines = [l for l in proc.stdout.strip().splitlines() if l]
+            assert lines and lines[-1] == '/fumitm/bundle.pem', \
+                f'zsh {flags}: got {proc.stdout!r} (stderr: {proc.stderr!r})'
 
 
 if __name__ == '__main__':

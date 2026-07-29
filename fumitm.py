@@ -248,6 +248,10 @@ class FumitmPython:
         # this run, so repeated writes in one run never overwrite the .bak with an
         # intermediate generated file.
         self._backed_up_shell_configs = set()
+        # Paths already announced in dry-run mode. Nothing persists in a dry
+        # run, so every var re-detects the same pending file changes; report
+        # each file once instead of once per variable.
+        self._dry_run_reported = set()
         self.cert_fingerprint = ""
         self.selected_tools = selected_tools or []
         self.cert_file = cert_file
@@ -1311,6 +1315,18 @@ class FumitmPython:
             # Return actual name rather than 'unknown'
             return shell_name
 
+    def _zsh_dotdir(self):
+        """Directory zsh reads its per-user startup files from.
+
+        zsh uses $ZDOTDIR when set, falling back to $HOME. A user with a custom
+        dotfile directory would otherwise get stubs in HOME files zsh never
+        reads, recreating the non-interactive-login gap for them.
+        """
+        zdotdir = os.environ.get('ZDOTDIR')
+        if zdotdir:
+            return os.path.expanduser(zdotdir)
+        return os.path.expanduser("~")
+
     def get_shell_config(self, shell_type):
         """Get the primary shell config file.
 
@@ -1326,7 +1342,7 @@ class FumitmPython:
                     return os.path.join(home, config)
             return os.path.join(home, '.profile')
         elif shell_type == 'zsh':
-            return os.path.join(home, '.zshrc')
+            return os.path.join(self._zsh_dotdir(), '.zshrc')
         elif shell_type == 'fish':
             return os.path.join(home, '.config/fish/config.fish')
         else:
@@ -1357,7 +1373,9 @@ class FumitmPython:
             return os.path.join(home, *parts)
 
         if shell_type == 'zsh':
-            return [in_home('.zshenv'), in_home('.zshrc'), in_home('.zlogin')]
+            zdot = self._zsh_dotdir()
+            return [os.path.join(zdot, name)
+                    for name in ('.zshenv', '.zshrc', '.zlogin')]
 
         if shell_type == 'bash':
             targets = [in_home('.bashrc')]
@@ -1383,8 +1401,9 @@ class FumitmPython:
     def _uses_env_file(self, shell_type):
         """True when the shell can source a POSIX-sh env file.
 
-        fish (and csh derivatives) use `set -gx` rather than `export VAR=val`,
-        so they keep the historical inline block in their own config file.
+        fish (`set -gx`) and csh derivatives (`setenv`) cannot source POSIX-sh
+        syntax, so they keep the historical inline block in their own config
+        file.
         """
         return shell_type in ('zsh', 'bash', 'sh', 'dash', 'ksh')
 
@@ -1458,7 +1477,7 @@ class FumitmPython:
         if shell_type == 'zsh':
             # .zprofile is read by login shells and is where vendor installers
             # commonly write, but fumitm never edits it, so name it explicitly.
-            candidates.insert(1, os.path.join(home, '.zprofile'))
+            candidates.insert(1, os.path.join(self._zsh_dotdir(), '.zprofile'))
         for path in candidates:
             if os.path.exists(path):
                 self.print_info(f"  {path.replace(home, '~', 1)}")
@@ -2167,7 +2186,9 @@ class FumitmPython:
             return False
 
         if not self.is_install_mode():
-            self.print_action(f"Would update {path} ({label})")
+            if path not in self._dry_run_reported:
+                self.print_action(f"Would update {path} ({label})")
+                self._dry_run_reported.add(path)
             return True
 
         if path not in self._backed_up_shell_configs:

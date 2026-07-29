@@ -27,6 +27,9 @@ def isolate_home(tmp_path_factory, monkeypatch):
     """
     home = tmp_path_factory.mktemp("home")
     monkeypatch.setenv("HOME", str(home))
+    # A developer's real ZDOTDIR would redirect the zsh startup-file writes to
+    # their actual dotfile directory — same pollution, different door.
+    monkeypatch.delenv("ZDOTDIR", raising=False)
     return home
 
 
