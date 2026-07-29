@@ -179,6 +179,16 @@ The script follows a modular architecture with these key components:
     - Exit codes: 0 (success), 1 (hard failure), 2 (non-interactive input needed), 3 (partial success), 130 (interrupted).
     - Tool scope: each `tools_registry` entry has a `'scope'` key (`'system'`, `'user'`, `'hybrid'`). User-scoped tools are skipped when running as root without `--run-as-user`.
 
+12. **Shell Environment Configuration** (`add_to_shell_config`):
+    - Exports live in one sourced file, `~/.config/fumitm/env.sh`, and each shell startup file gets a marker-delimited **source stub** re-emitted at the end of the file on every write. Because the stub is last, the env file's exports win by last-export-wins over any earlier vendor block (e.g. Aikido), without fumitm ever editing that block.
+    - `get_shell_configs(shell_type)`: returns **every** startup file the shell reads, not just one. A shell reads a different set per invocation mode, so writing to only one leaves the others exposed to whatever a vendor block set.
+      - zsh reads `.zshenv` → `.zprofile` (login) → `.zshrc` (interactive) → `.zlogin` (login). fumitm stubs `.zshenv`, `.zshrc` and `.zlogin`, which covers all four modes; `.zlogin` lands after `.zprofile` so a vendor block there loses. **`.zprofile` is deliberately never edited** — it is vendor territory.
+      - bash gets `.bashrc` plus the first existing of `.bash_profile`/`.bash_login`/`.profile` (creating `.bash_profile` if none exist), plus `.profile` when present so `/bin/sh` login shells are covered. `$BASH_ENV` is **not** set: it would run for every script on the system.
+    - The classic failure this prevents: a non-interactive login shell (`zsh -lc`, used by many tool launchers) reads `.zprofile` but never `.zshrc`, so exports placed only in `.zshrc` are silently absent and TLS fails with `CERTIFICATE_VERIFY_FAILED` while the interactive terminal works fine.
+    - **Migration**: an inline export block written by an older fumitm is hoisted into the env file and replaced in place by the stub. The merged set is always written back — never short-circuited on "value already correct" — because replacing a legacy block removes its exports from the startup file, so anything hoisted out of it must reach the env file or the setting is silently lost.
+    - fish (and csh derivatives) keep the historical inline block via `_write_inline_block()`, since they cannot source POSIX-sh syntax. `_uses_env_file(shell_type)` gates the two paths.
+    - `_read_text_or_none()` guards every read: `os.path.exists()` succeeding does not guarantee the open will (dangling symlink, permissions, races).
+
 ## Key Implementation Details
 
 - Uses Python's exception handling for robust error management
@@ -186,7 +196,7 @@ The script follows a modular architecture with these key components:
 - Handles multiple certificate formats and locations across different tools
 - Provides user-friendly colored output with clear status indicators
 - Supports both system-wide and user-specific certificate locations
-- Detects and adapts to user's shell (bash, zsh, fish)
+- Detects and adapts to user's shell (bash, zsh, fish), writing to every startup file that shell reads (see Shell Environment Configuration above)
 - Cross-platform Python implementation with proper type handling
 - The global `CERT_PATH` constant is kept for backward compatibility but is unused internally; all class methods use `self.cert_path`
 - All file writes to `$HOME` go through ownership-correcting helpers (`_fix_ownership`, `_safe_makedirs`) so that `sudo ./fumitm.py --fix` does not leave root-owned files behind
@@ -200,3 +210,5 @@ To add a new MITM proxy provider, add an entry to the `PROVIDERS` dict with the 
 - `FumitmTestCase.create_fumitm_instance()` defaults to `provider='warp'` to skip auto-detection, which would otherwise trigger subprocess calls (e.g. `pgrep`) that consume mock responses meant for the test's actual assertions.
 - When testing auto-detection or provider resolution, instantiate `FumitmPython` directly with `provider=None` and mock the detection methods.
 - `CERT_PATH` is listed in the `known_unused` set in `test_no_unused_globals_in_fumitm` since it's kept for backward compatibility but no longer referenced internally.
+- **`isolate_home` in `conftest.py` is autouse**: it points `$HOME` at a throwaway directory for every test. fumitm resolves shell startup files and `~/.config/fumitm/env.sh` from `~`, so a test that only passes a `tmp_path` config would otherwise write to the developer's real dotfiles. Tests needing a specific HOME override it with `monkeypatch.setenv` afterwards. Do not remove this fixture.
+- Tests asserting on managed exports should read `Path(instance._env_file_path()).read_text()`, not the shell config — the startup file carries only the source stub.

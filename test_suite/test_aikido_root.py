@@ -7,6 +7,7 @@ These tests cover detection, root extraction (root kept, ephemeral intermediate
 rejected), additive bundle assembly, idempotency, and the absent-Aikido no-op.
 """
 
+from pathlib import Path
 from unittest.mock import MagicMock, mock_open, patch
 
 import mock_data
@@ -511,12 +512,12 @@ class TestAikidoPythonTrustVars(FumitmTestCase):
             result = inst.setup_python_cert()
 
         python_bundle = str(home / '.python-ca-bundle.pem')
-        content = shell_config.read_text()
+        env = Path(inst._env_file_path()).read_text()
         for var in ('SSL_CERT_FILE', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE',
                     'PIP_CERT', 'POETRY_CERTIFICATES_PYPI_CERT', 'BUNDLE_SSL_CA_CERT'):
-            assert f'export {var}="{python_bundle}"' in content
-        # All six live in a single managed block.
-        assert content.count(inst._FUMITM_BLOCK_BEGIN) == 1
+            assert f'export {var}="{python_bundle}"' in env
+        # All six live in the single sourced env file, behind one stub.
+        assert shell_config.read_text().count(inst._FUMITM_BLOCK_BEGIN) == 1
         assert result.status == 'configured'
 
     def test_suspicious_requests_bundle_still_reclaims_vendor_vars(
@@ -555,12 +556,12 @@ class TestAikidoPythonTrustVars(FumitmTestCase):
             result = inst.setup_python_cert()
 
         python_bundle = str(home / '.python-ca-bundle.pem')
-        content = shell_config.read_text()
+        env = Path(inst._env_file_path()).read_text()
         for var in ('SSL_CERT_FILE', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE',
                     'PIP_CERT', 'POETRY_CERTIFICATES_PYPI_CERT', 'BUNDLE_SSL_CA_CERT'):
-            assert f'export {var}="{python_bundle}"' in content
+            assert f'export {var}="{python_bundle}"' in env
         # The vendor bundle is no longer referenced by any managed export.
-        assert str(suspicious) not in content
+        assert str(suspicious) not in env
         assert result.status == 'configured'
 
 
@@ -600,12 +601,12 @@ class TestAikidoGcloudReauthTrust(FumitmTestCase):
              patch('fumitm.subprocess.run', return_value=get_value):
             result = inst.setup_gcloud_cert()
 
-        content = shell_config.read_text()
+        env = Path(inst._env_file_path()).read_text()
         for var in ('REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE'):
-            assert f'export {var}="{python_bundle}"' in content
-        # The reclaimed vars live in the always-last managed block so they win
+            assert f'export {var}="{python_bundle}"' in env
+        # The reclaimed vars are sourced from the always-last stub, so they win
         # over Aikido's earlier vendor export by last-export-wins.
-        assert content.count(inst._FUMITM_BLOCK_BEGIN) == 1
+        assert shell_config.read_text().count(inst._FUMITM_BLOCK_BEGIN) == 1
         # A reauth-only change must be reported, not masked as already_ok.
         assert result.status == 'configured'
 
@@ -631,12 +632,12 @@ class TestAikidoGcloudReauthTrust(FumitmTestCase):
              patch('fumitm.subprocess.run', return_value=get_value):
             inst.setup_gcloud_cert()
 
-        content = shell_config.read_text()
+        env = Path(inst._env_file_path()).read_text()
         # Plain single-provider hosts keep only the gcloud property var; the
         # Python/curl trust vars are left to setup_python_cert.
-        assert 'CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE' in content
-        assert 'REQUESTS_CA_BUNDLE' not in content
-        assert 'CURL_CA_BUNDLE' not in content
+        assert 'CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE' in env
+        assert 'REQUESTS_CA_BUNDLE' not in env
+        assert 'CURL_CA_BUNDLE' not in env
 
 
 class TestAikidoWget(FumitmTestCase):
