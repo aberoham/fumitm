@@ -5,7 +5,6 @@ These tests verify the core workflows and functionality of the fumitm script
 by mocking external dependencies and testing realistic scenarios.
 """
 import os
-import shutil
 import subprocess
 import urllib.error
 from pathlib import Path
@@ -4408,11 +4407,11 @@ class TestShellStartupFileCoverage(FumitmTestCase):
         inst = self.create_fumitm_instance(mode='install')
         expected = [str(isolate_home / n) for n in ('.zshenv', '.zshrc', '.zlogin')]
 
+        monkeypatch.delenv('ZDOTDIR')
         assert inst.get_shell_configs('zsh') == expected
         monkeypatch.setenv('ZDOTDIR', '')
         assert inst.get_shell_configs('zsh') == expected
 
-    @pytest.mark.skipif(shutil.which('zsh') is None, reason='zsh not installed')
     def test_real_zsh_login_shell_with_zdotdir_gets_fumitm_value(
             self, isolate_home, monkeypatch, tmp_path):
         # End-to-end reproduction of the review finding on PR #99: vendor
@@ -4439,6 +4438,79 @@ class TestShellStartupFileCoverage(FumitmTestCase):
             lines = [l for l in proc.stdout.strip().splitlines() if l]
             assert lines and lines[-1] == '/fumitm/bundle.pem', \
                 f'zsh {flags}: got {proc.stdout!r} (stderr: {proc.stderr!r})'
+
+    def test_real_zsh_shell_local_zdotdir_gets_fumitm_value(
+            self, isolate_home, monkeypatch, tmp_path):
+        # ZDOTDIR is a shell parameter and need not be exported. In that case
+        # Python cannot see it in os.environ, but zsh still uses the value from
+        # HOME/.zshenv for every later startup file.
+        zdot = tmp_path / 'shell-local-zdot'
+        zdot.mkdir()
+        (isolate_home / '.zshenv').write_text(f'ZDOTDIR="{zdot}"\n')
+        (zdot / '.zprofile').write_text(
+            'export SSL_CERT_FILE="/vendor/aikido.pem"\n')
+        monkeypatch.delenv('ZDOTDIR')
+
+        inst = self.create_fumitm_instance(mode='install')
+        with patch.object(inst, 'detect_shell', return_value='zsh'):
+            inst.add_to_shell_config('SSL_CERT_FILE', '/fumitm/bundle.pem')
+
+        assert inst._queried_zsh_dotdir == str(zdot)
+        assert (isolate_home / '.zshenv').read_text() == f'ZDOTDIR="{zdot}"\n'
+        for name in ('.zshenv', '.zshrc', '.zlogin'):
+            assert inst._FUMITM_ENV_FILE_SHELL in (zdot / name).read_text()
+
+        shell_env = {
+            'HOME': str(isolate_home),
+            'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
+        }
+        proc = subprocess.run(
+            ['zsh', '-lc', 'printf %s "$SSL_CERT_FILE"'],
+            capture_output=True, text=True, env=shell_env, timeout=30,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == '/fumitm/bundle.pem'
+
+    def test_zdotdir_query_timeout_falls_back_to_home(
+            self, isolate_home, monkeypatch):
+        monkeypatch.delenv('ZDOTDIR')
+        monkeypatch.setenv('SHELL', '/bin/zsh')
+        inst = self.create_fumitm_instance(mode='install')
+        process = MagicMock()
+        process.communicate.side_effect = [
+            subprocess.TimeoutExpired('/bin/zsh', 3),
+            ('', ''),
+        ]
+
+        with patch(
+                'fumitm.subprocess.Popen', return_value=process):
+            assert inst._zsh_dotdir() == str(isolate_home)
+        process.kill.assert_called_once_with()
+
+    def test_zdotdir_query_drops_root_to_target_user(
+            self, isolate_home, monkeypatch):
+        monkeypatch.delenv('ZDOTDIR')
+        monkeypatch.setenv('SHELL', '/bin/zsh')
+        inst = self.create_fumitm_instance(mode='install')
+        inst._target_uid = 501
+        inst._target_gid = 20
+        target = MagicMock(pw_name='alice')
+        process = MagicMock(returncode=0)
+        process.communicate.return_value = (
+            f'__FUMITM_ZDOTDIR__={isolate_home}\n',
+            '',
+        )
+
+        with patch('fumitm.os.getuid', return_value=0), \
+                patch('fumitm.pwd.getpwuid', return_value=target), \
+                patch('fumitm.os.getgrouplist', return_value=[20, 80]), \
+                patch('fumitm.subprocess.Popen', return_value=process) as popen:
+            assert inst._zsh_dotdir() == str(isolate_home)
+
+        assert popen.call_args.kwargs['user'] == 501
+        assert popen.call_args.kwargs['group'] == 20
+        assert popen.call_args.kwargs['extra_groups'] == [20, 80]
 
 
 if __name__ == '__main__':

@@ -16,7 +16,9 @@ class MockBuilder:
         self.subprocess_responses = []
         self.which_mapping = {}
         self.exists_mapping = {}
-        self.environ_vars = {}
+        # Keep unit tests from querying the developer's real zsh startup files.
+        # Real-shell ZDOTDIR tests explicitly remove this isolated fallback.
+        self.environ_vars = {'ZDOTDIR': ''}
         self.platform = 'Darwin'
         self.file_contents = {}
     

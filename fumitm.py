@@ -252,6 +252,9 @@ class FumitmPython:
         # run, so every var re-detects the same pending file changes; report
         # each file once instead of once per variable.
         self._dry_run_reported = set()
+        # Cached result of asking zsh where shell-local startup configuration
+        # redirected ZDOTDIR. Exported values are read directly on every call.
+        self._queried_zsh_dotdir = None
         self.cert_fingerprint = ""
         self.selected_tools = selected_tools or []
         self.cert_file = cert_file
@@ -1315,17 +1318,107 @@ class FumitmPython:
             # Return actual name rather than 'unknown'
             return shell_name
 
+    def _query_zsh_dotdir(self, home):
+        """Ask zsh for a shell-local ZDOTDIR assignment from .zshenv.
+
+        ZDOTDIR need not be exported, so a Python child cannot always discover
+        it through os.environ. A non-interactive zsh reads only .zshenv before
+        executing the command below, which exposes the effective directory
+        without loading .zprofile, .zshrc or .zlogin.
+
+        When fumitm is root on behalf of a target user, the child drops to that
+        user's uid, gid and supplementary groups before reading user-controlled
+        startup code. The query is bounded and falls back safely to HOME.
+        """
+        shell_path = os.environ.get('SHELL')
+        if not shell_path or os.path.basename(shell_path) != 'zsh':
+            if self._target_uid is not None:
+                try:
+                    candidate = pwd.getpwuid(self._target_uid).pw_shell
+                    if os.path.basename(candidate) == 'zsh':
+                        shell_path = candidate
+                except (KeyError, OSError):
+                    shell_path = None
+            if not shell_path or os.path.basename(shell_path) != 'zsh':
+                shell_path = shutil.which('zsh')
+
+        if not shell_path:
+            self.print_debug("Could not find zsh to resolve shell-local ZDOTDIR")
+            return None
+
+        child_identity = {}
+        if os.getuid() == 0 and self._target_uid not in (None, 0):
+            uid, gid = self._target_uid, self._target_gid
+            try:
+                username = pwd.getpwuid(uid).pw_name
+            except KeyError:
+                self.print_debug(
+                    f"Could not resolve target UID {uid} for ZDOTDIR query"
+                )
+                return None
+            child_identity = {
+                'user': uid,
+                'group': gid,
+                'extra_groups': os.getgrouplist(username, gid),
+            }
+
+        marker = "__FUMITM_ZDOTDIR__="
+        query_env = os.environ.copy()
+        query_env['HOME'] = home
+        query_env.pop('ZDOTDIR', None)
+        try:
+            process = subprocess.Popen(
+                [
+                    shell_path,
+                    '-c',
+                    f'print -r -- "{marker}${{ZDOTDIR:-$HOME}}"',
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                env=query_env,
+                **child_identity,
+            )
+            stdout, _ = process.communicate(timeout=3)
+        except subprocess.TimeoutExpired as e:
+            process.kill()
+            process.communicate()
+            self.print_debug(f"Could not query zsh for ZDOTDIR: {e}")
+            return None
+        except (OSError, subprocess.SubprocessError, TypeError) as e:
+            self.print_debug(f"Could not query zsh for ZDOTDIR: {e}")
+            return None
+
+        if process.returncode != 0:
+            self.print_debug(
+                f"zsh ZDOTDIR query exited with status {process.returncode}"
+            )
+            return None
+
+        for line in reversed(stdout.splitlines()):
+            if line.startswith(marker):
+                value = line[len(marker):]
+                return value or home
+        self.print_debug("zsh ZDOTDIR query returned no recognizable result")
+        return None
+
     def _zsh_dotdir(self):
         """Directory zsh reads its per-user startup files from.
 
-        zsh uses $ZDOTDIR when set, falling back to $HOME. A user with a custom
-        dotfile directory would otherwise get stubs in HOME files zsh never
-        reads, recreating the non-interactive-login gap for them.
+        zsh uses $ZDOTDIR when set, falling back to $HOME. Exported values are
+        visible directly; when .zshenv sets a shell-local value, query zsh once
+        so stubs do not land in HOME files that later startup phases never read.
         """
-        zdotdir = os.environ.get('ZDOTDIR')
-        if zdotdir:
-            return os.path.expanduser(zdotdir)
-        return os.path.expanduser("~")
+        home = os.path.expanduser("~")
+        if 'ZDOTDIR' in os.environ:
+            zdotdir = os.environ.get('ZDOTDIR')
+            return os.path.expanduser(zdotdir) if zdotdir else home
+
+        if self._queried_zsh_dotdir is None:
+            queried = self._query_zsh_dotdir(home)
+            resolved = os.path.expanduser(queried) if queried else home
+            self._queried_zsh_dotdir = os.path.abspath(resolved)
+        return self._queried_zsh_dotdir
 
     def get_shell_config(self, shell_type):
         """Get the primary shell config file.
