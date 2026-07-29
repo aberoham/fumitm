@@ -16,6 +16,24 @@ import mock_data
 from helpers import MockBuilder, create_temp_cert_file
 
 
+@pytest.fixture(autouse=True)
+def isolate_home(tmp_path_factory, monkeypatch):
+    """Point $HOME at a throwaway directory for every test.
+
+    fumitm resolves shell startup files and its managed env file from ~, so a
+    test that only passes a tmp_path config would otherwise still write to the
+    developer's real dotfiles. Tests that need a specific HOME override this by
+    calling monkeypatch.setenv afterwards (e.g. the mock_home_dir fixture).
+    """
+    home = tmp_path_factory.mktemp("home")
+    monkeypatch.setenv("HOME", str(home))
+    # An explicit empty value exercises HOME fallback without querying the
+    # developer's real zsh startup files. Tests for shell-local discovery remove
+    # the variable deliberately after installing an isolated .zshenv.
+    monkeypatch.setenv("ZDOTDIR", "")
+    return home
+
+
 @pytest.fixture
 def sample_cert_path():
     """Path to sample certificate file."""

@@ -221,11 +221,17 @@ ToolResult = namedtuple(
 
 
 class FumitmPython:
-    # Markers delimiting fumitm's managed export block in the shell config. The
+    # Markers delimiting fumitm's managed block in a shell startup file. The
     # block is always re-emitted at the end of the file so its TLS-trust settings
     # win over any earlier vendor block (e.g. Aikido) via last-export-wins.
     _FUMITM_BLOCK_BEGIN = "# >>> fumitm managed (keep last) >>>"
     _FUMITM_BLOCK_END = "# <<< fumitm managed <<<"
+
+    # For POSIX-sh-compatible shells the exports live in one file that every
+    # startup file sources, rather than being duplicated into each of them.
+    # $HOME (not an expanded path) keeps the stub valid if the home dir moves.
+    _FUMITM_ENV_FILE_REL = ".config/fumitm/env.sh"
+    _FUMITM_ENV_FILE_SHELL = '"$HOME/.config/fumitm/env.sh"'
 
     def __init__(self, mode='status', debug=False, selected_tools=None,
                  cert_file=None, manual_cert=False, skip_verify=False,
@@ -242,6 +248,13 @@ class FumitmPython:
         # this run, so repeated writes in one run never overwrite the .bak with an
         # intermediate generated file.
         self._backed_up_shell_configs = set()
+        # Paths already announced in dry-run mode. Nothing persists in a dry
+        # run, so every var re-detects the same pending file changes; report
+        # each file once instead of once per variable.
+        self._dry_run_reported = set()
+        # Cached result of asking zsh where shell-local startup configuration
+        # redirected ZDOTDIR. Exported values are read directly on every call.
+        self._queried_zsh_dotdir = None
         self.cert_fingerprint = ""
         self.selected_tools = selected_tools or []
         self.cert_file = cert_file
@@ -1305,8 +1318,115 @@ class FumitmPython:
             # Return actual name rather than 'unknown'
             return shell_name
 
+    def _query_zsh_dotdir(self, home):
+        """Ask zsh for a shell-local ZDOTDIR assignment from .zshenv.
+
+        ZDOTDIR need not be exported, so a Python child cannot always discover
+        it through os.environ. A non-interactive zsh reads only .zshenv before
+        executing the command below, which exposes the effective directory
+        without loading .zprofile, .zshrc or .zlogin.
+
+        When fumitm is root on behalf of a target user, the child drops to that
+        user's uid, gid and supplementary groups before reading user-controlled
+        startup code. The query is bounded and falls back safely to HOME.
+        """
+        shell_path = os.environ.get('SHELL')
+        if not shell_path or os.path.basename(shell_path) != 'zsh':
+            if self._target_uid is not None:
+                try:
+                    candidate = pwd.getpwuid(self._target_uid).pw_shell
+                    if os.path.basename(candidate) == 'zsh':
+                        shell_path = candidate
+                except (KeyError, OSError):
+                    shell_path = None
+            if not shell_path or os.path.basename(shell_path) != 'zsh':
+                shell_path = shutil.which('zsh')
+
+        if not shell_path:
+            self.print_debug("Could not find zsh to resolve shell-local ZDOTDIR")
+            return None
+
+        child_identity = {}
+        if os.getuid() == 0 and self._target_uid not in (None, 0):
+            uid, gid = self._target_uid, self._target_gid
+            try:
+                username = pwd.getpwuid(uid).pw_name
+            except KeyError:
+                self.print_debug(
+                    f"Could not resolve target UID {uid} for ZDOTDIR query"
+                )
+                return None
+            child_identity = {
+                'user': uid,
+                'group': gid,
+                'extra_groups': os.getgrouplist(username, gid),
+            }
+
+        marker = "__FUMITM_ZDOTDIR__="
+        query_env = os.environ.copy()
+        query_env['HOME'] = home
+        query_env.pop('ZDOTDIR', None)
+        try:
+            process = subprocess.Popen(
+                [
+                    shell_path,
+                    '-c',
+                    f'print -r -- "{marker}${{ZDOTDIR:-$HOME}}"',
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                env=query_env,
+                **child_identity,
+            )
+            stdout, _ = process.communicate(timeout=3)
+        except subprocess.TimeoutExpired as e:
+            process.kill()
+            process.communicate()
+            self.print_debug(f"Could not query zsh for ZDOTDIR: {e}")
+            return None
+        except (OSError, subprocess.SubprocessError, TypeError) as e:
+            self.print_debug(f"Could not query zsh for ZDOTDIR: {e}")
+            return None
+
+        if process.returncode != 0:
+            self.print_debug(
+                f"zsh ZDOTDIR query exited with status {process.returncode}"
+            )
+            return None
+
+        for line in reversed(stdout.splitlines()):
+            if line.startswith(marker):
+                value = line[len(marker):]
+                return value or home
+        self.print_debug("zsh ZDOTDIR query returned no recognizable result")
+        return None
+
+    def _zsh_dotdir(self):
+        """Directory zsh reads its per-user startup files from.
+
+        zsh uses $ZDOTDIR when set, falling back to $HOME. Exported values are
+        visible directly; when .zshenv sets a shell-local value, query zsh once
+        so stubs do not land in HOME files that later startup phases never read.
+        """
+        home = os.path.expanduser("~")
+        if 'ZDOTDIR' in os.environ:
+            zdotdir = os.environ.get('ZDOTDIR')
+            return os.path.expanduser(zdotdir) if zdotdir else home
+
+        if self._queried_zsh_dotdir is None:
+            queried = self._query_zsh_dotdir(home)
+            resolved = os.path.expanduser(queried) if queried else home
+            self._queried_zsh_dotdir = os.path.abspath(resolved)
+        return self._queried_zsh_dotdir
+
     def get_shell_config(self, shell_type):
-        """Get shell config file."""
+        """Get the primary shell config file.
+
+        Kept for callers that need a single representative path (messages,
+        prompts). Writes go through get_shell_configs(), which covers every
+        startup file the shell actually reads.
+        """
         home = os.path.expanduser("~")
         if shell_type == 'bash':
             # For macOS, .bash_profile is the primary config file for login shells
@@ -1315,11 +1435,70 @@ class FumitmPython:
                     return os.path.join(home, config)
             return os.path.join(home, '.profile')
         elif shell_type == 'zsh':
-            return os.path.join(home, '.zshrc')
+            return os.path.join(self._zsh_dotdir(), '.zshrc')
         elif shell_type == 'fish':
             return os.path.join(home, '.config/fish/config.fish')
         else:
             return os.path.join(home, '.profile')
+
+    def get_shell_configs(self, shell_type):
+        """Every startup file that must carry fumitm's block, in read order.
+
+        A shell reads a different set of startup files per invocation mode, so
+        writing to only one of them leaves the others exposed to whatever a
+        vendor block (e.g. Aikido) set. The classic failure is a non-interactive
+        login shell (`zsh -lc`, used by many tool launchers): it reads .zprofile
+        but never .zshrc, so exports placed only in .zshrc are silently absent.
+
+        zsh reads .zshenv → .zprofile (login) → .zshrc (interactive) → .zlogin
+        (login). Stubbing .zshenv, .zshrc and .zlogin covers all four modes, and
+        .zlogin lands after .zprofile so a vendor block there loses. .zprofile
+        itself is deliberately never edited — it is vendor territory.
+
+        bash reads the first existing of .bash_profile/.bash_login/.profile for
+        login shells and .bashrc for interactive non-login ones. Non-interactive
+        non-login bash reads only $BASH_ENV, which fumitm does not set: forcing a
+        global BASH_ENV would run this file for every script on the system.
+        """
+        home = os.path.expanduser("~")
+
+        def in_home(*parts):
+            return os.path.join(home, *parts)
+
+        if shell_type == 'zsh':
+            zdot = self._zsh_dotdir()
+            return [os.path.join(zdot, name)
+                    for name in ('.zshenv', '.zshrc', '.zlogin')]
+
+        if shell_type == 'bash':
+            targets = [in_home('.bashrc')]
+            for name in ('.bash_profile', '.bash_login', '.profile'):
+                if os.path.exists(in_home(name)):
+                    targets.append(in_home(name))
+                    break
+            else:
+                # None exist yet; .bash_profile is bash's first choice on macOS.
+                targets.append(in_home('.bash_profile'))
+            # A /bin/sh login shell reads .profile regardless of which file bash
+            # picked above, so cover it too when the user has one.
+            if os.path.exists(in_home('.profile')) and in_home('.profile') not in targets:
+                targets.append(in_home('.profile'))
+            return targets
+
+        return [self.get_shell_config(shell_type)]
+
+    def _env_file_path(self):
+        """Absolute path of the sourced env file holding fumitm's exports."""
+        return os.path.join(os.path.expanduser("~"), self._FUMITM_ENV_FILE_REL)
+
+    def _uses_env_file(self, shell_type):
+        """True when the shell can source a POSIX-sh env file.
+
+        fish (`set -gx`) and csh derivatives (`setenv`) cannot source POSIX-sh
+        syntax, so they keep the historical inline block in their own config
+        file.
+        """
+        return shell_type in ('zsh', 'bash', 'sh', 'dash', 'ksh')
 
     def check_environment_sanity(self):
         """Check for broken CA-related environment variables pointing to non-existent files.
@@ -1386,14 +1565,17 @@ class FumitmPython:
 
         self.print_info("To fix PERMANENTLY, remove/comment the export lines from:")
         shell_type = self.detect_shell()
+        home = os.path.expanduser("~")
+        candidates = list(self.get_shell_configs(shell_type))
         if shell_type == 'zsh':
-            self.print_info("  ~/.zshrc, ~/.zprofile")
-        elif shell_type == 'bash':
-            self.print_info("  ~/.bashrc, ~/.bash_profile, ~/.profile")
-        elif shell_type == 'fish':
-            self.print_info("  ~/.config/fish/config.fish")
-        else:
-            self.print_info("  ~/.profile, ~/.bashrc, or your shell's config file")
+            # .zprofile is read by login shells and is where vendor installers
+            # commonly write, but fumitm never edits it, so name it explicitly.
+            candidates.insert(1, os.path.join(self._zsh_dotdir(), '.zprofile'))
+        for path in candidates:
+            if os.path.exists(path):
+                self.print_info(f"  {path.replace(home, '~', 1)}")
+        if self._uses_env_file(shell_type) and os.path.exists(self._env_file_path()):
+            self.print_info(f"  {self._env_file_path().replace(home, '~', 1)}  (managed by fumitm)")
         print()
 
         self.print_warn("IMPORTANT: After editing shell config files, you must either:")
@@ -2060,18 +2242,188 @@ class FumitmPython:
         body.append(self._FUMITM_BLOCK_END)
         return '\n'.join(body)
 
-    def add_to_shell_config(self, var_name, var_value, shell_config):
-        """Upsert an export into fumitm's managed, always-last shell-config block.
+    def _render_stub(self):
+        """Render the managed source-stub block placed in each startup file."""
+        return '\n'.join([
+            self._FUMITM_BLOCK_BEGIN,
+            f'[ -r {self._FUMITM_ENV_FILE_SHELL} ] && . {self._FUMITM_ENV_FILE_SHELL}',
+            self._FUMITM_BLOCK_END,
+        ])
 
-        fumitm keeps its TLS-trust exports in a single marker-delimited block that
-        is re-emitted at the end of the file on every write. This guarantees the
-        exports sit after any earlier vendor block (e.g. Aikido) so they win by
-        last-export-wins, without ever editing the vendor's block. A user's own
-        earlier export of the same variable is preserved but overridden.
+    def _read_text_or_none(self, path):
+        """Read a file, returning None when it is absent or unreadable.
+
+        os.path.exists() succeeding does not guarantee the open will: the path
+        may be a dangling symlink, be unreadable, or vanish in between. Callers
+        treat None as "no existing content" rather than crashing the run.
+        """
+        try:
+            with open(path, 'r') as f:
+                return f.read()
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            self.print_debug(f"Could not read {path}: {e}")
+            return None
+
+    def _write_managed_file(self, path, new, label):
+        """Write `new` to `path`, backing up the pre-run original once per run.
+
+        Returns True when the file changed (or would change in dry-run mode).
+        Shared by the env file and the per-startup-file stubs so both get the
+        same backup, ownership and dry-run handling.
+        """
+        original = self._read_text_or_none(path)
+
+        if original == new:
+            return False
+
+        if not self.is_install_mode():
+            if path not in self._dry_run_reported:
+                self.print_action(f"Would update {path} ({label})")
+                self._dry_run_reported.add(path)
+            return True
+
+        if path not in self._backed_up_shell_configs:
+            if original is not None:
+                with open(path + '.bak', 'w') as f:
+                    f.write(original)
+                self._fix_ownership(path + '.bak')
+            self._backed_up_shell_configs.add(path)
+
+        self._safe_makedirs(os.path.dirname(path))
+        with open(path, 'w') as f:
+            f.write(new)
+        self._fix_ownership(path)
+        self.shell_modified = True
+        return True
+
+    def _read_env_file(self):
+        """Parse the sourced env file into an insertion-ordered var->value dict."""
+        content = self._read_text_or_none(self._env_file_path())
+        if content is None:
+            return {}
+
+        managed = {}
+        for line in content.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith('export '):
+                continue
+            try:
+                name, rhs = stripped[len('export '):].split('=', 1)
+            except ValueError:
+                continue
+            rhs = rhs.strip()
+            if (rhs.startswith('"') and rhs.endswith('"')) or \
+                    (rhs.startswith("'") and rhs.endswith("'")):
+                rhs = rhs[1:-1]
+            managed[name.strip()] = rhs
+        return managed
+
+    def _write_env_file(self, managed):
+        """Write the sourced env file holding every fumitm-managed export."""
+        body = [
+            "# Managed by fumitm - do not edit; this file is regenerated.",
+            "# Sourced from your shell startup files so TLS trust applies to",
+            "# interactive, non-interactive and login shells alike.",
+        ]
+        body.extend(f'export {name}="{value}"' for name, value in managed.items())
+        return self._write_managed_file(
+            self._env_file_path(), '\n'.join(body) + '\n', 'fumitm exports'
+        )
+
+    def _ensure_stub(self, shell_config):
+        """Ensure `shell_config` ends with the managed source stub.
+
+        Any pre-existing managed block is removed first, so an inline export
+        block written by an older fumitm is replaced in place by the stub rather
+        than left behind to fight with it.
+        """
+        other_lines, _ = self._parse_fumitm_block(
+            self._read_text_or_none(shell_config) or ""
+        )
+        while other_lines and other_lines[-1].strip() == '':
+            other_lines.pop()
+        prefix = ('\n'.join(other_lines) + '\n\n') if other_lines else ''
+        new = prefix + self._render_stub() + '\n'
+        return self._write_managed_file(shell_config, new, 'source stub')
+
+    def _legacy_block_vars(self, shell_config):
+        """Exports found in an inline managed block written by an older fumitm."""
+        content = self._read_text_or_none(shell_config)
+        if content is None:
+            return {}
+        _, managed = self._parse_fumitm_block(content)
+        return managed
+
+    def add_to_shell_config(self, var_name, var_value, shell_config=None):
+        """Upsert an export so it applies in every mode the user's shell runs in.
+
+        For POSIX-sh-compatible shells the value is written to a single sourced
+        env file, and a marker-delimited stub sourcing it is re-emitted at the
+        end of each startup file the shell reads (see get_shell_configs). Because
+        the stub is always last, it wins by last-export-wins over any earlier
+        vendor block (e.g. Aikido) without fumitm ever editing that block.
+
+        fish and csh derivatives keep the historical inline block in their own
+        config file, since they cannot source POSIX-sh syntax.
+
+        Args:
+            shell_config: optional extra startup file to stub, in addition to the
+                detected shell's standard set. Retained so existing callers can
+                keep passing the path they resolved.
 
         Returns:
-            bool: True when the file changed (or would change in dry-run mode),
+            bool: True when anything changed (or would change in dry-run mode),
             False on a no-op. The gcloud setup uses this to report pre-bootstrap.
+        """
+        shell_type = self.detect_shell()
+
+        if not self._uses_env_file(shell_type):
+            return self._write_inline_block(
+                var_name, var_value,
+                shell_config or self.get_shell_config(shell_type),
+            )
+
+        targets = self.get_shell_configs(shell_type)
+        if shell_config and shell_config not in targets:
+            targets.append(shell_config)
+
+        # Hoist values from any legacy inline block first so upgrading from an
+        # older fumitm preserves what it had already configured; the env file
+        # wins where both carry the same variable, being the newer source.
+        #
+        # The merged set is always written back, never short-circuited on
+        # "value already correct": replacing a legacy block with a stub removes
+        # that block's exports from the startup file, so anything hoisted out of
+        # it must reach the env file or the setting is silently lost.
+        existing = self._read_env_file()
+        managed = {}
+        for path in targets:
+            managed.update(self._legacy_block_vars(path))
+        managed.update(existing)
+        managed[var_name] = var_value
+
+        # _write_env_file compares content, so an unchanged set stays a no-op.
+        changed = self._write_env_file(managed)
+        if changed and existing.get(var_name) != var_value:
+            if self.is_install_mode():
+                self.print_info(f"Set {var_name} in {self._env_file_path()}")
+            else:
+                self.print_action(f'export {var_name}="{var_value}"')
+
+        for path in targets:
+            if self._ensure_stub(path):
+                changed = True
+
+        return changed
+
+    def _write_inline_block(self, var_name, var_value, shell_config):
+        """Upsert an export into fumitm's managed, always-last inline block.
+
+        The pre-env-file behaviour, retained for shells that cannot source a
+        POSIX-sh file. A user's own earlier export of the same variable is
+        preserved but overridden.
         """
         original = None
         if os.path.exists(shell_config):
@@ -2104,6 +2456,8 @@ class FumitmPython:
                 self._fix_ownership(shell_config + '.bak')
             self._backed_up_shell_configs.add(shell_config)
 
+        # fish keeps its config under ~/.config/fish, which may not exist yet.
+        self._safe_makedirs(os.path.dirname(shell_config))
         with open(shell_config, 'w') as f:
             f.write(new)
         self._fix_ownership(shell_config)

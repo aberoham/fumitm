@@ -7,6 +7,7 @@ by mocking external dependencies and testing realistic scenarios.
 import os
 import subprocess
 import urllib.error
+from pathlib import Path
 from typing import ClassVar
 from unittest.mock import MagicMock, call, mock_open, patch
 
@@ -3954,25 +3955,28 @@ class TestGitTlsBackend(FumitmTestCase):
 
 
 class TestShellConfigIdempotency(FumitmTestCase):
-    """add_to_shell_config maintains a trailing managed block and is a no-op only
-    when that block is already present and correct at the end of the file.
+    """add_to_shell_config writes values to the sourced env file and maintains a
+    trailing source stub in each startup file, re-running as a no-op.
 
-    The managed block wins by last-export-wins, so a user's earlier export is
-    preserved verbatim but overridden — never commented out, never prompted.
+    The stub is last, so the env file's exports win by last-export-wins; a user's
+    earlier export is preserved verbatim but overridden — never commented out,
+    never prompted.
     """
 
-    def test_idempotent_when_block_already_correct(self, tmp_path):
+    def test_idempotent_when_already_correct(self, tmp_path):
         instance = self.create_fumitm_instance(mode='install')
         rc = tmp_path / '.zshrc'
-        original = (
-            '# user prologue\n'
-            'export PATH="/usr/local/bin:$PATH"\n'
-            '\n'
-            f'{instance._FUMITM_BLOCK_BEGIN}\n'
-            'export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE="/Users/test/.python-ca-bundle.pem"\n'
-            f'{instance._FUMITM_BLOCK_END}\n'
-        )
-        rc.write_text(original)
+        rc.write_text('# user prologue\nexport PATH="/usr/local/bin:$PATH"\n')
+
+        assert instance.add_to_shell_config(
+            'CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE',
+            '/Users/test/.python-ca-bundle.pem',
+            str(rc),
+        ) is True
+
+        settled_rc = rc.read_text()
+        settled_env = Path(instance._env_file_path()).read_text()
+        instance.shell_modified = False
 
         changed = instance.add_to_shell_config(
             'CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE',
@@ -3981,9 +3985,59 @@ class TestShellConfigIdempotency(FumitmTestCase):
         )
 
         assert changed is False
-        assert rc.read_text() == original, "file should be untouched"
-        assert getattr(instance, 'shell_modified', False) is False
-        assert not (tmp_path / '.zshrc.bak').exists()
+        assert rc.read_text() == settled_rc, "startup file should be untouched"
+        assert Path(instance._env_file_path()).read_text() == settled_env
+        assert instance.shell_modified is False
+
+    def test_migrates_legacy_inline_block(self, tmp_path):
+        # An inline export block written by an older fumitm is hoisted into the
+        # env file and replaced in place by the stub, so the two never conflict.
+        instance = self.create_fumitm_instance(mode='install')
+        rc = tmp_path / '.zshrc'
+        rc.write_text(
+            'export PATH="/usr/local/bin:$PATH"\n'
+            '\n'
+            f'{instance._FUMITM_BLOCK_BEGIN}\n'
+            'export NODE_EXTRA_CA_CERTS="/legacy/node.pem"\n'
+            'export SSL_CERT_FILE="/legacy/bundle.pem"\n'
+            f'{instance._FUMITM_BLOCK_END}\n'
+        )
+
+        instance.add_to_shell_config('SSL_CERT_FILE', '/new/bundle.pem', str(rc))
+
+        content = rc.read_text()
+        env = Path(instance._env_file_path()).read_text()
+        # The legacy block is gone from the startup file, replaced by the stub.
+        assert 'export SSL_CERT_FILE=' not in content
+        assert 'export NODE_EXTRA_CA_CERTS=' not in content
+        assert content.count(instance._FUMITM_BLOCK_BEGIN) == 1
+        assert 'export PATH="/usr/local/bin:$PATH"' in content, "user line preserved"
+        # The unrelated legacy var carried over; the requested one was updated.
+        assert 'export NODE_EXTRA_CA_CERTS="/legacy/node.pem"' in env
+        assert 'export SSL_CERT_FILE="/new/bundle.pem"' in env
+        assert '/legacy/bundle.pem' not in env
+
+    def test_legacy_value_survives_when_already_correct(self, tmp_path):
+        # Regression: when a legacy inline block already held the requested
+        # value, an "already correct" short-circuit skipped writing the env file
+        # while the stub still replaced that block — silently dropping the
+        # export. The merged set must always be written back.
+        instance = self.create_fumitm_instance(mode='install')
+        rc = tmp_path / '.zshrc'
+        bundle = '/Users/test/.python-ca-bundle.pem'
+        rc.write_text(
+            f'{instance._FUMITM_BLOCK_BEGIN}\n'
+            f'export SSL_CERT_FILE="{bundle}"\n'
+            f'{instance._FUMITM_BLOCK_END}\n'
+        )
+
+        # Same value the legacy block already carried.
+        instance.add_to_shell_config('SSL_CERT_FILE', bundle, str(rc))
+
+        assert 'export SSL_CERT_FILE=' not in rc.read_text(), "legacy block replaced"
+        assert f'export SSL_CERT_FILE="{bundle}"' \
+            in Path(instance._env_file_path()).read_text(), \
+            "hoisted value must reach the env file, not vanish with the block"
 
     def test_overrides_differing_value_without_prompt(self, tmp_path):
         instance = self.create_fumitm_instance(mode='install')
@@ -4000,17 +4054,19 @@ class TestShellConfigIdempotency(FumitmTestCase):
             )
 
         new_content = rc.read_text()
-        assert prompt.call_count == 0, "managed block is authoritative; no prompt"
-        # The user's earlier line is preserved (never commented), and the managed
-        # block at EOF carries the new value, winning by last-export-wins.
+        assert prompt.call_count == 0, "the env file is authoritative; no prompt"
+        # The user's earlier line is preserved (never commented), and the stub at
+        # EOF sources the new value, winning by last-export-wins.
         assert 'export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE="/old/path.pem"' in new_content
         assert '#export' not in new_content
         assert new_content.rstrip().endswith(instance._FUMITM_BLOCK_END)
-        assert new_content.index('/new/path.pem') > new_content.index('/old/path.pem')
+        assert new_content.index(instance._FUMITM_BLOCK_BEGIN) > new_content.index('/old/path.pem')
+        assert 'export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE="/new/path.pem"' \
+            in Path(instance._env_file_path()).read_text()
         assert changed is True
         assert instance.shell_modified is True
 
-    def test_value_lands_inside_managed_block(self, tmp_path):
+    def test_value_lands_in_env_file_behind_stub(self, tmp_path):
         instance = self.create_fumitm_instance(mode='install')
         rc = tmp_path / '.zshrc'
         rc.write_text('#export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE="/old/path.pem"\n')
@@ -4024,10 +4080,13 @@ class TestShellConfigIdempotency(FumitmTestCase):
 
         content = rc.read_text()
         assert prompt.call_count == 0, "commented-out lines should not trigger a prompt"
+        # The startup file carries only the stub; the value lives in the env file.
         begin = content.index(instance._FUMITM_BLOCK_BEGIN)
-        export = content.index('export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE="/new/path.pem"')
+        source = content.index(instance._FUMITM_ENV_FILE_SHELL)
         end = content.index(instance._FUMITM_BLOCK_END)
-        assert begin < export < end
+        assert begin < source < end
+        assert 'export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE="/new/path.pem"' \
+            in Path(instance._env_file_path()).read_text()
         assert instance.shell_modified is True
 
     def test_plain_user_export_preserved_and_overridden(self, tmp_path):
@@ -4077,19 +4136,23 @@ class TestShellConfigManagedBlock(FumitmTestCase):
         instance.add_to_shell_config('REQUESTS_CA_BUNDLE', '/fumitm/bundle.pem', str(rc))
 
         content = rc.read_text()
-        # Aikido's block is preserved verbatim, and the fumitm block sits after it.
+        env = Path(instance._env_file_path()).read_text()
+        # Aikido's block is preserved verbatim, and the fumitm stub sits after it,
+        # so sourcing the env file happens last and its exports win.
         assert aikido.strip() in content
         assert content.index(instance._FUMITM_BLOCK_BEGIN) > content.index('aikido-endpoint end')
-        # The managed-block copy (last occurrence) wins over Aikido's earlier line.
-        assert content.rindex('export SSL_CERT_FILE="/fumitm/bundle.pem"') \
+        assert content.index(instance._FUMITM_ENV_FILE_SHELL) \
             > content.index('export SSL_CERT_FILE="/aikido/only.pem"')
-        assert 'export REQUESTS_CA_BUNDLE="/fumitm/bundle.pem"' in content
+        assert 'export SSL_CERT_FILE="/fumitm/bundle.pem"' in env
+        assert 'export REQUESTS_CA_BUNDLE="/fumitm/bundle.pem"' in env
 
         # Second pass is byte-identical (idempotent).
         before = rc.read_text()
+        before_env = env
         changed = instance.add_to_shell_config('SSL_CERT_FILE', '/fumitm/bundle.pem', str(rc))
         assert changed is False
         assert rc.read_text() == before
+        assert Path(instance._env_file_path()).read_text() == before_env
 
     def test_relocates_block_to_eof_when_mid_file(self, tmp_path):
         instance = self.create_fumitm_instance(mode='install')
@@ -4110,17 +4173,19 @@ class TestShellConfigManagedBlock(FumitmTestCase):
         assert content.index('LATER_USER_VAR') < content.index(instance._FUMITM_BLOCK_BEGIN)
         assert content.rstrip().endswith(instance._FUMITM_BLOCK_END)
 
-    def test_multiple_vars_accumulate_in_one_block(self, tmp_path):
+    def test_multiple_vars_accumulate_in_one_env_file(self, tmp_path):
         instance = self.create_fumitm_instance(mode='install')
         rc = tmp_path / '.zshrc'
         instance.add_to_shell_config('SSL_CERT_FILE', '/b.pem', str(rc))
         instance.add_to_shell_config('REQUESTS_CA_BUNDLE', '/b.pem', str(rc))
 
         content = rc.read_text()
+        env = Path(instance._env_file_path()).read_text()
+        # One stub per startup file, however many vars are configured.
         assert content.count(instance._FUMITM_BLOCK_BEGIN) == 1
         assert content.count(instance._FUMITM_BLOCK_END) == 1
-        assert 'export SSL_CERT_FILE="/b.pem"' in content
-        assert 'export REQUESTS_CA_BUNDLE="/b.pem"' in content
+        assert 'export SSL_CERT_FILE="/b.pem"' in env
+        assert 'export REQUESTS_CA_BUNDLE="/b.pem"' in env
 
     def test_per_run_backup_holds_pre_run_original(self, tmp_path):
         instance = self.create_fumitm_instance(mode='install')
@@ -4190,10 +4255,262 @@ class TestShellConfigManagedBlock(FumitmTestCase):
         instance.add_to_shell_config('SSL_CERT_FILE', '/new.pem', str(rc))
 
         content = rc.read_text()
-        # The fresh block was updated; the stale begin + its line stay as foreign.
+        env = Path(instance._env_file_path()).read_text()
+        # The fresh block became the stub; the stale begin + its line stay as
+        # foreign content, and the old value did not survive the migration.
         assert 'export STALE_LEFTOVER="x"' in content
-        assert 'export SSL_CERT_FILE="/new.pem"' in content
         assert 'export SSL_CERT_FILE="/old.pem"' not in content
+        assert 'export SSL_CERT_FILE="/new.pem"' in env
+        assert '/old.pem' not in env
+
+
+class TestShellStartupFileCoverage(FumitmTestCase):
+    """Every startup file the shell reads gets the stub, so the exports apply in
+    interactive, non-interactive and login shells alike.
+
+    Regression cover for exports landing only in .zshrc: a non-interactive login
+    shell (`zsh -lc`, used by many tool launchers) reads .zprofile and skips
+    .zshrc entirely, so a vendor block in .zprofile silently won.
+    """
+
+    def _install(self, home, shell):
+        inst = self.create_fumitm_instance(mode='install')
+        with patch.object(inst, 'detect_shell', return_value=shell):
+            inst.add_to_shell_config('SSL_CERT_FILE', '/new/bundle.pem')
+        return inst
+
+    def test_zsh_targets_cover_every_shell_mode(self, isolate_home):
+        inst = self.create_fumitm_instance(mode='install')
+        targets = [os.path.basename(p) for p in inst.get_shell_configs('zsh')]
+        # .zshenv: non-login non-interactive. .zshrc: interactive.
+        # .zlogin: login, and read after .zprofile so a vendor block there loses.
+        assert targets == ['.zshenv', '.zshrc', '.zlogin']
+
+    def test_zprofile_is_never_written(self, isolate_home):
+        zprofile = isolate_home / '.zprofile'
+        vendor = 'export SSL_CERT_FILE="/vendor/aikido.pem"\n'
+        zprofile.write_text(vendor)
+
+        self._install(isolate_home, 'zsh')
+
+        assert zprofile.read_text() == vendor, "vendor's own file must not be edited"
+        assert not (isolate_home / '.zprofile.bak').exists()
+
+    def test_stub_written_to_every_zsh_startup_file(self, isolate_home):
+        inst = self._install(isolate_home, 'zsh')
+
+        for name in ('.zshenv', '.zshrc', '.zlogin'):
+            content = (isolate_home / name).read_text()
+            assert inst._FUMITM_ENV_FILE_SHELL in content, f'{name} missing stub'
+            assert content.rstrip().endswith(inst._FUMITM_BLOCK_END), \
+                f'{name} stub must be last so it wins over vendor blocks'
+        assert 'export SSL_CERT_FILE="/new/bundle.pem"' \
+            in Path(inst._env_file_path()).read_text()
+
+    def test_bash_targets_include_login_and_interactive_files(self, isolate_home):
+        (isolate_home / '.profile').write_text('# login\n')
+        inst = self.create_fumitm_instance(mode='install')
+
+        targets = [os.path.basename(p) for p in inst.get_shell_configs('bash')]
+
+        # .bashrc for interactive non-login; .profile is the first existing
+        # login file, so bash reads it rather than creating .bash_profile.
+        assert targets == ['.bashrc', '.profile']
+
+    def test_bash_creates_bash_profile_when_no_login_file_exists(self, isolate_home):
+        inst = self.create_fumitm_instance(mode='install')
+        targets = [os.path.basename(p) for p in inst.get_shell_configs('bash')]
+        assert targets == ['.bashrc', '.bash_profile']
+
+    def test_fish_keeps_inline_block_and_writes_no_env_file(self, isolate_home):
+        inst = self.create_fumitm_instance(mode='install')
+        config = isolate_home / '.config' / 'fish' / 'config.fish'
+
+        with patch.object(inst, 'detect_shell', return_value='fish'), \
+             patch.object(inst, 'get_shell_config', return_value=str(config)):
+            inst.add_to_shell_config('SSL_CERT_FILE', '/new/bundle.pem')
+
+        # fish cannot source POSIX-sh syntax, so it keeps the inline block.
+        assert 'export SSL_CERT_FILE="/new/bundle.pem"' in config.read_text()
+        assert not Path(inst._env_file_path()).exists()
+
+    def test_status_mode_writes_nothing(self, isolate_home):
+        inst = self.create_fumitm_instance(mode='status')
+
+        with patch.object(inst, 'detect_shell', return_value='zsh'):
+            changed = inst.add_to_shell_config('SSL_CERT_FILE', '/new/bundle.pem')
+
+        assert changed is True, "dry run still reports the pending change"
+        assert not Path(inst._env_file_path()).exists()
+        for name in ('.zshenv', '.zshrc', '.zlogin'):
+            assert not (isolate_home / name).exists()
+        assert inst.shell_modified is False
+
+    def test_dry_run_reports_each_file_once_across_vars(self, isolate_home):
+        # Nothing persists in a dry run, so every var re-detects the same
+        # pending file changes; without dedup a multi-var setup floods the
+        # output with identical "Would update" lines per file.
+        inst = self.create_fumitm_instance(mode='status')
+
+        with patch.object(inst, 'detect_shell', return_value='zsh'), \
+                patch.object(inst, 'print_action') as action:
+            for var in ('SSL_CERT_FILE', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE'):
+                inst.add_to_shell_config(var, '/new/bundle.pem')
+
+        would_update = [c.args[0] for c in action.call_args_list
+                        if c.args[0].startswith('Would update')]
+        assert len(would_update) == len(set(would_update)), \
+            f'duplicate dry-run lines: {would_update}'
+        # env file + three startup files, once each; one export line per var.
+        assert len(would_update) == 4
+        exports = [c.args[0] for c in action.call_args_list
+                   if c.args[0].startswith('export ')]
+        assert len(exports) == 3
+
+    def test_rerun_restores_a_stub_deleted_from_one_file(self, isolate_home):
+        inst = self._install(isolate_home, 'zsh')
+        (isolate_home / '.zlogin').write_text('# user wiped the stub\n')
+
+        with patch.object(inst, 'detect_shell', return_value='zsh'):
+            changed = inst.add_to_shell_config('SSL_CERT_FILE', '/new/bundle.pem')
+
+        assert changed is True
+        assert inst._FUMITM_ENV_FILE_SHELL in (isolate_home / '.zlogin').read_text()
+
+    def test_zdotdir_overrides_home_for_zsh_targets(
+            self, isolate_home, monkeypatch, tmp_path):
+        # zsh reads its per-user startup files from $ZDOTDIR when set, not
+        # $HOME. Writing to HOME files a custom-dotdir zsh never reads would
+        # recreate the exact non-interactive-login gap this scheme fixes.
+        zdot = tmp_path / 'zdot'
+        zdot.mkdir()
+        monkeypatch.setenv('ZDOTDIR', str(zdot))
+        inst = self.create_fumitm_instance(mode='install')
+
+        assert inst.get_shell_configs('zsh') == [
+            str(zdot / '.zshenv'), str(zdot / '.zshrc'), str(zdot / '.zlogin')]
+        assert inst.get_shell_config('zsh') == str(zdot / '.zshrc')
+
+        with patch.object(inst, 'detect_shell', return_value='zsh'):
+            inst.add_to_shell_config('SSL_CERT_FILE', '/new/bundle.pem')
+
+        for name in ('.zshenv', '.zshrc', '.zlogin'):
+            assert inst._FUMITM_ENV_FILE_SHELL in (zdot / name).read_text(), \
+                f'{name} missing stub under ZDOTDIR'
+            assert not (isolate_home / name).exists(), \
+                f'HOME {name} written despite ZDOTDIR — zsh never reads it'
+        # The env file itself is not a zsh startup file; it stays under HOME.
+        assert Path(inst._env_file_path()).exists()
+
+    def test_zdotdir_unset_or_empty_falls_back_to_home(
+            self, isolate_home, monkeypatch):
+        inst = self.create_fumitm_instance(mode='install')
+        expected = [str(isolate_home / n) for n in ('.zshenv', '.zshrc', '.zlogin')]
+
+        monkeypatch.delenv('ZDOTDIR')
+        assert inst.get_shell_configs('zsh') == expected
+        monkeypatch.setenv('ZDOTDIR', '')
+        assert inst.get_shell_configs('zsh') == expected
+
+    def test_real_zsh_login_shell_with_zdotdir_gets_fumitm_value(
+            self, isolate_home, monkeypatch, tmp_path):
+        # End-to-end reproduction of the review finding on PR #99: vendor
+        # export in $ZDOTDIR/.zprofile, fumitm configured, then every zsh
+        # invocation mode must resolve fumitm's bundle - including the
+        # non-interactive login shell that reads .zprofile but not .zshrc.
+        zdot = tmp_path / 'zdot'
+        zdot.mkdir()
+        (zdot / '.zprofile').write_text(
+            'export SSL_CERT_FILE="/vendor/aikido.pem"\n')
+        monkeypatch.setenv('ZDOTDIR', str(zdot))
+
+        inst = self.create_fumitm_instance(mode='install')
+        with patch.object(inst, 'detect_shell', return_value='zsh'):
+            inst.add_to_shell_config('SSL_CERT_FILE', '/fumitm/bundle.pem')
+
+        shell_env = {'HOME': str(isolate_home), 'ZDOTDIR': str(zdot),
+                     'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
+        for flags in ('-c', '-ic', '-lc', '-lic'):
+            proc = subprocess.run(
+                ['zsh', flags, 'echo $SSL_CERT_FILE'],
+                capture_output=True, text=True, env=shell_env, timeout=30,
+                check=False)  # interactive modes may exit non-zero without a tty
+            lines = [l for l in proc.stdout.strip().splitlines() if l]
+            assert lines and lines[-1] == '/fumitm/bundle.pem', \
+                f'zsh {flags}: got {proc.stdout!r} (stderr: {proc.stderr!r})'
+
+    def test_real_zsh_shell_local_zdotdir_gets_fumitm_value(
+            self, isolate_home, monkeypatch, tmp_path):
+        # ZDOTDIR is a shell parameter and need not be exported. In that case
+        # Python cannot see it in os.environ, but zsh still uses the value from
+        # HOME/.zshenv for every later startup file.
+        zdot = tmp_path / 'shell-local-zdot'
+        zdot.mkdir()
+        (isolate_home / '.zshenv').write_text(f'ZDOTDIR="{zdot}"\n')
+        (zdot / '.zprofile').write_text(
+            'export SSL_CERT_FILE="/vendor/aikido.pem"\n')
+        monkeypatch.delenv('ZDOTDIR')
+
+        inst = self.create_fumitm_instance(mode='install')
+        with patch.object(inst, 'detect_shell', return_value='zsh'):
+            inst.add_to_shell_config('SSL_CERT_FILE', '/fumitm/bundle.pem')
+
+        assert inst._queried_zsh_dotdir == str(zdot)
+        assert (isolate_home / '.zshenv').read_text() == f'ZDOTDIR="{zdot}"\n'
+        for name in ('.zshenv', '.zshrc', '.zlogin'):
+            assert inst._FUMITM_ENV_FILE_SHELL in (zdot / name).read_text()
+
+        shell_env = {
+            'HOME': str(isolate_home),
+            'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
+        }
+        proc = subprocess.run(
+            ['zsh', '-lc', 'printf %s "$SSL_CERT_FILE"'],
+            capture_output=True, text=True, env=shell_env, timeout=30,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == '/fumitm/bundle.pem'
+
+    def test_zdotdir_query_timeout_falls_back_to_home(
+            self, isolate_home, monkeypatch):
+        monkeypatch.delenv('ZDOTDIR')
+        monkeypatch.setenv('SHELL', '/bin/zsh')
+        inst = self.create_fumitm_instance(mode='install')
+        process = MagicMock()
+        process.communicate.side_effect = [
+            subprocess.TimeoutExpired('/bin/zsh', 3),
+            ('', ''),
+        ]
+
+        with patch(
+                'fumitm.subprocess.Popen', return_value=process):
+            assert inst._zsh_dotdir() == str(isolate_home)
+        process.kill.assert_called_once_with()
+
+    def test_zdotdir_query_drops_root_to_target_user(
+            self, isolate_home, monkeypatch):
+        monkeypatch.delenv('ZDOTDIR')
+        monkeypatch.setenv('SHELL', '/bin/zsh')
+        inst = self.create_fumitm_instance(mode='install')
+        inst._target_uid = 501
+        inst._target_gid = 20
+        target = MagicMock(pw_name='alice')
+        process = MagicMock(returncode=0)
+        process.communicate.return_value = (
+            f'__FUMITM_ZDOTDIR__={isolate_home}\n',
+            '',
+        )
+
+        with patch('fumitm.os.getuid', return_value=0), \
+                patch('fumitm.pwd.getpwuid', return_value=target), \
+                patch('fumitm.os.getgrouplist', return_value=[20, 80]), \
+                patch('fumitm.subprocess.Popen', return_value=process) as popen:
+            assert inst._zsh_dotdir() == str(isolate_home)
+
+        assert popen.call_args.kwargs['user'] == 501
+        assert popen.call_args.kwargs['group'] == 20
+        assert popen.call_args.kwargs['extra_groups'] == [20, 80]
 
 
 if __name__ == '__main__':
