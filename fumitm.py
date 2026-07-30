@@ -6944,8 +6944,16 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
 
         Deliberately independent of shell_modified: on a converged rerun
         nothing on disk changes, but a freshly started wrapper process has
-        not inherited the environment and still needs this path to source
-        before launching dependent children.
+        not inherited the environment and still needs this path for its
+        dependent children.
+
+        Trust boundary: the file is owned and writable by the target user
+        (fumitm chowns it back after writing). A privileged wrapper must
+        never source it — that evaluates user-controlled shell code as
+        root. It should instead drop privileges and let the dependent
+        child source the file as the target user (e.g. via sudo -u). Only
+        the deterministic path is reported, never the file's contents,
+        precisely so nothing privileged is tempted to trust them.
         """
         if not self._uses_env_file(self.detect_shell()):
             return None
