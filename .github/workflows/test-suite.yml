@@ -40,6 +40,7 @@ jobs:
             - 'test_suite/test_aikido_root.py'
             - 'test_suite/test_curlrc.py'
             - 'test_suite/test_headless_mdm.py'
+            - 'test_suite/test_refresh_hook.py'
             - 'test_suite/helpers.py'
             - 'test_suite/mock_data.py'
           fumitm_windows:
@@ -77,7 +78,7 @@ jobs:
       working-directory: test_suite
       run: |
         source .venv/bin/activate
-        python -m pytest test_fumitm_integration.py test_netskope_provider.py test_suspicious_bundles.py test_aikido_root.py test_curlrc.py test_headless_mdm.py -v --tb=short
+        python -m pytest test_fumitm_integration.py test_netskope_provider.py test_suspicious_bundles.py test_aikido_root.py test_curlrc.py test_headless_mdm.py test_refresh_hook.py -v --tb=short
 
   test-linux:
     runs-on: ubuntu-latest
@@ -87,10 +88,10 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install zsh test dependency
+    - name: Install shell test dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install --yes zsh
+        sudo apt-get install --yes zsh fish
 
     - name: Set up uv
       uses: astral-sh/setup-uv@v4
@@ -111,7 +112,7 @@ jobs:
       working-directory: test_suite
       run: |
         source .venv/bin/activate
-        python -m pytest test_fumitm_integration.py test_netskope_provider.py test_suspicious_bundles.py test_aikido_root.py test_curlrc.py test_headless_mdm.py -v --tb=short
+        python -m pytest test_fumitm_integration.py test_netskope_provider.py test_suspicious_bundles.py test_aikido_root.py test_curlrc.py test_headless_mdm.py test_refresh_hook.py -v --tb=short
 
   test-windows:
     runs-on: windows-latest

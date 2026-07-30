@@ -73,7 +73,9 @@ changed_when: >
 
 ## Already-Open Shells
 
-fumitm installs a passive prompt hook (zsh `precmd`, bash `PROMPT_COMMAND`, fish `conf.d`) alongside its persistent exports. Once a shell has loaded the hook, any later fumitm run — a local checkout, a saved download, or a Jamf policy using `--run-as-user` — is picked up at that shell's next prompt: the hook sources `~/.config/fumitm/env.sh` (or `env.fish` for fish), which no-ops unless its content generation changed. The hook requires no installed fumitm executable, runs no subprocess, and preserves the previous command's exit status. Disable with `--no-refresh-hook`.
+fumitm installs a passive prompt hook (zsh `precmd`, bash `PROMPT_COMMAND`, fish `conf.d`) alongside its persistent exports. Once a shell has loaded the hook, any later fumitm run — a local checkout, a saved download, or a Jamf policy using `--run-as-user` — is picked up at that shell's next prompt: the hook sources `~/.config/fumitm/env.sh` (or `env.fish` for fish), which no-ops unless its content generation changed. The hook requires no installed fumitm executable, runs no subprocess, and preserves the previous command's exit status.
+
+Hook state is reconciled once per `--fix` run, independent of which tools needed changes: an already-converged installation (every tool `already_ok`) still gains the hook when upgrading from a pre-hook fumitm, including `--tools` runs that select no shell-writing tool. `--no-refresh-hook` disables the hook and also removes one installed by an earlier run — only the marker-delimited hook block (and fish's `conf.d` file) is removed; persistence stubs and exports stay. The reconciliation appears in the run summary and `FUMITM_RESULT` as the `refresh-hook` entry.
 
 The first-ever run cannot retroactively refresh shells that were already open before the hook existed; those need one explicit `. "$HOME/.config/fumitm/env.sh"` or a new terminal (see `shell_reload_command` above).
 

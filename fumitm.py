@@ -2574,6 +2574,76 @@ class FumitmPython:
         return self._write_managed_file(target, prefix + hook + '\n',
                                         'refresh hook')
 
+    def _remove_refresh_hooks(self):
+        """Remove fumitm-owned refresh hook content for every shell.
+
+        Startup files lose only the marker-delimited refresh block; source
+        stubs and all other content stay untouched, so persistence keeps
+        working. The fish conf.d hook file is deleted outright since fumitm
+        owns that whole file. Returns True when anything was removed (or
+        would be, in dry-run mode).
+        """
+        removed = False
+        targets = {self._refresh_hook_target('zsh'),
+                   self._refresh_hook_target('bash')}
+        for target in targets:
+            content = self._read_text_or_none(target)
+            if content is None:
+                continue
+            other_lines, block = self._split_refresh_block(content)
+            if block is None:
+                continue
+            while other_lines and other_lines[-1].strip() == '':
+                other_lines.pop()
+            new = ('\n'.join(other_lines) + '\n') if other_lines else ''
+            if self._write_managed_file(target, new, 'refresh hook removal'):
+                removed = True
+        hook_path = os.path.join(os.path.expanduser("~"),
+                                 self._FUMITM_FISH_HOOK_REL)
+        if os.path.exists(hook_path):
+            if self.is_install_mode():
+                os.remove(hook_path)
+                self.print_info(f"Removed {hook_path}")
+            else:
+                self.print_action(f"Would remove {hook_path}")
+            removed = True
+        return removed
+
+    def _reconcile_refresh_hook(self):
+        """Converge the prompt refresh hook independently of tool outcomes.
+
+        Called once per install run. Tool setup functions only touch the
+        hook via add_to_shell_config, which a fully converged system never
+        reaches: every tool returns already_ok, so an upgrade from a
+        pre-hook fumitm would otherwise never install the hook. The same
+        holds for --tools runs that select no shell-writing tool. The
+        inverse applies to --no-refresh-hook, which must be able to remove
+        a hook installed by an earlier run, not merely skip adding one.
+
+        Returns a ToolResult for the run summary, or None when the
+        detected shell has no prompt hook and there is nothing to remove.
+        """
+        if self.no_refresh_hook:
+            removed = self._remove_refresh_hooks()
+            if removed:
+                return ToolResult(
+                    'refresh-hook', 'configured',
+                    'Removed prompt refresh hook (--no-refresh-hook)')
+            return ToolResult('refresh-hook', 'already_ok',
+                              'No prompt refresh hook installed')
+        shell_type = self.detect_shell()
+        if shell_type == 'fish':
+            changed = self._ensure_fish_refresh_hook()
+        elif self._refresh_hook_target(shell_type) is not None:
+            changed = self._ensure_refresh_hook(shell_type)
+        else:
+            return None
+        if changed:
+            return ToolResult('refresh-hook', 'configured',
+                              'Installed prompt refresh hook')
+        return ToolResult('refresh-hook', 'already_ok',
+                          'Prompt refresh hook current')
+
     def _env_fish_path(self):
         """Absolute path of the generated fish env file."""
         return os.path.join(os.path.expanduser("~"), self._FUMITM_ENV_FISH_REL)
@@ -2619,7 +2689,13 @@ class FumitmPython:
             (f'if test "$_FUMITM_ENV_GENERATION" != "{generation}"; '
              'or test "$_FUMITM_ENV_FORCE" = "1"'),
         ]
-        body.extend(f'    set -e {name}' for name in manifest)
+        # Erase global scope only: an unscoped `set -e` erases from the
+        # smallest existing scope, so it would permanently delete a user's
+        # persisted universal value (set -Ux) from fish's variable store.
+        # fumitm only ever writes globals, so only globals are cleaned up;
+        # a universal value remains underneath and reappears if fumitm
+        # stops managing the name.
+        body.extend(f'    set -eg {name}' for name in manifest)
         body.extend(f'    set -gx {name} "{value}"'
                     for name, value in managed.items())
         body.append(f'    set -gx _FUMITM_ENV_GENERATION "{generation}"')
@@ -7463,6 +7539,16 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                         continue
                     result = self._run_setup(tool_key, setup_func)
                     results.append(result)
+
+                # Hook lifecycle is independent of tool outcomes: a fully
+                # converged system returns already_ok from every tool without
+                # ever reaching add_to_shell_config, yet still needs the hook
+                # installed (upgrade) or removed (--no-refresh-hook). Skipped
+                # without user context, like every other $HOME write.
+                if not no_user:
+                    hook_result = self._reconcile_refresh_hook()
+                    if hook_result is not None:
+                        results.append(hook_result)
 
                 print()
                 exit_code = self._print_summary(results)
