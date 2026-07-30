@@ -7248,9 +7248,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             'shell_reload_command': (
                 self._shell_reload_command() if self.shell_modified else None
             ),
-            'shell_env_file': (
-                self._shell_env_file() if self.shell_modified else None
-            ),
+            'shell_env_file': self._shell_env_file(),
         }
         # Stable machine-parseable line for Ansible changed_when
         print(f"FUMITM_RESULT: {json.dumps(result_obj)}")
@@ -7289,20 +7287,27 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         return None
 
     def _shell_env_file(self):
-        """Absolute path of the generated env file, or None without one.
+        """Absolute path of the generated env file when it exists, else None.
 
         Reported in FUMITM_RESULT for automation wrappers: a root Jamf
         process using --run-as-user writes the target user's env file, but
         shell_reload_command is $HOME-relative and would resolve against the
         wrapper's own $HOME (/var/root). This path is absolute and already
         resolved against the target user's corrected home directory.
+
+        Deliberately independent of shell_modified: on a converged rerun
+        nothing on disk changes, but a freshly started wrapper process has
+        not inherited the environment and still needs this path to source
+        before launching dependent children.
         """
         shell_type = self.detect_shell()
         if self._uses_env_file(shell_type):
-            return self._env_file_path()
-        if shell_type == 'fish':
-            return self._env_fish_path()
-        return None
+            path = self._env_file_path()
+        elif shell_type == 'fish':
+            path = self._env_fish_path()
+        else:
+            return None
+        return path if os.path.exists(path) else None
 
     def _print_shell_reload_notice(self):
         """Final, unmissable instruction to activate exports in this shell.

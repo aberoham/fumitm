@@ -7,6 +7,9 @@ accuracy, exit codes, and orchestrator environment simulations.
 """
 import json
 import os
+import re
+import shutil
+import subprocess
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -974,6 +977,13 @@ class TestShellReloadNotice(FumitmTestCase):
         assert data['shell_reload_required'] is True
         assert data['shell_reload_command'] == self.ENV_SOURCE_CMD
 
+    @staticmethod
+    def _create_env_file(instance):
+        path = Path(instance._env_file_path())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('export SSL_CERT_FILE="/b.pem"\n')
+        return str(path)
+
     def test_result_json_reload_fields_when_not_modified(self, capsys):
         instance = self.create_fumitm_instance()
         instance._print_summary([ToolResult('a', 'already_ok', '')])
@@ -989,6 +999,7 @@ class TestShellReloadNotice(FumitmTestCase):
         $HOME-relative shell_reload_command."""
         instance = self.create_fumitm_instance()
         instance.shell_modified = True
+        self._create_env_file(instance)
         with patch.object(instance, 'detect_shell', return_value='zsh'):
             instance._print_summary([ToolResult('a', 'configured', 'done')])
         data = self._parse_result(capsys.readouterr().out)
@@ -997,9 +1008,26 @@ class TestShellReloadNotice(FumitmTestCase):
         assert '$HOME' not in data['shell_env_file']
         assert data['shell_env_file'].endswith('.config/fumitm/env.sh')
 
+    def test_result_json_env_file_reported_on_converged_rerun(self, capsys):
+        """A converged rerun changes nothing on disk, but a freshly started
+        wrapper process has not inherited the environment: shell_env_file
+        must still point at the existing env file while
+        shell_reload_required stays false."""
+        instance = self.create_fumitm_instance()
+        self._create_env_file(instance)
+        with patch.object(instance, 'detect_shell', return_value='zsh'):
+            instance._print_summary([ToolResult('a', 'already_ok', '')])
+        data = self._parse_result(capsys.readouterr().out)
+        assert data['shell_reload_required'] is False
+        assert data['shell_reload_command'] is None
+        assert data['shell_env_file'] == instance._env_file_path()
+
     def test_result_json_env_file_for_fish_is_env_fish(self, capsys):
         instance = self.create_fumitm_instance()
         instance.shell_modified = True
+        fish_path = Path(instance._env_fish_path())
+        fish_path.parent.mkdir(parents=True, exist_ok=True)
+        fish_path.write_text('set -gx SSL_CERT_FILE "/b.pem"\n')
         with patch.object(instance, 'detect_shell', return_value='fish'):
             instance._print_summary([ToolResult('a', 'configured', 'done')])
         data = self._parse_result(capsys.readouterr().out)
@@ -1007,6 +1035,84 @@ class TestShellReloadNotice(FumitmTestCase):
         assert os.path.isabs(data['shell_env_file'])
         assert data['shell_reload_command'] == \
             'source "$HOME/.config/fumitm/env.fish"'
+
+
+class TestReadmeActivationBlock(FumitmTestCase):
+    """The README copy/paste block must activate on partial success while
+    preserving fumitm's exit status as the block's final status."""
+
+    @staticmethod
+    def _readme_block():
+        readme = Path(__file__).resolve().parent.parent / 'README.md'
+        lines = readme.read_text().splitlines()
+        for i, line in enumerate(lines):
+            if line.startswith('_fumitm_status=0; python3 <(curl'):
+                return lines[i:i + 3]
+        raise AssertionError('activation block not found in README.md')
+
+    def _stubbed_script(self, status):
+        """The real README block with the curl|python line stubbed out."""
+        block = self._readme_block()
+        first = re.sub(r"python3 <\(curl [^)]*\) --fix --yes",
+                       f"sh -c 'exit {status}'", block[0])
+        assert first != block[0], 'stub substitution did not match'
+        return '\n'.join([first] + block[1:])
+
+    def test_block_structure(self):
+        block = self._readme_block()
+        assert block[0].startswith('_fumitm_status=0; ')
+        assert block[0].endswith('|| _fumitm_status=$?')
+        assert block[1] == ('[ -r "$HOME/.config/fumitm/env.sh" ] && '
+                            '. "$HOME/.config/fumitm/env.sh"')
+        assert block[2] == '(exit $_fumitm_status)'
+
+    @pytest.mark.parametrize('shell', ['bash', 'zsh'])
+    @pytest.mark.parametrize(('status', 'with_file'), [
+        (0, True), (0, False), (1, False), (3, True),
+    ])
+    def test_block_preserves_status_and_activates(
+            self, isolate_home, shell, status, with_file):
+        if shutil.which(shell) is None:
+            pytest.skip(f'{shell} not installed')
+        if with_file:
+            env_dir = isolate_home / '.config' / 'fumitm'
+            env_dir.mkdir(parents=True)
+            (env_dir / 'env.sh').write_text(
+                'export SSL_CERT_FILE="/b.pem"\n')
+        script = self._stubbed_script(status)
+        env = {'HOME': str(isolate_home),
+               'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
+        proc = subprocess.run([shell, '-c', script], env=env,
+                              capture_output=True, text=True, timeout=30,
+                              check=False)
+        assert proc.returncode == status, \
+            f'block status {proc.returncode} != fumitm status {status}'
+        probe = subprocess.run(
+            [shell, '-c', script + '\necho "var:${SSL_CERT_FILE:-none}"'],
+            env=env, capture_output=True, text=True, timeout=30, check=False)
+        expected = '/b.pem' if with_file else 'none'
+        assert f'var:{expected}' in probe.stdout
+
+    @pytest.mark.parametrize('shell', ['bash', 'zsh'])
+    def test_block_activates_before_errexit_stop(self, isolate_home, shell):
+        """Under set -e, a partial-success status must not stop the script
+        before the activation line runs; the script then stops with
+        fumitm's status, faithfully reflecting the failure."""
+        if shutil.which(shell) is None:
+            pytest.skip(f'{shell} not installed')
+        env_dir = isolate_home / '.config' / 'fumitm'
+        env_dir.mkdir(parents=True)
+        (env_dir / 'env.sh').write_text('export SSL_CERT_FILE="/b.pem"\n')
+        script = ('set -e\n'
+                  + self._stubbed_script(3)
+                  + '\necho unreachable')
+        env = {'HOME': str(isolate_home),
+               'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
+        proc = subprocess.run([shell, '-c', script], env=env,
+                              capture_output=True, text=True, timeout=30,
+                              check=False)
+        assert proc.returncode == 3
+        assert 'unreachable' not in proc.stdout
 
 
 if __name__ == '__main__':
