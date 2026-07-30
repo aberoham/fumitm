@@ -6891,6 +6891,10 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             'partial': partial,
             'failed': failed,
             'exit_code': exit_code,
+            'shell_reload_required': self.shell_modified,
+            'shell_reload_command': (
+                self._shell_reload_command() if self.shell_modified else None
+            ),
         }
         # Stable machine-parseable line for Ansible changed_when
         print(f"FUMITM_RESULT: {json.dumps(result_obj)}")
@@ -6911,6 +6915,51 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             self._json_log_file_handle.flush()
 
         return exit_code
+
+    def _shell_reload_command(self):
+        """The exact command that activates fumitm's exports in the current shell.
+
+        POSIX shells source the small generated env file, never a whole rc
+        file: re-running .zshrc/.bashrc repeats unrelated agents, hooks,
+        aliases and PATH mutations that are not idempotent. fish keeps its
+        inline block in config.fish, so sourcing that file remains the fish
+        activation path. Returns None for shells with no safe one-liner.
+        """
+        shell_type = self.detect_shell()
+        if self._uses_env_file(shell_type):
+            return f'. {self._FUMITM_ENV_FILE_SHELL}'
+        if shell_type == 'fish':
+            home = os.path.expanduser("~")
+            return f"source {self.get_shell_config(shell_type).replace(home, '~', 1)}"
+        return None
+
+    def _print_shell_reload_notice(self):
+        """Final, unmissable instruction to activate exports in this shell.
+
+        A child process cannot modify its parent shell's environment, so after
+        a --fix the invoking terminal still carries the old variables until the
+        user sources the env file (or the chained README command does it for
+        them). Printed last so it is not buried under later informational
+        output. Suppressed in headless mode: a root Jamf/MDM policy log has no
+        interactive shell for the instruction to act on; automation reads the
+        shell_reload_* fields in FUMITM_RESULT instead.
+        """
+        if not self.shell_modified or self.headless:
+            return
+        command = self._shell_reload_command()
+        print()
+        self.print_warn("=" * 60)
+        self.print_warn("CURRENT SHELL NOT YET UPDATED")
+        self.print_warn("=" * 60)
+        self.print_warn("Environment changes only apply to new shells.")
+        self.print_warn("To activate them in THIS terminal, run:")
+        print()
+        if command:
+            self.print_info(f"  {command}")
+        else:
+            self.print_info("  exec $SHELL -l  (restarts your shell)")
+        print()
+        self.print_info("Or simply open a new terminal window.")
 
     def main(self):
         """Main entry point for the FumitmPython instance."""
@@ -7037,19 +7086,10 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 if any_container_processed:
                     self._print_docker_build_hint()
 
-                if self.shell_modified:
-                    self.print_warn("Shell configuration was modified.")
-                    self.print_warn("Please reload your shell configuration:")
-                    shell_type = self.detect_shell()
-                    shell_config = self.get_shell_config(shell_type)
-                    if shell_type in ('bash', 'zsh', 'fish'):
-                        self.print_info(f"  source {shell_config}")
-                    else:
-                        self.print_info("  Please restart your shell")
-
                 print()
                 self.print_info(f"Certificate location: {self.cert_path}")
                 self.print_info("For additional applications, please refer to the documentation.")
+                self._print_shell_reload_notice()
                 return exit_code
 
             print()

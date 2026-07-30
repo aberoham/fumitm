@@ -8,13 +8,15 @@ Script to automatically verify and fix MITM TLS distrust issues commonly afflict
 
 ```bash
 # Fix everything in one shot (no prompts, no download needed)
-python3 <(curl -LsSf https://raw.githubusercontent.com/aberoham/fumitm/main/fumitm.py) --fix --yes
-source ~/.zshrc  # or ~/.bashrc
+python3 <(curl -LsSf https://raw.githubusercontent.com/aberoham/fumitm/main/fumitm.py) --fix --yes &&
+  . "$HOME/.config/fumitm/env.sh"
 
 # With sudo (needed for Java keystores, DBeaver, and other system-level fixes)
-sudo python3 <(curl -LsSf https://raw.githubusercontent.com/aberoham/fumitm/main/fumitm.py) --fix --yes --run-as-user $USER
-source ~/.zshrc  # or ~/.bashrc
+sudo python3 <(curl -LsSf https://raw.githubusercontent.com/aberoham/fumitm/main/fumitm.py) --fix --yes --run-as-user $USER &&
+  . "$HOME/.config/fumitm/env.sh"
 ```
+
+The trailing `. "$HOME/.config/fumitm/env.sh"` activates the new TLS environment in your current terminal. A child process cannot modify its parent shell, so without it the fixes only apply to newly opened shells.
 
 For more control, download the script first:
 

@@ -911,5 +911,76 @@ class TestSudoHelperUpdates(FumitmTestCase):
                 mock_getpwuid.assert_called_with(501)
 
 
+class TestShellReloadNotice(FumitmTestCase):
+    """Issue #100: activation guidance for the invoking shell after --fix."""
+
+    ENV_SOURCE_CMD = '. "$HOME/.config/fumitm/env.sh"'
+
+    @staticmethod
+    def _parse_result(output):
+        for line in output.splitlines():
+            if line.startswith('FUMITM_RESULT:'):
+                return json.loads(line.split(':', 1)[1].strip())
+        raise AssertionError('FUMITM_RESULT line not found')
+
+    def test_reload_command_posix_sources_env_file(self):
+        """POSIX shells get the env file, never a whole rc file."""
+        instance = self.create_fumitm_instance()
+        for shell in ('zsh', 'bash'):
+            with patch.object(instance, 'detect_shell', return_value=shell):
+                assert instance._shell_reload_command() == self.ENV_SOURCE_CMD
+
+    def test_reload_command_fish_sources_config_fish(self):
+        """fish cannot source POSIX sh, so it keeps sourcing config.fish."""
+        instance = self.create_fumitm_instance()
+        with patch.object(instance, 'detect_shell', return_value='fish'):
+            cmd = instance._shell_reload_command()
+        assert cmd == 'source ~/.config/fish/config.fish'
+
+    def test_reload_command_unknown_shell_is_none(self):
+        instance = self.create_fumitm_instance()
+        with patch.object(instance, 'detect_shell', return_value='csh'):
+            assert instance._shell_reload_command() is None
+
+    def test_notice_printed_when_shell_modified(self, capsys):
+        instance = self.create_fumitm_instance()
+        instance.shell_modified = True
+        with patch.object(instance, 'detect_shell', return_value='zsh'):
+            instance._print_shell_reload_notice()
+        out = capsys.readouterr().out
+        assert 'CURRENT SHELL NOT YET UPDATED' in out
+        assert self.ENV_SOURCE_CMD in out
+        assert '.zshrc' not in out
+
+    def test_notice_suppressed_without_shell_changes(self, capsys):
+        instance = self.create_fumitm_instance()
+        instance.shell_modified = False
+        instance._print_shell_reload_notice()
+        assert 'CURRENT SHELL' not in capsys.readouterr().out
+
+    def test_notice_suppressed_in_headless_mode(self, capsys):
+        """A root Jamf/MDM policy log has no shell the instruction can act on."""
+        instance = self.create_fumitm_instance(headless=True)
+        instance.shell_modified = True
+        instance._print_shell_reload_notice()
+        assert 'CURRENT SHELL' not in capsys.readouterr().out
+
+    def test_result_json_reload_fields_when_modified(self, capsys):
+        instance = self.create_fumitm_instance()
+        instance.shell_modified = True
+        with patch.object(instance, 'detect_shell', return_value='zsh'):
+            instance._print_summary([ToolResult('a', 'configured', 'done')])
+        data = self._parse_result(capsys.readouterr().out)
+        assert data['shell_reload_required'] is True
+        assert data['shell_reload_command'] == self.ENV_SOURCE_CMD
+
+    def test_result_json_reload_fields_when_not_modified(self, capsys):
+        instance = self.create_fumitm_instance()
+        instance._print_summary([ToolResult('a', 'already_ok', '')])
+        data = self._parse_result(capsys.readouterr().out)
+        assert data['shell_reload_required'] is False
+        assert data['shell_reload_command'] is None
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
