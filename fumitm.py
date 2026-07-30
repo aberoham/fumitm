@@ -252,6 +252,13 @@ class FumitmPython:
     # in already-open shells instead of merely overwriting the survivors.
     _FUMITM_MANIFEST_PREFIX = "# fumitm-managed-vars:"
 
+    # Summary entries that are not certificate tools. Their success is
+    # excluded from the hard-vs-partial exit decision: a run where every
+    # requested tool failed must stay exit 1 even when the prompt-hook
+    # install succeeded. Their failures still mark the run partial, and a
+    # 'configured' status still drives changes_made.
+    _AUXILIARY_TOOLS = frozenset({'refresh-hook'})
+
     def __init__(self, mode='status', debug=False, selected_tools=None,
                  cert_file=None, manual_cert=False, skip_verify=False,
                  provider=None, auto_yes=False, no_color=False,
@@ -2643,6 +2650,28 @@ class FumitmPython:
                               'Installed prompt refresh hook')
         return ToolResult('refresh-hook', 'already_ok',
                           'Prompt refresh hook current')
+
+    def _run_hook_reconciliation(self):
+        """Run hook reconciliation behind _run_setup's exception boundary.
+
+        A failed startup-file write or fish hook removal must degrade to a
+        failed 'refresh-hook' summary entry, not escape to the outer
+        unexpected-error handler — that would skip _print_summary and turn
+        a run with successfully configured tools into a bare exit 1 with
+        no FUMITM_RESULT line. _run_setup cannot wrap
+        _reconcile_refresh_hook directly because it maps a non-ToolResult
+        return onto 'completed', while reconciliation legitimately returns
+        None for shells with no prompt hook; a sentinel carries that None
+        across the boundary.
+        """
+        no_hook = ToolResult('refresh-hook', 'skipped', 'No prompt hook')
+
+        def reconcile():
+            result = self._reconcile_refresh_hook()
+            return no_hook if result is None else result
+
+        result = self._run_setup('refresh-hook', reconcile)
+        return None if result is no_hook else result
 
     def _env_fish_path(self):
         """Absolute path of the generated fish env file."""
@@ -7302,7 +7331,18 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         self.print_info(f"Summary: {summary_text}")
 
         changes_made = self._compute_changes_made(results)
-        succeeded = configured + already_ok + completed + partial
+        # Auxiliary entries (the refresh hook) never count as successes
+        # here: only certificate tools decide whether a run with failures
+        # is a hard failure (nothing succeeded, exit 1) or partial
+        # (exit 3). Auxiliary failures do count as problems.
+        succeeded = sum(
+            1 for r in results
+            if r.tool not in self._AUXILIARY_TOOLS and (
+                r.status in ('configured', 'already_ok', 'completed')
+                or (r.status == 'failed'
+                    and getattr(r, 'changed', None) is True)
+            )
+        )
         problems = failed + partial
         if problems > 0 and succeeded == 0:
             exit_code = 1
@@ -7546,7 +7586,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 # installed (upgrade) or removed (--no-refresh-hook). Skipped
                 # without user context, like every other $HOME write.
                 if not no_user:
-                    hook_result = self._reconcile_refresh_hook()
+                    hook_result = self._run_hook_reconciliation()
                     if hook_result is not None:
                         results.append(hook_result)
 

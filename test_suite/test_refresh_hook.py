@@ -267,6 +267,60 @@ class TestHookReconciliation(FumitmTestCase):
         with patch.object(instance, 'detect_shell', return_value='sh'):
             assert instance._reconcile_refresh_hook() is None
 
+    def test_hook_reconciliation_boundary_preserves_none(self, isolate_home):
+        """The exception boundary must pass a hookless shell's None
+        through untouched, not coerce it into a 'completed' entry that
+        would poison changes_made."""
+        instance = self.create_fumitm_instance(mode='install')
+        with patch.object(instance, 'detect_shell', return_value='sh'):
+            assert instance._run_hook_reconciliation() is None
+
+    def test_all_tools_failed_stays_hard_failure_despite_hook(
+            self, isolate_home, capsys):
+        """The hook is not a certificate tool: its successful install must
+        not soften an all-tools-failed run from exit 1 to partial exit 3,
+        though its 'configured' status still drives changes_made."""
+        instance = self.create_fumitm_instance(mode='install', auto_yes=True)
+        instance.tools_registry = {
+            'fake': {
+                'name': 'Fake Tool', 'tags': [], 'scope': 'user',
+                'setup_func': lambda: ToolResult('fake', 'failed', 'boom'),
+                'check_func': None,
+            }
+        }
+        with patch.object(instance, 'detect_shell', return_value='zsh'):
+            exit_code = self._run_main(instance)
+        assert exit_code == 1
+        assert fumitm.FumitmPython._FUMITM_REFRESH_BEGIN in \
+            (isolate_home / '.zshrc').read_text()
+        data = self._parse_result(capsys.readouterr().out)
+        assert data['exit_code'] == 1
+        assert data['changes_made'] is True
+
+    def test_hook_failure_keeps_summary_and_partial_exit(
+            self, isolate_home, capsys):
+        """A hook I/O failure degrades to a failed refresh-hook entry: the
+        machine summary still prints and a run with a configured tool
+        exits 3 (partial), instead of escaping to the unexpected-error
+        handler and returning 1 with no FUMITM_RESULT line."""
+        instance = self.create_fumitm_instance(mode='install', auto_yes=True)
+        instance.tools_registry = {
+            'fake': {
+                'name': 'Fake Tool', 'tags': [], 'scope': 'user',
+                'setup_func': lambda: ToolResult('fake', 'configured', ''),
+                'check_func': None,
+            }
+        }
+        with patch.object(instance, 'detect_shell', return_value='zsh'), \
+                patch.object(instance, '_reconcile_refresh_hook',
+                             side_effect=OSError('read-only file system')):
+            exit_code = self._run_main(instance)
+        assert exit_code == 3
+        data = self._parse_result(capsys.readouterr().out)
+        assert data['exit_code'] == 3
+        assert data['configured'] == 1
+        assert data['failed'] == 1
+
 
 class TestFishEnvFile(FumitmTestCase):
     """fish migration: env.fish, config.fish stub, conf.d prompt hook."""

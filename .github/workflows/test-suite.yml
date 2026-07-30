@@ -59,6 +59,9 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Install shell test dependencies
+      run: brew install fish
+
     - name: Set up uv
       uses: astral-sh/setup-uv@v4
 
