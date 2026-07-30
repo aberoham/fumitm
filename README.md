@@ -8,13 +8,17 @@ Script to automatically verify and fix MITM TLS distrust issues commonly afflict
 
 ```bash
 # Fix everything in one shot (no prompts, no download needed)
-python3 <(curl -LsSf https://raw.githubusercontent.com/aberoham/fumitm/main/fumitm.py) --fix --yes
-source ~/.zshrc  # or ~/.bashrc
+_fumitm_status=0; python3 <(curl -LsSf https://raw.githubusercontent.com/aberoham/fumitm/main/fumitm.py) --fix --yes || _fumitm_status=$?
+[ -r "$HOME/.config/fumitm/env.sh" ] && . "$HOME/.config/fumitm/env.sh"
+case $- in *i*) ;; *) (exit "$_fumitm_status");; esac
 
 # With sudo (needed for Java keystores, DBeaver, and other system-level fixes)
-sudo python3 <(curl -LsSf https://raw.githubusercontent.com/aberoham/fumitm/main/fumitm.py) --fix --yes --run-as-user $USER
-source ~/.zshrc  # or ~/.bashrc
+_fumitm_status=0; sudo python3 <(curl -LsSf https://raw.githubusercontent.com/aberoham/fumitm/main/fumitm.py) --fix --yes --run-as-user $USER || _fumitm_status=$?
+[ -r "$HOME/.config/fumitm/env.sh" ] && . "$HOME/.config/fumitm/env.sh"
+case $- in *i*) ;; *) (exit "$_fumitm_status");; esac
 ```
+
+The middle line activates the new TLS environment in your current terminal — a child process cannot modify its parent shell, so without it the fixes only apply to newly opened shells. It runs even after a partial-success run (exit code 3 — some tools fixed, some not), sourcing the env file whenever it exists, which is exactly what any new shell would do. The final line restores fumitm's exit status in scripts only: a wrapper script sees fumitm's real status as `$?`, and under `set -e` it stops there — after activation has run. Interactive shells are deliberately excluded (the `case $- in *i*)` guard): restoring a failure status into a terminal that has `set -e` enabled would terminate the session instead of returning to the prompt, so when pasted into a terminal the block always ends with status 0 and the outcome is read from fumitm's printed summary.
 
 For more control, download the script first:
 

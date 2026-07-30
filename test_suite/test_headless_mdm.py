@@ -7,7 +7,12 @@ accuracy, exit codes, and orchestrator environment simulations.
 """
 import json
 import os
+import re
+import select
+import shutil
+import subprocess
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -909,6 +914,332 @@ class TestSudoHelperUpdates(FumitmTestCase):
                 shell = instance.detect_shell()
                 assert shell == 'zsh'
                 mock_getpwuid.assert_called_with(501)
+
+
+class TestShellReloadNotice(FumitmTestCase):
+    """Issue #100: activation guidance for the invoking shell after --fix."""
+
+    ENV_SOURCE_CMD = '. "$HOME/.config/fumitm/env.sh"'
+
+    @staticmethod
+    def _parse_result(output):
+        for line in output.splitlines():
+            if line.startswith('FUMITM_RESULT:'):
+                return json.loads(line.split(':', 1)[1].strip())
+        raise AssertionError('FUMITM_RESULT line not found')
+
+    def test_reload_command_posix_sources_env_file(self):
+        """POSIX shells get the env file, never a whole rc file."""
+        instance = self.create_fumitm_instance()
+        for shell in ('zsh', 'bash'):
+            with patch.object(instance, 'detect_shell', return_value=shell):
+                assert instance._shell_reload_command() == self.ENV_SOURCE_CMD
+
+    def test_reload_command_fish_is_none(self):
+        """fish cannot source POSIX sh, and re-sourcing config.fish would
+        repeat non-idempotent startup work; fish gets the new-session
+        fallback until a dedicated fish env file exists."""
+        instance = self.create_fumitm_instance()
+        with patch.object(instance, 'detect_shell', return_value='fish'):
+            assert instance._shell_reload_command() is None
+
+    def test_reload_command_unknown_shell_is_none(self):
+        instance = self.create_fumitm_instance()
+        with patch.object(instance, 'detect_shell', return_value='csh'):
+            assert instance._shell_reload_command() is None
+
+    def test_notice_printed_when_shell_modified(self, capsys):
+        instance = self.create_fumitm_instance()
+        instance.shell_modified = True
+        with patch.object(instance, 'detect_shell', return_value='zsh'):
+            instance._print_shell_reload_notice()
+        out = capsys.readouterr().out
+        assert 'CURRENT SHELL NOT YET UPDATED' in out
+        assert self.ENV_SOURCE_CMD in out
+        assert '.zshrc' not in out
+
+    def test_notice_suppressed_without_shell_changes(self, capsys):
+        instance = self.create_fumitm_instance()
+        instance.shell_modified = False
+        instance._print_shell_reload_notice()
+        assert 'CURRENT SHELL' not in capsys.readouterr().out
+
+    def test_notice_suppressed_in_headless_mode(self, capsys):
+        """A root Jamf/MDM policy log has no shell the instruction can act on."""
+        instance = self.create_fumitm_instance(headless=True)
+        instance.shell_modified = True
+        instance._print_shell_reload_notice()
+        assert 'CURRENT SHELL' not in capsys.readouterr().out
+
+    def test_result_json_reload_fields_when_modified(self, capsys):
+        instance = self.create_fumitm_instance()
+        instance.shell_modified = True
+        with patch.object(instance, 'detect_shell', return_value='zsh'):
+            instance._print_summary([ToolResult('a', 'configured', 'done')])
+        data = self._parse_result(capsys.readouterr().out)
+        assert data['shell_reload_required'] is True
+        assert data['shell_reload_command'] == self.ENV_SOURCE_CMD
+
+    @staticmethod
+    def _create_env_file(instance):
+        path = Path(instance._env_file_path())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('export SSL_CERT_FILE="/b.pem"\n')
+        return str(path)
+
+    def test_result_json_reload_fields_when_not_modified(self, capsys):
+        instance = self.create_fumitm_instance()
+        instance._print_summary([ToolResult('a', 'already_ok', '')])
+        data = self._parse_result(capsys.readouterr().out)
+        assert data['shell_reload_required'] is False
+        assert data['shell_reload_command'] is None
+        assert data['shell_env_file'] is None
+
+    def test_result_json_env_file_is_absolute_target_path(self, capsys):
+        """shell_env_file must be usable by an automation wrapper whose own
+        $HOME differs from the target user's (root Jamf + --run-as-user):
+        absolute and resolved against the corrected home, unlike the
+        $HOME-relative shell_reload_command."""
+        instance = self.create_fumitm_instance()
+        instance.shell_modified = True
+        self._create_env_file(instance)
+        with patch.object(instance, 'detect_shell', return_value='zsh'):
+            instance._print_summary([ToolResult('a', 'configured', 'done')])
+        data = self._parse_result(capsys.readouterr().out)
+        assert data['shell_env_file'] == instance._env_file_path()
+        assert os.path.isabs(data['shell_env_file'])
+        assert '$HOME' not in data['shell_env_file']
+        assert data['shell_env_file'].endswith('.config/fumitm/env.sh')
+
+    def test_result_json_env_file_reported_on_converged_rerun(self, capsys):
+        """A converged rerun changes nothing on disk, but a freshly started
+        wrapper process has not inherited the environment: shell_env_file
+        must still point at the existing env file while
+        shell_reload_required stays false."""
+        instance = self.create_fumitm_instance()
+        self._create_env_file(instance)
+        with patch.object(instance, 'detect_shell', return_value='zsh'):
+            instance._print_summary([ToolResult('a', 'already_ok', '')])
+        data = self._parse_result(capsys.readouterr().out)
+        assert data['shell_reload_required'] is False
+        assert data['shell_reload_command'] is None
+        assert data['shell_env_file'] == instance._env_file_path()
+
+    def test_result_json_env_file_none_for_fish(self, capsys):
+        instance = self.create_fumitm_instance()
+        instance.shell_modified = True
+        with patch.object(instance, 'detect_shell', return_value='fish'):
+            instance._print_summary([ToolResult('a', 'configured', 'done')])
+        data = self._parse_result(capsys.readouterr().out)
+        assert data['shell_env_file'] is None
+        assert data['shell_reload_command'] is None
+
+
+class TestReadmeActivationBlock(FumitmTestCase):
+    """The README copy/paste block must activate on partial success while
+    preserving fumitm's exit status as the block's final status."""
+
+    @staticmethod
+    def _readme_block():
+        readme = Path(__file__).resolve().parent.parent / 'README.md'
+        lines = readme.read_text().splitlines()
+        for i, line in enumerate(lines):
+            if line.startswith('_fumitm_status=0; python3 <(curl'):
+                return lines[i:i + 3]
+        raise AssertionError('activation block not found in README.md')
+
+    def _stubbed_script(self, status):
+        """The real README block with the curl|python line stubbed out."""
+        block = self._readme_block()
+        first = re.sub(r"python3 <\(curl [^)]*\) --fix --yes",
+                       f"sh -c 'exit {status}'", block[0])
+        assert first != block[0], 'stub substitution did not match'
+        return '\n'.join([first] + block[1:])
+
+    def test_block_structure(self):
+        block = self._readme_block()
+        assert block[0].startswith('_fumitm_status=0; ')
+        assert block[0].endswith('|| _fumitm_status=$?')
+        assert block[1] == ('[ -r "$HOME/.config/fumitm/env.sh" ] && '
+                            '. "$HOME/.config/fumitm/env.sh"')
+        assert block[2] == ('case $- in *i*) ;; '
+                            '*) (exit "$_fumitm_status");; esac')
+
+    @pytest.mark.parametrize('shell', ['bash', 'zsh'])
+    @pytest.mark.parametrize(('status', 'with_file'), [
+        (0, True), (0, False), (1, False), (3, True),
+    ])
+    def test_block_preserves_status_and_activates(
+            self, isolate_home, shell, status, with_file):
+        if shutil.which(shell) is None:
+            pytest.skip(f'{shell} not installed')
+        if with_file:
+            env_dir = isolate_home / '.config' / 'fumitm'
+            env_dir.mkdir(parents=True)
+            (env_dir / 'env.sh').write_text(
+                'export SSL_CERT_FILE="/b.pem"\n')
+        script = self._stubbed_script(status)
+        env = {'HOME': str(isolate_home),
+               'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
+        proc = subprocess.run([shell, '-c', script], env=env,
+                              capture_output=True, text=True, timeout=30,
+                              check=False)
+        assert proc.returncode == status, \
+            f'block status {proc.returncode} != fumitm status {status}'
+        probe = subprocess.run(
+            [shell, '-c', script + '\necho "var:${SSL_CERT_FILE:-none}"'],
+            env=env, capture_output=True, text=True, timeout=30, check=False)
+        expected = '/b.pem' if with_file else 'none'
+        assert f'var:{expected}' in probe.stdout
+
+    @pytest.mark.parametrize('shell', ['bash', 'zsh'])
+    def test_block_activates_before_errexit_stop(self, isolate_home, shell):
+        """Under set -e, a partial-success status must not stop the script
+        before the activation line runs; the script then stops with
+        fumitm's status, faithfully reflecting the failure."""
+        if shutil.which(shell) is None:
+            pytest.skip(f'{shell} not installed')
+        env_dir = isolate_home / '.config' / 'fumitm'
+        env_dir.mkdir(parents=True)
+        (env_dir / 'env.sh').write_text('export SSL_CERT_FILE="/b.pem"\n')
+        script = ('set -e\n'
+                  + self._stubbed_script(3)
+                  + '\necho unreachable')
+        env = {'HOME': str(isolate_home),
+               'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
+        proc = subprocess.run([shell, '-c', script], env=env,
+                              capture_output=True, text=True, timeout=30,
+                              check=False)
+        assert proc.returncode == 3
+        assert 'unreachable' not in proc.stdout
+
+    @staticmethod
+    def _interactive_flags(shell):
+        """Flags for a clean interactive shell that reads no startup files."""
+        return (['--noprofile', '--norc', '-i'] if shell == 'bash'
+                else ['-f', '-i'])
+
+    @pytest.mark.parametrize('shell', ['bash', 'zsh'])
+    @pytest.mark.parametrize('status', [0, 1, 3])
+    def test_block_survives_interactive_errexit(
+            self, isolate_home, shell, status):
+        """An interactive shell with set -e must survive the block whatever
+        fumitm's exit status. A bare failing `(exit N)` is a top-level
+        command, so errexit would terminate the session instead of
+        returning to the prompt; the `case $- in *i*)` guard skips status
+        restoration in interactive shells."""
+        if shutil.which(shell) is None:
+            pytest.skip(f'{shell} not installed')
+        script = ('set -e\n'
+                  + self._stubbed_script(status)
+                  + '\necho SURVIVED')
+        env = {'HOME': str(isolate_home),
+               'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
+        proc = subprocess.run(
+            [shell, *self._interactive_flags(shell), '-c', script],
+            env=env, capture_output=True, text=True, timeout=30,
+            check=False)
+        assert proc.returncode == 0, \
+            f'interactive {shell} exited {proc.returncode} instead of surviving'
+        assert 'SURVIVED' in proc.stdout
+
+    @pytest.mark.parametrize('shell', ['bash', 'zsh'])
+    def test_block_pasted_into_pty_returns_prompt(self, isolate_home, shell):
+        """The primary README use case: paste the block into an
+        already-running interactive shell on a real terminal — with
+        errexit enabled and fumitm failing — and get the prompt back."""
+        pty = pytest.importorskip('pty')
+        if shutil.which(shell) is None:
+            pytest.skip(f'{shell} not installed')
+        env = {'HOME': str(isolate_home), 'TERM': 'dumb',
+               'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
+        master, slave = pty.openpty()
+        try:
+            proc = subprocess.Popen(
+                [shell, *self._interactive_flags(shell)],
+                stdin=slave, stdout=slave, stderr=slave,
+                env=env, start_new_session=True, close_fds=True)
+            os.close(slave)
+            slave = None
+            # `$?` in the marker stays literal in the echoed input but
+            # expands in the output, so `SURVIVED:0` proves the shell
+            # executed the line rather than merely echoing the paste.
+            typed = ('set -e\n'
+                     + self._stubbed_script(3)
+                     + '\necho SURVIVED:$?\nexit\n')
+            os.write(master, typed.encode())
+            output = b''
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([master], [], [], 1)
+                if not ready:
+                    if proc.poll() is not None:
+                        break
+                    continue
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:
+                    break  # EIO: shell exited and the slave side closed
+                if not chunk:
+                    break
+                output += chunk
+            proc.wait(timeout=10)
+        finally:
+            os.close(master)
+            if slave is not None:
+                os.close(slave)
+        assert b'SURVIVED:0' in output, \
+            f'shell died before the prompt returned; output: {output!r}'
+        assert proc.returncode == 0
+
+
+class TestShellEnvFileTrustBoundary(FumitmTestCase):
+    """shell_env_file points at a target-user-writable file. The automation
+    docs and the reporting code must direct privileged wrappers to drop
+    privileges rather than source it as root (privilege-escalation risk)."""
+
+    def test_automation_docs_forbid_privileged_sourcing(self):
+        doc = (Path(__file__).resolve().parent.parent
+               / 'README-automation.md').read_text()
+        start = doc.index('`shell_env_file`')
+        section = doc[start:start + 1500]
+        assert 'must never source' in section
+        assert 'sudo -u' in section, \
+            'docs must show the privilege-drop pattern for dependent children'
+        assert 'needs to source this path' not in doc, \
+            'docs must not instruct the (possibly root) wrapper to source'
+
+    def test_shell_env_file_docstring_states_boundary(self):
+        doc = fumitm.FumitmPython._shell_env_file.__doc__
+        assert 'never source' in doc
+        assert 'drop privileges' in doc
+
+    def test_privilege_drop_example_executes(self, tmp_path):
+        """Run the documented privilege-drop pattern verbatim (minus sudo)
+        and assert the child actually receives the environment. The
+        wrapper's $env_file variable is not visible inside the
+        single-quoted `sh -c` body, so the example must deliver the path
+        as a positional argument; an example that references $env_file
+        inside the quotes fails before launching the child."""
+        doc = (Path(__file__).resolve().parent.parent
+               / 'README-automation.md').read_text()
+        match = re.search(r'^\s*sudo -u "\$target_user" (sh -c .*)$',
+                          doc, re.M)
+        assert match, 'privilege-drop example not found in automation docs'
+        example = match.group(1).replace(
+            'dependent-command', 'printenv SSL_CERT_FILE')
+        env_file = tmp_path / 'env.sh'
+        env_file.write_text('export SSL_CERT_FILE="/b.pem"\n')
+        # env_file is deliberately a plain (unexported) wrapper variable,
+        # exactly as a Jamf/Ansible wrapper script would hold it.
+        script = f"env_file='{env_file}'\n{example}\n"
+        proc = subprocess.run(
+            ['sh', '-c', script],
+            env={'PATH': os.environ.get('PATH', '/usr/bin:/bin')},
+            capture_output=True, text=True, timeout=30, check=False)
+        assert proc.returncode == 0, \
+            f'documented example failed: {proc.stderr!r}'
+        assert proc.stdout.strip() == '/b.pem'
 
 
 if __name__ == '__main__':

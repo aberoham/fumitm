@@ -46,13 +46,22 @@ Exit codes 2 and 3 are deliberately separate: exit 2 is always a caller/config p
 In install mode (`--fix`), fumitm prints a `FUMITM_RESULT:` line to stdout after the install loop:
 
 ```
-FUMITM_RESULT: {"changes_made":true,"configured":2,"completed":5,"already_ok":0,"skipped":3,"failed":1,"exit_code":3}
+FUMITM_RESULT: {"changes_made":true,"configured":2,"completed":5,"already_ok":0,"skipped":3,"failed":1,"exit_code":3,"shell_reload_required":true,"shell_reload_command":". \"$HOME/.config/fumitm/env.sh\"","shell_env_file":"/Users/alice/.config/fumitm/env.sh"}
 ```
 
 Fields:
 - `changes_made`: `true` if any tool returned `configured`; `false` if no changes were made (all `already_ok`, all `skipped`, or no results); `null` if legacy `completed` statuses make change state unknown.
 - `configured` / `completed` / `already_ok` / `skipped` / `failed`: per-status counts.
 - `exit_code`: the exit code that will be returned.
+- `shell_reload_required`: `true` when shell configuration was modified. Already-running shells keep their old environment until they source the env file or a new shell is opened; fumitm cannot modify the environment of the process that invoked it.
+- `shell_reload_command`: the command for the *end user's own shell*, `$HOME`-relative, or `null` when no reload is needed or the shell has no safe one-liner. Do not use this from an automation wrapper: under `--run-as-user` the wrapper's `$HOME` (e.g. `/var/root`) is not the target user's.
+- `shell_env_file`: absolute path of the generated env file, already resolved against the target user's home, or `null` when none exists. Reported whenever the file exists — including converged reruns where `shell_reload_required` is `false` — because a freshly started wrapper process has not inherited the environment. **Trust boundary:** the file lives in the target user's home and is owned and writable by that user. A privileged (root) wrapper must never source it or otherwise evaluate it as shell code — that executes user-controlled content as root, and the file can be replaced between fumitm returning and the wrapper reading it. When a dependent child needs the environment, drop privileges first so the sourcing happens as the target user. The path is passed as a positional argument — the wrapper's `$env_file` variable is not visible inside the single-quoted `sh -c` body:
+
+  ```bash
+  sudo -u "$target_user" sh -c '. "$1" && exec dependent-command' sh "$env_file"
+  ```
+
+  Wrappers already running as the target user (Ansible `become_user`, direct `sudo -u` execs) may source the path directly — it is their own file.
 
 Ansible `changed_when` must use `!= false` to treat `null` (unknown) as changed (conservative):
 

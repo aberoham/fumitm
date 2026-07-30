@@ -6891,6 +6891,11 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             'partial': partial,
             'failed': failed,
             'exit_code': exit_code,
+            'shell_reload_required': self.shell_modified,
+            'shell_reload_command': (
+                self._shell_reload_command() if self.shell_modified else None
+            ),
+            'shell_env_file': self._shell_env_file(),
         }
         # Stable machine-parseable line for Ansible changed_when
         print(f"FUMITM_RESULT: {json.dumps(result_obj)}")
@@ -6911,6 +6916,77 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             self._json_log_file_handle.flush()
 
         return exit_code
+
+    def _shell_reload_command(self):
+        """The exact command that activates fumitm's exports in the current shell.
+
+        POSIX shells source the small generated env file, never a whole rc
+        file: re-running .zshrc/.bashrc repeats unrelated agents, hooks,
+        aliases and PATH mutations that are not idempotent. Returns None for
+        shells with no safe one-liner — including fish, which cannot source
+        the POSIX env file and whose config.fish would repeat the same
+        non-idempotent startup work; fish users get the new-session fallback
+        until a dedicated fish env file exists.
+        """
+        shell_type = self.detect_shell()
+        if self._uses_env_file(shell_type):
+            return f'. {self._FUMITM_ENV_FILE_SHELL}'
+        return None
+
+    def _shell_env_file(self):
+        """Absolute path of the generated env file when it exists, else None.
+
+        Reported in FUMITM_RESULT for automation wrappers: a root Jamf
+        process using --run-as-user writes the target user's env file, but
+        shell_reload_command is $HOME-relative and would resolve against the
+        wrapper's own $HOME (/var/root). This path is absolute and already
+        resolved against the target user's corrected home directory.
+
+        Deliberately independent of shell_modified: on a converged rerun
+        nothing on disk changes, but a freshly started wrapper process has
+        not inherited the environment and still needs this path for its
+        dependent children.
+
+        Trust boundary: the file is owned and writable by the target user
+        (fumitm chowns it back after writing). A privileged wrapper must
+        never source it — that evaluates user-controlled shell code as
+        root. It should instead drop privileges and let the dependent
+        child source the file as the target user (e.g. via sudo -u). Only
+        the deterministic path is reported, never the file's contents,
+        precisely so nothing privileged is tempted to trust them.
+        """
+        if not self._uses_env_file(self.detect_shell()):
+            return None
+        path = self._env_file_path()
+        return path if os.path.exists(path) else None
+
+    def _print_shell_reload_notice(self):
+        """Final, unmissable instruction to activate exports in this shell.
+
+        A child process cannot modify its parent shell's environment, so after
+        a --fix the invoking terminal still carries the old variables until the
+        user sources the env file (or the chained README command does it for
+        them). Printed last so it is not buried under later informational
+        output. Suppressed in headless mode: a root Jamf/MDM policy log has no
+        interactive shell for the instruction to act on; automation reads the
+        shell_reload_* fields in FUMITM_RESULT instead.
+        """
+        if not self.shell_modified or self.headless:
+            return
+        command = self._shell_reload_command()
+        print()
+        self.print_warn("=" * 60)
+        self.print_warn("CURRENT SHELL NOT YET UPDATED")
+        self.print_warn("=" * 60)
+        self.print_warn("Environment changes only apply to new shells.")
+        self.print_warn("To activate them in THIS terminal, run:")
+        print()
+        if command:
+            self.print_info(f"  {command}")
+        else:
+            self.print_info("  exec $SHELL -l  (restarts your shell)")
+        print()
+        self.print_info("Or simply open a new terminal window.")
 
     def main(self):
         """Main entry point for the FumitmPython instance."""
@@ -7037,19 +7113,10 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 if any_container_processed:
                     self._print_docker_build_hint()
 
-                if self.shell_modified:
-                    self.print_warn("Shell configuration was modified.")
-                    self.print_warn("Please reload your shell configuration:")
-                    shell_type = self.detect_shell()
-                    shell_config = self.get_shell_config(shell_type)
-                    if shell_type in ('bash', 'zsh', 'fish'):
-                        self.print_info(f"  source {shell_config}")
-                    else:
-                        self.print_info("  Please restart your shell")
-
                 print()
                 self.print_info(f"Certificate location: {self.cert_path}")
                 self.print_info("For additional applications, please refer to the documentation.")
+                self._print_shell_reload_notice()
                 return exit_code
 
             print()
