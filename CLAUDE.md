@@ -120,6 +120,7 @@ The script follows a modular architecture with these key components:
    - **WARP**: Downloads certificate from `warp-cli certs`, stores at `~/.cloudflare-ca.pem`
    - **Netskope**: Reads from known file paths (`nscacert_combined.pem` preferred over `nscacert.pem`), with macOS keychain fallback extracting root (`-c "certadmin"`) and intermediate (`-c "goskope"`) CAs. Stores at `~/.netskope-ca.pem`. Detects encrypted `.enc` certs and directs users to `--cert-file`.
    - Checks for updates and certificate validity
+   - **Aikido supplemental root** (`SUPPLEMENTAL_ROOTS` dict): auto-detected and added to every managed bundle alongside the primary provider root (`--with-aikido`/`--no-aikido`/`--aikido-cert`). The `aikido-adopt` registry tool is the forward path: on agents shipping the `aikido-doctor` CLI it runs `[sudo] aikido-doctor certconfig adopt <provider-root>` so Aikido's own combined bundle trusts the primary provider. The env-var reclaim, curlrc-override fix, and stub-last shell machinery remain as defense-in-depth for hosts where adopt hasn't run.
 
 4. **Tool-Specific Setup Functions**:
    - Each supported tool has its own `setup_*_cert()` function

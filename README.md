@@ -109,6 +109,17 @@ signals are absent, supply the root with `--aikido-cert /path/to/aikido-root.pem
 `~/.aikido-ca.pem` from an earlier run. Aikido support currently targets
 macOS/Linux (`fumitm.py`); the Windows port does not yet add the Aikido root.
 
+Newer Aikido agents ship `aikido-doctor certconfig adopt <pem>`, which teaches
+Aikido's own combined CA bundle an external root. When the `aikido-doctor`
+binary is on PATH, `--fix` runs it against the primary provider's root (the
+`aikido-adopt` tool key), so the bundle Aikido env-injects at tools also trusts
+the primary proxy. Running it needs root: as a non-root user fumitm asks for
+confirmation (`--yes` auto-confirms) and invokes it via `sudo`; in a non-root
+run without a terminal it prints the exact command to run manually and moves
+on. The defensive workarounds for the pre-adopt world (env-var reclaim, curlrc
+override handling, exports kept last in shell startup files) all remain in
+place for hosts where the agent predates `certconfig` or adopt has not run.
+
 ### Windows-Specific
 - `warp-cli.exe` command must be available 
 - Administrator privileges may be required for some fixes
@@ -121,7 +132,7 @@ Something amiss or not quite right? Please post the full output of a run to an i
 
 ### Linux/macOS
 `./fumitm.py --list-tools` currently reports these Linux/macOS tool keys:
-`brew-cacerts`, `node`, `python`, `gcloud`, `java`, `jenv`, `gradle`, `dbeaver`, `wget`, `podman`, `rancher`, `android`, `colima`, `git`, `curl`, `aws`.
+`aikido-adopt`, `brew-cacerts`, `node`, `python`, `gcloud`, `java`, `jenv`, `gradle`, `dbeaver`, `wget`, `podman`, `rancher`, `android`, `colima`, `git`, `curl`, `aws`.
 
 - **Homebrew CA Certificates (`brew-cacerts`)**: configures Homebrew's CA bundle (covers Homebrew OpenSSL consumers)
 - **Node.js/npm**: configures `NODE_EXTRA_CA_CERTS` for Node.js and the cafile setting for npm

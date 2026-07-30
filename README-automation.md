@@ -29,6 +29,13 @@ root supplied explicitly via `--aikido-cert`, or persisted from an earlier run a
 Aikido support targets macOS/Linux; the Windows port does not yet add the Aikido
 root.
 
+When the agent ships the `aikido-doctor` CLI, `--fix` also adopts the primary
+provider root into Aikido's combined bundle (`aikido-doctor certconfig adopt`,
+tool key `aikido-adopt`). This needs root: run fumitm as root (JAMF/launchd)
+for it to apply automatically; a non-root run without a TTY records the step as
+`skipped` and prints the exact `sudo` command instead — it never causes exit
+code 2 and does not change exit-code semantics.
+
 ## Exit Codes
 
 | Code | Meaning | Orchestrator guidance |

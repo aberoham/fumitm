@@ -11,6 +11,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from collections import namedtuple
@@ -329,6 +330,14 @@ class FumitmPython:
         # determines what runs without user context when root runs without
         # --run-as-user: 'system' tools run always, 'user' tools need $HOME.
         self.tools_registry = {
+            'aikido-adopt': {
+                'name': 'Aikido certconfig adopt',
+                'tags': ['aikido', 'aikido-adopt', 'aikido-doctor', 'certconfig'],
+                'setup_func': self.setup_aikido_adopt,
+                'check_func': self.check_aikido_adopt_status,
+                'description': "Adopt the primary provider root into Aikido's combined CA bundle (aikido-doctor certconfig adopt)",
+                'scope': 'system',
+            },
             'brew-cacerts': {
                 'name': 'Homebrew CA Certificates',
                 'tags': ['brew', 'homebrew', 'ca-certificates', 'cacerts'],
@@ -521,7 +530,9 @@ class FumitmPython:
 
         Such a bundle (e.g. Aikido's combined PEM) is maintained and env-injected
         by the vendor at runtime. fumitm must not adopt, append to, or relocate
-        it; it manages its own bundle instead.
+        it; it manages its own bundle instead. The sanctioned way to add roots
+        to the vendor bundle is the vendor's own tooling (see
+        setup_aikido_adopt / `aikido-doctor certconfig adopt`).
         """
         for descriptor in SUPPLEMENTAL_ROOTS.values():
             support_dir = descriptor.get('support_dir')
@@ -3130,6 +3141,87 @@ class FumitmPython:
             )
         return default
 
+    def setup_aikido_adopt(self):
+        """Adopt the primary provider root into Aikido's combined CA bundle.
+
+        Newer Aikido agents ship `aikido-doctor certconfig adopt <pem>`, which
+        teaches the agent's own combined bundle an external root at the source.
+        Once adopted, the bundle Aikido env-injects also trusts the primary
+        MITM provider, so tools it points at that bundle stop failing. The
+        defensive reclaim/curlrc/stub-last machinery elsewhere stays in place
+        for hosts where the agent predates certconfig or adopt has not run.
+        """
+        if not any(e['key'] == 'aikido' for e in self.extra_roots):
+            return ToolResult('aikido-adopt', 'skipped', 'Aikido not active')
+        if not self.command_exists('aikido-doctor'):
+            return ToolResult('aikido-adopt', 'skipped', 'aikido-doctor not found in PATH')
+        if not os.path.exists(self.cert_path):
+            return ToolResult('aikido-adopt', 'skipped', 'Provider root certificate not materialized')
+
+        combined_pem = SUPPLEMENTAL_ROOTS['aikido']['combined_pem']
+        provider_name = self.provider['short_name']
+        if os.path.exists(combined_pem) and self.certificate_exists_in_file(self.cert_path, combined_pem):
+            self.print_info(f"{provider_name} root already present in Aikido's combined bundle")
+            return ToolResult('aikido-adopt', 'already_ok', 'Provider root already in Aikido combined bundle')
+
+        as_root = os.geteuid() == 0
+        argv = ['aikido-doctor', 'certconfig', 'adopt', self.cert_path]
+        if not as_root:
+            argv = ['sudo'] + argv
+        command_str = ' '.join(argv)
+
+        if not self.is_install_mode():
+            self.print_action(f"Would run: {command_str}")
+            return ToolResult('aikido-adopt', 'skipped', 'Dry run')
+
+        if not as_root:
+            # sudo reads the password from the TTY, so without one it would
+            # hang even under --yes; hand the command to the operator instead
+            # of aborting the whole run with NonInteractiveError.
+            if self.headless or not sys.stdin.isatty():
+                self.print_warn("Adopting the provider root into Aikido's bundle requires sudo")
+                self.print_action(f"Run manually: {command_str}")
+                return ToolResult('aikido-adopt', 'skipped', 'Requires sudo; run manually')
+            try:
+                response = self._prompt(
+                    f"Run 'sudo aikido-doctor certconfig adopt' to add the {provider_name} "
+                    "root to Aikido's combined bundle? (Y/n) ")
+            except NonInteractiveError:
+                self.print_action(f"Run manually: {command_str}")
+                return ToolResult('aikido-adopt', 'skipped', 'Requires sudo; run manually')
+            if response.strip().lower() in ('n', 'no'):
+                return ToolResult('aikido-adopt', 'skipped', 'Declined by user')
+
+        self.print_status(f"Running: {command_str}")
+        try:
+            result = subprocess.run(argv, capture_output=True, text=True, check=False,
+                                    timeout=120 if as_root else 300)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            self.print_error(f"aikido-doctor failed to run: {e}")
+            return ToolResult('aikido-adopt', 'failed', f'aikido-doctor failed to run: {e}')
+
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or '').strip()
+            message = f'aikido-doctor exited {result.returncode}: {detail[:200]}'
+            self.print_error(message)
+            return ToolResult('aikido-adopt', 'failed', message)
+
+        # The agent may rewrite the combined bundle asynchronously; give it a
+        # few seconds before treating a missing root as a failure. An absent or
+        # unreadable bundle degrades to trusting the exit code.
+        if os.path.exists(combined_pem):
+            for _ in range(3):
+                if self.certificate_exists_in_file(self.cert_path, combined_pem):
+                    break
+                time.sleep(1)
+            else:
+                message = ('aikido-doctor reported success but provider root '
+                           'not found in combined bundle')
+                self.print_error(message)
+                return ToolResult('aikido-adopt', 'failed', message, changed=True)
+        self.print_info(f"Adopted {provider_name} root into Aikido's combined bundle")
+        return ToolResult('aikido-adopt', 'configured', 'Adopted provider root into Aikido combined bundle')
+
     def setup_brew_cacerts(self):
         """Regenerate Homebrew's ca-certificates bundle to include the proxy CA.
 
@@ -3792,6 +3884,8 @@ class FumitmPython:
         # branches above can exit while PIP_CERT/POETRY/BUNDLE_SSL_CA_CERT still
         # point at an Aikido-only bundle, so assert all of them at the both-roots
         # Python bundle whenever Aikido is active or any vendor var is present.
+        # setup_aikido_adopt fixes this at the source on agents that support
+        # `certconfig adopt`; this reclaim remains for hosts where it hasn't run.
         vendor_trust_vars = (
             'PIP_CERT', 'POETRY_CERTIFICATES_PYPI_CERT', 'BUNDLE_SSL_CA_CERT'
         )
@@ -4249,6 +4343,9 @@ class FumitmPython:
         A vendor agent (e.g. Aikido) may write a cacert directive into curlrc
         pointing at a bundle that lacks the primary proxy CA; that directive
         outranks the environment variable, so curl keeps failing after --fix.
+        setup_aikido_adopt addresses the missing-root bundle at the source on
+        agents that support `certconfig adopt`; this fix remains for hosts
+        where it hasn't run.
         The fix appends a fumitm-managed block whose cacert points at
         target_bundle, kept last so it wins. If curlrc is not writable, falls
         back to appending the proxy roots into the referenced bundle when that
@@ -5826,6 +5923,27 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         self.print_debug(f"Test result for {tool_name}: {result}")
         return result
     
+    def check_aikido_adopt_status(self, temp_warp_cert):
+        """Check whether Aikido's combined bundle contains the provider root."""
+        has_issues = False
+        if not any(e['key'] == 'aikido' for e in self.extra_roots):
+            self.print_info("  - Aikido not active")
+            return has_issues
+        if not self.command_exists('aikido-doctor'):
+            self.print_info("  - aikido-doctor not found in PATH (agent predates certconfig adopt)")
+            return has_issues
+        combined_pem = SUPPLEMENTAL_ROOTS['aikido']['combined_pem']
+        if not os.path.exists(combined_pem):
+            self.print_info("  - Aikido combined bundle not present (agent not running?)")
+            return has_issues
+        if self.certificate_exists_in_file(temp_warp_cert, combined_pem):
+            self.print_info("  ✓ Provider root present in Aikido's combined bundle")
+        else:
+            self.print_warn("  ✗ Provider root not in Aikido's combined bundle")
+            self.print_action("    Run with --fix to adopt it via aikido-doctor")
+            has_issues = True
+        return has_issues
+
     def check_brew_cacerts_status(self, temp_warp_cert):
         """Check whether Homebrew's ca-certificates bundle contains the proxy CA."""
         has_issues = False
