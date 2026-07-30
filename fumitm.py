@@ -7248,6 +7248,9 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             'shell_reload_command': (
                 self._shell_reload_command() if self.shell_modified else None
             ),
+            'shell_env_file': (
+                self._shell_env_file() if self.shell_modified else None
+            ),
         }
         # Stable machine-parseable line for Ansible changed_when
         print(f"FUMITM_RESULT: {json.dumps(result_obj)}")
@@ -7283,6 +7286,22 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             return f'. {self._FUMITM_ENV_FILE_SHELL}'
         if shell_type == 'fish':
             return f'source {self._FUMITM_ENV_FISH_SHELL}'
+        return None
+
+    def _shell_env_file(self):
+        """Absolute path of the generated env file, or None without one.
+
+        Reported in FUMITM_RESULT for automation wrappers: a root Jamf
+        process using --run-as-user writes the target user's env file, but
+        shell_reload_command is $HOME-relative and would resolve against the
+        wrapper's own $HOME (/var/root). This path is absolute and already
+        resolved against the target user's corrected home directory.
+        """
+        shell_type = self.detect_shell()
+        if self._uses_env_file(shell_type):
+            return self._env_file_path()
+        if shell_type == 'fish':
+            return self._env_fish_path()
         return None
 
     def _print_shell_reload_notice(self):

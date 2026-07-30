@@ -980,6 +980,33 @@ class TestShellReloadNotice(FumitmTestCase):
         data = self._parse_result(capsys.readouterr().out)
         assert data['shell_reload_required'] is False
         assert data['shell_reload_command'] is None
+        assert data['shell_env_file'] is None
+
+    def test_result_json_env_file_is_absolute_target_path(self, capsys):
+        """shell_env_file must be usable by an automation wrapper whose own
+        $HOME differs from the target user's (root Jamf + --run-as-user):
+        absolute and resolved against the corrected home, unlike the
+        $HOME-relative shell_reload_command."""
+        instance = self.create_fumitm_instance()
+        instance.shell_modified = True
+        with patch.object(instance, 'detect_shell', return_value='zsh'):
+            instance._print_summary([ToolResult('a', 'configured', 'done')])
+        data = self._parse_result(capsys.readouterr().out)
+        assert data['shell_env_file'] == instance._env_file_path()
+        assert os.path.isabs(data['shell_env_file'])
+        assert '$HOME' not in data['shell_env_file']
+        assert data['shell_env_file'].endswith('.config/fumitm/env.sh')
+
+    def test_result_json_env_file_for_fish_is_env_fish(self, capsys):
+        instance = self.create_fumitm_instance()
+        instance.shell_modified = True
+        with patch.object(instance, 'detect_shell', return_value='fish'):
+            instance._print_summary([ToolResult('a', 'configured', 'done')])
+        data = self._parse_result(capsys.readouterr().out)
+        assert data['shell_env_file'] == instance._env_fish_path()
+        assert os.path.isabs(data['shell_env_file'])
+        assert data['shell_reload_command'] == \
+            'source "$HOME/.config/fumitm/env.fish"'
 
 
 if __name__ == '__main__':

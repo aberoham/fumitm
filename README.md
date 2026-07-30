@@ -8,15 +8,15 @@ Script to automatically verify and fix MITM TLS distrust issues commonly afflict
 
 ```bash
 # Fix everything in one shot (no prompts, no download needed)
-python3 <(curl -LsSf https://raw.githubusercontent.com/aberoham/fumitm/main/fumitm.py) --fix --yes &&
-  . "$HOME/.config/fumitm/env.sh"
+python3 <(curl -LsSf https://raw.githubusercontent.com/aberoham/fumitm/main/fumitm.py) --fix --yes
+[ -r "$HOME/.config/fumitm/env.sh" ] && . "$HOME/.config/fumitm/env.sh"
 
 # With sudo (needed for Java keystores, DBeaver, and other system-level fixes)
-sudo python3 <(curl -LsSf https://raw.githubusercontent.com/aberoham/fumitm/main/fumitm.py) --fix --yes --run-as-user $USER &&
-  . "$HOME/.config/fumitm/env.sh"
+sudo python3 <(curl -LsSf https://raw.githubusercontent.com/aberoham/fumitm/main/fumitm.py) --fix --yes --run-as-user $USER
+[ -r "$HOME/.config/fumitm/env.sh" ] && . "$HOME/.config/fumitm/env.sh"
 ```
 
-The trailing `. "$HOME/.config/fumitm/env.sh"` activates the new TLS environment in your current terminal. A child process cannot modify its parent shell, so without it the fixes only apply to newly opened shells. This is only needed once: fumitm also installs a small prompt hook, so terminals opened after the first run pick up later fumitm runs automatically at their next prompt (opt out with `--no-refresh-hook`).
+The second line activates the new TLS environment in your current terminal. A child process cannot modify its parent shell, so without it the fixes only apply to newly opened shells. It is a separate command rather than an `&&` chain so that a partial-success run (exit code 3 — some tools fixed, some not) still activates what was configured; it sources the file whenever it exists, which is exactly what any new shell would do. It is also only needed once: fumitm installs a small prompt hook, so terminals opened after the first run pick up later fumitm runs automatically at their next prompt (opt out with `--no-refresh-hook`).
 
 For more control, download the script first:
 
