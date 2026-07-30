@@ -8,15 +8,15 @@ Script to automatically verify and fix MITM TLS distrust issues commonly afflict
 
 ```bash
 # Fix everything in one shot (no prompts, no download needed)
-python3 <(curl -LsSf https://raw.githubusercontent.com/aberoham/fumitm/main/fumitm.py) --fix --yes &&
-  . "$HOME/.config/fumitm/env.sh"
+python3 <(curl -LsSf https://raw.githubusercontent.com/aberoham/fumitm/main/fumitm.py) --fix --yes
+[ -r "$HOME/.config/fumitm/env.sh" ] && . "$HOME/.config/fumitm/env.sh"
 
 # With sudo (needed for Java keystores, DBeaver, and other system-level fixes)
-sudo python3 <(curl -LsSf https://raw.githubusercontent.com/aberoham/fumitm/main/fumitm.py) --fix --yes --run-as-user $USER &&
-  . "$HOME/.config/fumitm/env.sh"
+sudo python3 <(curl -LsSf https://raw.githubusercontent.com/aberoham/fumitm/main/fumitm.py) --fix --yes --run-as-user $USER
+[ -r "$HOME/.config/fumitm/env.sh" ] && . "$HOME/.config/fumitm/env.sh"
 ```
 
-The trailing `. "$HOME/.config/fumitm/env.sh"` activates the new TLS environment in your current terminal. A child process cannot modify its parent shell, so without it the fixes only apply to newly opened shells.
+The second line activates the new TLS environment in your current terminal. A child process cannot modify its parent shell, so without it the fixes only apply to newly opened shells. It is a separate command rather than an `&&` chain so that a partial-success run (exit code 3 — some tools fixed, some not) still activates what was configured; it sources the file whenever it exists, which is exactly what any new shell would do.
 
 For more control, download the script first:
 

@@ -930,12 +930,13 @@ class TestShellReloadNotice(FumitmTestCase):
             with patch.object(instance, 'detect_shell', return_value=shell):
                 assert instance._shell_reload_command() == self.ENV_SOURCE_CMD
 
-    def test_reload_command_fish_sources_config_fish(self):
-        """fish cannot source POSIX sh, so it keeps sourcing config.fish."""
+    def test_reload_command_fish_is_none(self):
+        """fish cannot source POSIX sh, and re-sourcing config.fish would
+        repeat non-idempotent startup work; fish gets the new-session
+        fallback until a dedicated fish env file exists."""
         instance = self.create_fumitm_instance()
         with patch.object(instance, 'detect_shell', return_value='fish'):
-            cmd = instance._shell_reload_command()
-        assert cmd == 'source ~/.config/fish/config.fish'
+            assert instance._shell_reload_command() is None
 
     def test_reload_command_unknown_shell_is_none(self):
         instance = self.create_fumitm_instance()
@@ -979,6 +980,31 @@ class TestShellReloadNotice(FumitmTestCase):
         instance._print_summary([ToolResult('a', 'already_ok', '')])
         data = self._parse_result(capsys.readouterr().out)
         assert data['shell_reload_required'] is False
+        assert data['shell_reload_command'] is None
+        assert data['shell_env_file'] is None
+
+    def test_result_json_env_file_is_absolute_target_path(self, capsys):
+        """shell_env_file must be usable by an automation wrapper whose own
+        $HOME differs from the target user's (root Jamf + --run-as-user):
+        absolute and resolved against the corrected home, unlike the
+        $HOME-relative shell_reload_command."""
+        instance = self.create_fumitm_instance()
+        instance.shell_modified = True
+        with patch.object(instance, 'detect_shell', return_value='zsh'):
+            instance._print_summary([ToolResult('a', 'configured', 'done')])
+        data = self._parse_result(capsys.readouterr().out)
+        assert data['shell_env_file'] == instance._env_file_path()
+        assert os.path.isabs(data['shell_env_file'])
+        assert '$HOME' not in data['shell_env_file']
+        assert data['shell_env_file'].endswith('.config/fumitm/env.sh')
+
+    def test_result_json_env_file_none_for_fish(self, capsys):
+        instance = self.create_fumitm_instance()
+        instance.shell_modified = True
+        with patch.object(instance, 'detect_shell', return_value='fish'):
+            instance._print_summary([ToolResult('a', 'configured', 'done')])
+        data = self._parse_result(capsys.readouterr().out)
+        assert data['shell_env_file'] is None
         assert data['shell_reload_command'] is None
 
 
