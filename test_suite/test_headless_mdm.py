@@ -1218,6 +1218,33 @@ class TestShellEnvFileTrustBoundary(FumitmTestCase):
         assert 'never source' in doc
         assert 'drop privileges' in doc
 
+    def test_privilege_drop_example_executes(self, tmp_path):
+        """Run the documented privilege-drop pattern verbatim (minus sudo)
+        and assert the child actually receives the environment. The
+        wrapper's $env_file variable is not visible inside the
+        single-quoted `sh -c` body, so the example must deliver the path
+        as a positional argument; an example that references $env_file
+        inside the quotes fails before launching the child."""
+        doc = (Path(__file__).resolve().parent.parent
+               / 'README-automation.md').read_text()
+        match = re.search(r'^\s*sudo -u "\$target_user" (sh -c .*)$',
+                          doc, re.M)
+        assert match, 'privilege-drop example not found in automation docs'
+        example = match.group(1).replace(
+            'dependent-command', 'printenv SSL_CERT_FILE')
+        env_file = tmp_path / 'env.sh'
+        env_file.write_text('export SSL_CERT_FILE="/b.pem"\n')
+        # env_file is deliberately a plain (unexported) wrapper variable,
+        # exactly as a Jamf/Ansible wrapper script would hold it.
+        script = f"env_file='{env_file}'\n{example}\n"
+        proc = subprocess.run(
+            ['sh', '-c', script],
+            env={'PATH': os.environ.get('PATH', '/usr/bin:/bin')},
+            capture_output=True, text=True, timeout=30, check=False)
+        assert proc.returncode == 0, \
+            f'documented example failed: {proc.stderr!r}'
+        assert proc.stdout.strip() == '/b.pem'
+
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
