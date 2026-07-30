@@ -10,15 +10,15 @@ Script to automatically verify and fix MITM TLS distrust issues commonly afflict
 # Fix everything in one shot (no prompts, no download needed)
 _fumitm_status=0; python3 <(curl -LsSf https://raw.githubusercontent.com/aberoham/fumitm/main/fumitm.py) --fix --yes || _fumitm_status=$?
 [ -r "$HOME/.config/fumitm/env.sh" ] && . "$HOME/.config/fumitm/env.sh"
-(exit $_fumitm_status)
+case $- in *i*) ;; *) (exit "$_fumitm_status");; esac
 
 # With sudo (needed for Java keystores, DBeaver, and other system-level fixes)
 _fumitm_status=0; sudo python3 <(curl -LsSf https://raw.githubusercontent.com/aberoham/fumitm/main/fumitm.py) --fix --yes --run-as-user $USER || _fumitm_status=$?
 [ -r "$HOME/.config/fumitm/env.sh" ] && . "$HOME/.config/fumitm/env.sh"
-(exit $_fumitm_status)
+case $- in *i*) ;; *) (exit "$_fumitm_status");; esac
 ```
 
-The middle line activates the new TLS environment in your current terminal — a child process cannot modify its parent shell, so without it the fixes only apply to newly opened shells. It runs even after a partial-success run (exit code 3 — some tools fixed, some not), sourcing the env file whenever it exists, which is exactly what any new shell would do. The surrounding two lines keep fumitm's own exit status as the block's final `$?`: activation neither hides a failure nor manufactures one, and under `set -e` the activation line still runs before a failing status stops the script. Manual activation is also only needed once: fumitm installs a small prompt hook, so terminals opened after the first run pick up later fumitm runs automatically at their next prompt (opt out with `--no-refresh-hook`).
+The middle line activates the new TLS environment in your current terminal — a child process cannot modify its parent shell, so without it the fixes only apply to newly opened shells. It runs even after a partial-success run (exit code 3 — some tools fixed, some not), sourcing the env file whenever it exists, which is exactly what any new shell would do. The final line restores fumitm's exit status in scripts only: a wrapper script sees fumitm's real status as `$?`, and under `set -e` it stops there — after activation has run. Interactive shells are deliberately excluded (the `case $- in *i*)` guard): restoring a failure status into a terminal that has `set -e` enabled would terminate the session instead of returning to the prompt, so when pasted into a terminal the block always ends with status 0 and the outcome is read from fumitm's printed summary. Manual activation is also only needed once: fumitm installs a small prompt hook, so terminals opened after the first run pick up later fumitm runs automatically at their next prompt (opt out with `--no-refresh-hook`).
 
 For more control, download the script first:
 

@@ -55,7 +55,13 @@ Fields:
 - `exit_code`: the exit code that will be returned.
 - `shell_reload_required`: `true` when shell configuration was modified. Already-running shells keep their old environment until they source the env file or a new shell is opened; fumitm cannot modify the environment of the process that invoked it.
 - `shell_reload_command`: the command for the *end user's own shell*, `$HOME`-relative, or `null` when no reload is needed or the shell has no safe one-liner. Do not use this from an automation wrapper: under `--run-as-user` the wrapper's `$HOME` (e.g. `/var/root`) is not the target user's.
-- `shell_env_file`: absolute path of the generated env file, already resolved against the target user's home, or `null` when none exists. Reported whenever the file exists — including converged reruns where `shell_reload_required` is `false` — because a freshly started wrapper process has not inherited the environment and still needs to source this path before launching dependent children.
+- `shell_env_file`: absolute path of the generated env file, already resolved against the target user's home, or `null` when none exists. Reported whenever the file exists — including converged reruns where `shell_reload_required` is `false` — because a freshly started wrapper process has not inherited the environment. **Trust boundary:** the file lives in the target user's home and is owned and writable by that user. A privileged (root) wrapper must never source it or otherwise evaluate it as shell code — that executes user-controlled content as root, and the file can be replaced between fumitm returning and the wrapper reading it. When a dependent child needs the environment, drop privileges first so the sourcing happens as the target user:
+
+  ```bash
+  sudo -u "$target_user" sh -c '. "$env_file" && exec dependent-command'
+  ```
+
+  Wrappers already running as the target user (Ansible `become_user`, direct `sudo -u` execs) may source the path directly — it is their own file.
 
 Ansible `changed_when` must use `!= false` to treat `null` (unknown) as changed (conservative):
 

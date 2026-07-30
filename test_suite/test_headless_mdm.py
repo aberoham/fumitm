@@ -8,9 +8,11 @@ accuracy, exit codes, and orchestrator environment simulations.
 import json
 import os
 import re
+import select
 import shutil
 import subprocess
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -1064,7 +1066,8 @@ class TestReadmeActivationBlock(FumitmTestCase):
         assert block[0].endswith('|| _fumitm_status=$?')
         assert block[1] == ('[ -r "$HOME/.config/fumitm/env.sh" ] && '
                             '. "$HOME/.config/fumitm/env.sh"')
-        assert block[2] == '(exit $_fumitm_status)'
+        assert block[2] == ('case $- in *i*) ;; '
+                            '*) (exit "$_fumitm_status");; esac')
 
     @pytest.mark.parametrize('shell', ['bash', 'zsh'])
     @pytest.mark.parametrize(('status', 'with_file'), [
@@ -1113,6 +1116,107 @@ class TestReadmeActivationBlock(FumitmTestCase):
                               check=False)
         assert proc.returncode == 3
         assert 'unreachable' not in proc.stdout
+
+    @staticmethod
+    def _interactive_flags(shell):
+        """Flags for a clean interactive shell that reads no startup files."""
+        return (['--noprofile', '--norc', '-i'] if shell == 'bash'
+                else ['-f', '-i'])
+
+    @pytest.mark.parametrize('shell', ['bash', 'zsh'])
+    @pytest.mark.parametrize('status', [0, 1, 3])
+    def test_block_survives_interactive_errexit(
+            self, isolate_home, shell, status):
+        """An interactive shell with set -e must survive the block whatever
+        fumitm's exit status. A bare failing `(exit N)` is a top-level
+        command, so errexit would terminate the session instead of
+        returning to the prompt; the `case $- in *i*)` guard skips status
+        restoration in interactive shells."""
+        if shutil.which(shell) is None:
+            pytest.skip(f'{shell} not installed')
+        script = ('set -e\n'
+                  + self._stubbed_script(status)
+                  + '\necho SURVIVED')
+        env = {'HOME': str(isolate_home),
+               'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
+        proc = subprocess.run(
+            [shell, *self._interactive_flags(shell), '-c', script],
+            env=env, capture_output=True, text=True, timeout=30,
+            check=False)
+        assert proc.returncode == 0, \
+            f'interactive {shell} exited {proc.returncode} instead of surviving'
+        assert 'SURVIVED' in proc.stdout
+
+    @pytest.mark.parametrize('shell', ['bash', 'zsh'])
+    def test_block_pasted_into_pty_returns_prompt(self, isolate_home, shell):
+        """The primary README use case: paste the block into an
+        already-running interactive shell on a real terminal — with
+        errexit enabled and fumitm failing — and get the prompt back."""
+        pty = pytest.importorskip('pty')
+        if shutil.which(shell) is None:
+            pytest.skip(f'{shell} not installed')
+        env = {'HOME': str(isolate_home), 'TERM': 'dumb',
+               'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
+        master, slave = pty.openpty()
+        try:
+            proc = subprocess.Popen(
+                [shell, *self._interactive_flags(shell)],
+                stdin=slave, stdout=slave, stderr=slave,
+                env=env, start_new_session=True, close_fds=True)
+            os.close(slave)
+            slave = None
+            # `$?` in the marker stays literal in the echoed input but
+            # expands in the output, so `SURVIVED:0` proves the shell
+            # executed the line rather than merely echoing the paste.
+            typed = ('set -e\n'
+                     + self._stubbed_script(3)
+                     + '\necho SURVIVED:$?\nexit\n')
+            os.write(master, typed.encode())
+            output = b''
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([master], [], [], 1)
+                if not ready:
+                    if proc.poll() is not None:
+                        break
+                    continue
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:
+                    break  # EIO: shell exited and the slave side closed
+                if not chunk:
+                    break
+                output += chunk
+            proc.wait(timeout=10)
+        finally:
+            os.close(master)
+            if slave is not None:
+                os.close(slave)
+        assert b'SURVIVED:0' in output, \
+            f'shell died before the prompt returned; output: {output!r}'
+        assert proc.returncode == 0
+
+
+class TestShellEnvFileTrustBoundary(FumitmTestCase):
+    """shell_env_file points at a target-user-writable file. The automation
+    docs and the reporting code must direct privileged wrappers to drop
+    privileges rather than source it as root (privilege-escalation risk)."""
+
+    def test_automation_docs_forbid_privileged_sourcing(self):
+        doc = (Path(__file__).resolve().parent.parent
+               / 'README-automation.md').read_text()
+        start = doc.index('`shell_env_file`')
+        section = doc[start:start + 1500]
+        assert 'must never source' in section
+        assert 'sudo -u' in section, \
+            'docs must show the privilege-drop pattern for dependent children'
+        assert 'needs to source this path' not in doc, \
+            'docs must not instruct the (possibly root) wrapper to source'
+
+    def test_shell_env_file_docstring_states_boundary(self):
+        doc = fumitm.FumitmPython._shell_env_file.__doc__
+        assert 'never source' in doc
+        assert 'drop privileges' in doc
 
 
 if __name__ == '__main__':
