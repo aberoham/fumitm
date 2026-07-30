@@ -16,7 +16,7 @@ sudo python3 <(curl -LsSf https://raw.githubusercontent.com/aberoham/fumitm/main
   . "$HOME/.config/fumitm/env.sh"
 ```
 
-The trailing `. "$HOME/.config/fumitm/env.sh"` activates the new TLS environment in your current terminal. A child process cannot modify its parent shell, so without it the fixes only apply to newly opened shells.
+The trailing `. "$HOME/.config/fumitm/env.sh"` activates the new TLS environment in your current terminal. A child process cannot modify its parent shell, so without it the fixes only apply to newly opened shells. This is only needed once: fumitm also installs a small prompt hook, so terminals opened after the first run pick up later fumitm runs automatically at their next prompt (opt out with `--no-refresh-hook`).
 
 For more control, download the script first:
 

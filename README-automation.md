@@ -64,6 +64,12 @@ changed_when: >
    | first | regex_replace('^FUMITM_RESULT: ', '') | from_json).changes_made != false
 ```
 
+## Already-Open Shells
+
+fumitm installs a passive prompt hook (zsh `precmd`, bash `PROMPT_COMMAND`, fish `conf.d`) alongside its persistent exports. Once a shell has loaded the hook, any later fumitm run — a local checkout, a saved download, or a Jamf policy using `--run-as-user` — is picked up at that shell's next prompt: the hook sources `~/.config/fumitm/env.sh` (or `env.fish` for fish), which no-ops unless its content generation changed. The hook requires no installed fumitm executable, runs no subprocess, and preserves the previous command's exit status. Disable with `--no-refresh-hook`.
+
+The first-ever run cannot retroactively refresh shells that were already open before the hook existed; those need one explicit `. "$HOME/.config/fumitm/env.sh"` or a new terminal (see `shell_reload_command` above).
+
 ## User Targeting
 
 ### The problem

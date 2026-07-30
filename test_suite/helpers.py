@@ -133,6 +133,12 @@ def mock_fumitm_environment(mock_config):
          patch('fumitm.os.environ', mock_config['environ']), \
          patch('fumitm.os.makedirs'), \
          patch('fumitm.shutil.copy'), \
+         patch('fumitm.tempfile.mkstemp',
+               side_effect=lambda *a, **kw: (0, (kw.get('dir') or '/tmp') + '/mock.tmp')), \
+         patch('fumitm.os.fdopen',
+               side_effect=lambda fd, *a, **kw: mock_open()()), \
+         patch('fumitm.os.chmod'), \
+         patch('fumitm.os.replace'), \
          patch('builtins.open', side_effect=mock_config['open_side_effect']):
         
         mock_which.side_effect = mock_config['which_side_effect']

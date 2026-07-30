@@ -930,12 +930,12 @@ class TestShellReloadNotice(FumitmTestCase):
             with patch.object(instance, 'detect_shell', return_value=shell):
                 assert instance._shell_reload_command() == self.ENV_SOURCE_CMD
 
-    def test_reload_command_fish_sources_config_fish(self):
-        """fish cannot source POSIX sh, so it keeps sourcing config.fish."""
+    def test_reload_command_fish_sources_env_fish(self):
+        """fish cannot source POSIX sh, so it sources its own env file."""
         instance = self.create_fumitm_instance()
         with patch.object(instance, 'detect_shell', return_value='fish'):
             cmd = instance._shell_reload_command()
-        assert cmd == 'source ~/.config/fish/config.fish'
+        assert cmd == 'source "$HOME/.config/fumitm/env.fish"'
 
     def test_reload_command_unknown_shell_is_none(self):
         instance = self.create_fumitm_instance()

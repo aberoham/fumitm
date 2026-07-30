@@ -800,7 +800,7 @@ class TestCLIAndWorkflow(FumitmTestCase):
         'no_color': False, 'headless': False, 'skip_update_check': False,
         'log_file': None, 'log_dir': None, 'json_log_file': None, 'json_log_dir': None,
         'run_as_user': None, 'with_aikido': False, 'no_aikido': False,
-        'aikido_cert_file': None,
+        'aikido_cert_file': None, 'no_refresh_hook': False,
     }
 
     @patch('fumitm.sys.argv', ['fumitm.py', '--fix'])
@@ -4322,7 +4322,7 @@ class TestShellStartupFileCoverage(FumitmTestCase):
         targets = [os.path.basename(p) for p in inst.get_shell_configs('bash')]
         assert targets == ['.bashrc', '.bash_profile']
 
-    def test_fish_keeps_inline_block_and_writes_no_env_file(self, isolate_home):
+    def test_fish_writes_env_fish_and_stub_not_posix_env_file(self, isolate_home):
         inst = self.create_fumitm_instance(mode='install')
         config = isolate_home / '.config' / 'fish' / 'config.fish'
 
@@ -4330,8 +4330,12 @@ class TestShellStartupFileCoverage(FumitmTestCase):
              patch.object(inst, 'get_shell_config', return_value=str(config)):
             inst.add_to_shell_config('SSL_CERT_FILE', '/new/bundle.pem')
 
-        # fish cannot source POSIX-sh syntax, so it keeps the inline block.
-        assert 'export SSL_CERT_FILE="/new/bundle.pem"' in config.read_text()
+        # fish cannot source POSIX-sh syntax, so it gets its own env file and
+        # a config.fish stub sourcing it; the POSIX env.sh is never written.
+        env_fish = Path(inst._env_fish_path()).read_text()
+        assert 'set -gx SSL_CERT_FILE "/new/bundle.pem"' in env_fish
+        assert 'source "$HOME/.config/fumitm/env.fish"' in config.read_text()
+        assert 'export SSL_CERT_FILE' not in config.read_text()
         assert not Path(inst._env_file_path()).exists()
 
     def test_status_mode_writes_nothing(self, isolate_home):

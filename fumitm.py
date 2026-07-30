@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -233,6 +234,24 @@ class FumitmPython:
     _FUMITM_ENV_FILE_REL = ".config/fumitm/env.sh"
     _FUMITM_ENV_FILE_SHELL = '"$HOME/.config/fumitm/env.sh"'
 
+    # fish cannot source POSIX sh, so it gets its own generated env file. The
+    # config.fish stub and the prompt hook both source this file.
+    _FUMITM_ENV_FISH_REL = ".config/fumitm/env.fish"
+    _FUMITM_ENV_FISH_SHELL = '"$HOME/.config/fumitm/env.fish"'
+    _FUMITM_FISH_HOOK_REL = ".config/fish/conf.d/fumitm_refresh.fish"
+
+    # The interactive refresh hook lives in its own marker block, deliberately
+    # distinct from _FUMITM_BLOCK_BEGIN: an older fumitm rewrites the managed
+    # block wholesale, and a separate marker keeps a saved point-in-time copy
+    # from silently erasing the hook it predates.
+    _FUMITM_REFRESH_BEGIN = "# >>> fumitm refresh (prompt hook) >>>"
+    _FUMITM_REFRESH_END = "# <<< fumitm refresh <<<"
+
+    # Comment line in the generated env files recording every variable fumitm
+    # has ever managed there, so a later generation can unset removed variables
+    # in already-open shells instead of merely overwriting the survivors.
+    _FUMITM_MANIFEST_PREFIX = "# fumitm-managed-vars:"
+
     def __init__(self, mode='status', debug=False, selected_tools=None,
                  cert_file=None, manual_cert=False, skip_verify=False,
                  provider=None, auto_yes=False, no_color=False,
@@ -240,10 +259,15 @@ class FumitmPython:
                  log_file=None, log_dir=None,
                  json_log_file=None, json_log_dir=None,
                  run_as_user=None, with_aikido=False, no_aikido=False,
-                 aikido_cert_file=None):
+                 aikido_cert_file=None, no_refresh_hook=False):
         self.mode = mode
         self.debug = debug
         self.shell_modified = False
+        self.no_refresh_hook = no_refresh_hook
+        # True once this run has confirmed a prompt refresh hook is in place
+        # (installed now or already present); the final notice mentions that
+        # future runs are picked up automatically at the next prompt.
+        self._refresh_hook_ready = False
         # Shell config paths whose pre-run original has already been backed up
         # this run, so repeated writes in one run never overwrite the .bak with an
         # intermediate generated file.
@@ -2243,10 +2267,22 @@ class FumitmPython:
         return '\n'.join(body)
 
     def _render_stub(self):
-        """Render the managed source-stub block placed in each startup file."""
+        """Render the managed source-stub block placed in each startup file.
+
+        The stub forces the env file's exports unconditionally. The env file
+        self-guards on _FUMITM_ENV_GENERATION so the prompt hook can source
+        it cheaply, but that guard must not apply here: in a login shell the
+        .zshenv stub runs first and records the generation, a vendor block in
+        .zprofile then overrides a variable, and the .zlogin stub must still
+        re-export to win by last-export-wins. _FUMITM_ENV_FORCE is deliberately
+        not exported, so child shells and the prompt hook keep guarded
+        semantics.
+        """
         return '\n'.join([
             self._FUMITM_BLOCK_BEGIN,
-            f'[ -r {self._FUMITM_ENV_FILE_SHELL} ] && . {self._FUMITM_ENV_FILE_SHELL}',
+            (f'[ -r {self._FUMITM_ENV_FILE_SHELL} ] && '
+             f'{{ _FUMITM_ENV_FORCE=1; . {self._FUMITM_ENV_FILE_SHELL}; '
+             'unset _FUMITM_ENV_FORCE; }'),
             self._FUMITM_BLOCK_END,
         ])
 
@@ -2266,12 +2302,18 @@ class FumitmPython:
             self.print_debug(f"Could not read {path}: {e}")
             return None
 
-    def _write_managed_file(self, path, new, label):
+    def _write_managed_file(self, path, new, label, atomic=False):
         """Write `new` to `path`, backing up the pre-run original once per run.
 
         Returns True when the file changed (or would change in dry-run mode).
         Shared by the env file and the per-startup-file stubs so both get the
         same backup, ownership and dry-run handling.
+
+        With atomic=True the content lands via temp-file-plus-rename, so a
+        prompt hook sourcing the file concurrently can never read a partial
+        write; a symlink at `path` is replaced rather than written through.
+        Only fumitm-generated files use this: startup files may legitimately
+        be user symlinks into a dotfiles repo, which a rename would break.
         """
         original = self._read_text_or_none(path)
 
@@ -2292,9 +2334,27 @@ class FumitmPython:
             self._backed_up_shell_configs.add(path)
 
         self._safe_makedirs(os.path.dirname(path))
-        with open(path, 'w') as f:
-            f.write(new)
-        self._fix_ownership(path)
+        if atomic:
+            fd, tmp_path = tempfile.mkstemp(
+                dir=os.path.dirname(path),
+                prefix=os.path.basename(path) + '.', suffix='.tmp',
+            )
+            try:
+                with os.fdopen(fd, 'w') as f:
+                    f.write(new)
+                os.chmod(tmp_path, 0o644)
+                self._fix_ownership(tmp_path)
+                os.replace(tmp_path, path)
+            except BaseException:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        else:
+            with open(path, 'w') as f:
+                f.write(new)
+            self._fix_ownership(path)
         self.shell_modified = True
         return True
 
@@ -2317,19 +2377,71 @@ class FumitmPython:
             if (rhs.startswith('"') and rhs.endswith('"')) or \
                     (rhs.startswith("'") and rhs.endswith("'")):
                 rhs = rhs[1:-1]
-            managed[name.strip()] = rhs
+            name = name.strip()
+            if name.startswith('_FUMITM_'):
+                continue
+            managed[name] = rhs
         return managed
 
+    @staticmethod
+    def _env_generation(managed):
+        """Deterministic short digest identifying one exact set of exports.
+
+        Baked into the generated env file and exported as
+        _FUMITM_ENV_GENERATION when the file runs, so re-sourcing the file at
+        every prompt is a string comparison and nothing else once the shell is
+        current. Order-independent: the same var->value set always hashes the
+        same regardless of insertion history.
+        """
+        payload = '\n'.join(f'{k}={v}' for k, v in sorted(managed.items()))
+        return hashlib.sha256(payload.encode()).hexdigest()[:12]
+
+    def _env_manifest(self, path, current_reader):
+        """Every variable fumitm has ever managed in the env file at `path`.
+
+        The union of the previous file's recorded manifest and its live
+        exports. A variable stays in the manifest even after fumitm stops
+        exporting it, so the generated unset line can clear it from shells
+        still carrying an older generation.
+        """
+        manifest = set()
+        content = self._read_text_or_none(path)
+        if content is not None:
+            for line in content.splitlines():
+                if line.startswith(self._FUMITM_MANIFEST_PREFIX):
+                    manifest.update(line[len(self._FUMITM_MANIFEST_PREFIX):].split())
+        manifest.update(current_reader())
+        return manifest
+
     def _write_env_file(self, managed):
-        """Write the sourced env file holding every fumitm-managed export."""
+        """Write the sourced env file holding every fumitm-managed export.
+
+        The file self-guards on a content generation: shells that already
+        carry this generation skip it entirely, which is what makes sourcing
+        it from a prompt hook at every prompt affordable. On a generation
+        change it first unsets every variable in the manifest, then exports
+        the current set, so variables removed between generations disappear
+        from open shells instead of lingering.
+        """
+        manifest = sorted(self._env_manifest(self._env_file_path(),
+                                             self._read_env_file) | set(managed))
+        generation = self._env_generation(managed)
         body = [
             "# Managed by fumitm - do not edit; this file is regenerated.",
             "# Sourced from your shell startup files so TLS trust applies to",
             "# interactive, non-interactive and login shells alike.",
+            f"{self._FUMITM_MANIFEST_PREFIX} {' '.join(manifest)}".rstrip(),
+            (f'if [ "${{_FUMITM_ENV_GENERATION:-}}" != "{generation}" ] || '
+             '[ "${_FUMITM_ENV_FORCE:-}" = "1" ]; then'),
         ]
-        body.extend(f'export {name}="{value}"' for name, value in managed.items())
+        if manifest:
+            body.append(f"  unset {' '.join(manifest)}")
+        body.extend(f'  export {name}="{value}"' for name, value in managed.items())
+        body.append(f'  export _FUMITM_ENV_GENERATION="{generation}"')
+        body.append('fi')
         return self._write_managed_file(
-            self._env_file_path(), '\n'.join(body) + '\n', 'fumitm exports'
+            self._env_file_path(), '\n'.join(body) + '\n', 'fumitm exports',
+            atomic=True,
         )
 
     def _ensure_stub(self, shell_config):
@@ -2356,6 +2468,239 @@ class FumitmPython:
         _, managed = self._parse_fumitm_block(content)
         return managed
 
+    def _split_refresh_block(self, content):
+        """Split content into (lines outside the refresh block, block text).
+
+        Marker matching mirrors _parse_fumitm_block: the last begin marker
+        pairs with the first end marker after it; an unpaired begin is treated
+        as foreign content. Returns block text as None when absent.
+        """
+        lines = content.splitlines()
+        begin_idx = None
+        for i, line in enumerate(lines):
+            if line.strip() == self._FUMITM_REFRESH_BEGIN:
+                begin_idx = i
+        if begin_idx is None:
+            return lines, None
+        for i in range(begin_idx + 1, len(lines)):
+            if lines[i].strip() == self._FUMITM_REFRESH_END:
+                return (lines[:begin_idx] + lines[i + 1:],
+                        '\n'.join(lines[begin_idx:i + 1]))
+        return lines, None
+
+    def _render_refresh_hook(self, shell_type):
+        """The interactive prompt hook block for zsh or bash.
+
+        The hook only sources the local generated env file — no subprocess,
+        no network, no fumitm executable — so it keeps working after the user
+        deletes the script that installed it. It preserves the previous
+        command's exit status and registers idempotently alongside whatever
+        precmd_functions/PROMPT_COMMAND entries already exist. The sourced
+        env file self-guards on its generation, making the steady-state cost
+        of each prompt a single string comparison.
+        """
+        source_line = (f'[ -r {self._FUMITM_ENV_FILE_SHELL} ] '
+                       f'&& . {self._FUMITM_ENV_FILE_SHELL}')
+        if shell_type == 'zsh':
+            lines = [
+                self._FUMITM_REFRESH_BEGIN,
+                '_fumitm_refresh() {',
+                '  local _fumitm_last=$?',
+                f'  {source_line}',
+                '  return $_fumitm_last',
+                '}',
+                'typeset -ga precmd_functions',
+                'if (( ! ${precmd_functions[(I)_fumitm_refresh]} )); then',
+                '  precmd_functions+=(_fumitm_refresh)',
+                'fi',
+                self._FUMITM_REFRESH_END,
+            ]
+        elif shell_type == 'bash':
+            # .bashrc can be pulled in by non-interactive shells (e.g. some
+            # sshd setups), so the whole block gates on interactivity.
+            lines = [
+                self._FUMITM_REFRESH_BEGIN,
+                'case $- in *i*)',
+                '  _fumitm_refresh() {',
+                '    local _fumitm_last=$?',
+                f'    {source_line}',
+                '    return $_fumitm_last',
+                '  }',
+                '  case ";${PROMPT_COMMAND:-};" in',
+                '    *";_fumitm_refresh;"*) ;;',
+                ('    *) PROMPT_COMMAND="_fumitm_refresh'
+                 '${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;'),
+                '  esac',
+                ';;',
+                'esac',
+                self._FUMITM_REFRESH_END,
+            ]
+        else:
+            return None
+        return '\n'.join(lines)
+
+    def _refresh_hook_target(self, shell_type):
+        """The interactive startup file that should carry the refresh hook.
+
+        Only zsh and bash have a dependable prompt hook; plain sh/dash/ksh do
+        not, and fish uses a conf.d file instead (_ensure_fish_refresh_hook).
+        """
+        if shell_type == 'zsh':
+            return os.path.join(self._zsh_dotdir(), '.zshrc')
+        if shell_type == 'bash':
+            return os.path.join(os.path.expanduser("~"), '.bashrc')
+        return None
+
+    def _ensure_refresh_hook(self, shell_type):
+        """Ensure the interactive startup file carries the refresh hook block.
+
+        The block is upserted in place when present (so a hook-format upgrade
+        propagates) and appended otherwise. Skipped entirely with
+        --no-refresh-hook: persistence via the source stubs works without it,
+        the user just loses same-shell refresh on later runs.
+        """
+        hook = self._render_refresh_hook(shell_type)
+        target = self._refresh_hook_target(shell_type)
+        if hook is None or target is None:
+            return False
+        content = self._read_text_or_none(target) or ""
+        other_lines, existing = self._split_refresh_block(content)
+        self._refresh_hook_ready = True
+        if existing == hook:
+            return False
+        while other_lines and other_lines[-1].strip() == '':
+            other_lines.pop()
+        prefix = ('\n'.join(other_lines) + '\n\n') if other_lines else ''
+        return self._write_managed_file(target, prefix + hook + '\n',
+                                        'refresh hook')
+
+    def _env_fish_path(self):
+        """Absolute path of the generated fish env file."""
+        return os.path.join(os.path.expanduser("~"), self._FUMITM_ENV_FISH_REL)
+
+    def _read_env_fish_file(self):
+        """Parse env.fish into an insertion-ordered var->value dict."""
+        content = self._read_text_or_none(self._env_fish_path())
+        if content is None:
+            return {}
+        managed = {}
+        for line in content.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith('set -gx '):
+                continue
+            parts = stripped[len('set -gx '):].split(None, 1)
+            if len(parts) != 2:
+                continue
+            name, rhs = parts
+            if (rhs.startswith('"') and rhs.endswith('"')) or \
+                    (rhs.startswith("'") and rhs.endswith("'")):
+                rhs = rhs[1:-1]
+            if name.startswith('_FUMITM_'):
+                continue
+            managed[name] = rhs
+        return managed
+
+    def _write_env_fish_file(self, managed):
+        """Write the generated fish env file, mirroring _write_env_file.
+
+        The generation digest is shared with env.sh for the same var set, so
+        a fish shell spawning a POSIX shell (or vice versa) sees a matching
+        _FUMITM_ENV_GENERATION in the inherited environment and skips the
+        re-export, exactly as a same-shell child would.
+        """
+        manifest = sorted(self._env_manifest(self._env_fish_path(),
+                                             self._read_env_fish_file)
+                          | set(managed))
+        generation = self._env_generation(managed)
+        body = [
+            "# Managed by fumitm - do not edit; this file is regenerated.",
+            "# Sourced from config.fish and fumitm's prompt hook.",
+            f"{self._FUMITM_MANIFEST_PREFIX} {' '.join(manifest)}".rstrip(),
+            (f'if test "$_FUMITM_ENV_GENERATION" != "{generation}"; '
+             'or test "$_FUMITM_ENV_FORCE" = "1"'),
+        ]
+        body.extend(f'    set -e {name}' for name in manifest)
+        body.extend(f'    set -gx {name} "{value}"'
+                    for name, value in managed.items())
+        body.append(f'    set -gx _FUMITM_ENV_GENERATION "{generation}"')
+        body.append('end')
+        return self._write_managed_file(
+            self._env_fish_path(), '\n'.join(body) + '\n', 'fumitm exports',
+            atomic=True,
+        )
+
+    def _ensure_fish_stub(self, shell_config):
+        """Ensure config.fish ends with a stub sourcing the fish env file.
+
+        Replaces any legacy inline export block in place, mirroring
+        _ensure_stub for POSIX shells.
+        """
+        other_lines, _ = self._parse_fumitm_block(
+            self._read_text_or_none(shell_config) or ""
+        )
+        while other_lines and other_lines[-1].strip() == '':
+            other_lines.pop()
+        stub = '\n'.join([
+            self._FUMITM_BLOCK_BEGIN,
+            'set -g _FUMITM_ENV_FORCE 1',
+            (f'test -r {self._FUMITM_ENV_FISH_SHELL}; '
+             f'and source {self._FUMITM_ENV_FISH_SHELL}'),
+            'set -e _FUMITM_ENV_FORCE',
+            self._FUMITM_BLOCK_END,
+        ])
+        prefix = ('\n'.join(other_lines) + '\n\n') if other_lines else ''
+        return self._write_managed_file(shell_config, prefix + stub + '\n',
+                                        'source stub')
+
+    def _ensure_fish_refresh_hook(self):
+        """Ensure the fish prompt hook conf.d file exists and is current.
+
+        fish auto-loads conf.d files for every shell, so the file gates on
+        interactivity itself; deleting it disables prompt refresh without
+        touching persistence. fish ≥3.2 restores $status/$pipestatus for the
+        prompt after event handlers run, so the handler needs no save/restore.
+        """
+        hook_path = os.path.join(os.path.expanduser("~"),
+                                 self._FUMITM_FISH_HOOK_REL)
+        body = [
+            "# Managed by fumitm - delete this file to disable prompt refresh.",
+            "if status is-interactive",
+            "    function _fumitm_refresh --on-event fish_prompt",
+            (f"        test -r {self._FUMITM_ENV_FISH_SHELL}; "
+             f"and source {self._FUMITM_ENV_FISH_SHELL}"),
+            "    end",
+            "end",
+        ]
+        self._refresh_hook_ready = True
+        return self._write_managed_file(hook_path, '\n'.join(body) + '\n',
+                                        'refresh hook', atomic=True)
+
+    def _add_to_fish_config(self, var_name, var_value):
+        """Upsert a fish export: env.fish plus stub and prompt hook.
+
+        fish cannot source the POSIX env.sh, so it gets its own generated env
+        file. Any legacy inline export block in config.fish is hoisted into
+        env.fish and replaced by the stub, mirroring the POSIX migration.
+        """
+        config = self.get_shell_config('fish')
+        existing = self._read_env_fish_file()
+        managed = dict(self._legacy_block_vars(config))
+        managed.update(existing)
+        managed[var_name] = var_value
+
+        changed = self._write_env_fish_file(managed)
+        if changed and existing.get(var_name) != var_value:
+            if self.is_install_mode():
+                self.print_info(f"Set {var_name} in {self._env_fish_path()}")
+            else:
+                self.print_action(f'set -gx {var_name} "{var_value}"')
+
+        if not self.no_refresh_hook and self._ensure_fish_refresh_hook():
+            changed = True
+        if self._ensure_fish_stub(config):
+            changed = True
+        return changed
+
     def add_to_shell_config(self, var_name, var_value, shell_config=None):
         """Upsert an export so it applies in every mode the user's shell runs in.
 
@@ -2378,6 +2723,9 @@ class FumitmPython:
             False on a no-op. The gcloud setup uses this to report pre-bootstrap.
         """
         shell_type = self.detect_shell()
+
+        if shell_type == 'fish':
+            return self._add_to_fish_config(var_name, var_value)
 
         if not self._uses_env_file(shell_type):
             return self._write_inline_block(
@@ -2411,6 +2759,11 @@ class FumitmPython:
                 self.print_info(f"Set {var_name} in {self._env_file_path()}")
             else:
                 self.print_action(f'export {var_name}="{var_value}"')
+
+        # Hook before stubs: both append to the interactive startup file, and
+        # this order leaves the source stub last from the first run onward.
+        if not self.no_refresh_hook and self._ensure_refresh_hook(shell_type):
+            changed = True
 
         for path in targets:
             if self._ensure_stub(path):
@@ -6921,16 +7274,15 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
 
         POSIX shells source the small generated env file, never a whole rc
         file: re-running .zshrc/.bashrc repeats unrelated agents, hooks,
-        aliases and PATH mutations that are not idempotent. fish keeps its
-        inline block in config.fish, so sourcing that file remains the fish
-        activation path. Returns None for shells with no safe one-liner.
+        aliases and PATH mutations that are not idempotent. fish sources its
+        own generated env file for the same reason. Returns None for shells
+        with no safe one-liner.
         """
         shell_type = self.detect_shell()
         if self._uses_env_file(shell_type):
             return f'. {self._FUMITM_ENV_FILE_SHELL}'
         if shell_type == 'fish':
-            home = os.path.expanduser("~")
-            return f"source {self.get_shell_config(shell_type).replace(home, '~', 1)}"
+            return f'source {self._FUMITM_ENV_FISH_SHELL}'
         return None
 
     def _print_shell_reload_notice(self):
@@ -6960,6 +7312,12 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             self.print_info("  exec $SHELL -l  (restarts your shell)")
         print()
         self.print_info("Or simply open a new terminal window.")
+        if self._refresh_hook_ready:
+            print()
+            self.print_info(
+                "A prompt refresh hook is installed: future fumitm runs are "
+                "picked up automatically by shells opened after this point."
+            )
 
     def main(self):
         """Main entry point for the FumitmPython instance."""
@@ -7158,6 +7516,11 @@ def main():
                         help='Disable ANSI color output')
     parser.add_argument('--skip-update-check', action='store_true',
                         help='Skip checking for updates')
+    parser.add_argument('--no-refresh-hook', action='store_true',
+                        help='Do not install the interactive prompt hook that '
+                             'refreshes already-open shells after later fumitm '
+                             'runs (persistent exports for new shells are '
+                             'unaffected)')
     log_group = parser.add_mutually_exclusive_group()
     log_group.add_argument('--log-file', metavar='PATH',
                            help='Write plain-text log to PATH (overwrites each run)')
@@ -7244,6 +7607,7 @@ def main():
         with_aikido=args.with_aikido,
         no_aikido=args.no_aikido,
         aikido_cert_file=args.aikido_cert,
+        no_refresh_hook=args.no_refresh_hook,
     )
     exit_code = fumitm_instance.main()
     sys.exit(exit_code)
