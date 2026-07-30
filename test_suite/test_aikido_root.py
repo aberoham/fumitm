@@ -753,14 +753,7 @@ def _adopt_instance(tmp_path, mode='install', **kwargs):
     primary = tmp_path / 'primary.pem'
     primary.write_text(mock_data.MOCK_CERTIFICATE)
     inst.cert_path = str(primary)
-    inst.extra_roots = [{
-        'key': 'aikido',
-        'name': 'Aikido Endpoint Protection',
-        'short_name': 'Aikido',
-        'keytool_alias': 'aikido-root',
-        'container_cert_name': 'aikido',
-        'path': None,
-    }]
+    inst.extra_roots = [{'key': 'aikido', 'short_name': 'Aikido'}]
     return inst
 
 
@@ -777,21 +770,19 @@ def _doctor_on_path(inst):
 
 
 class TestAikidoAdoptRegistry(FumitmTestCase):
-    """The aikido-adopt tool is registered first, with the right shape."""
+    """The aikido-adopt tool is registered with the right shape."""
 
     def test_registry_entry_exists(self):
         inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
         entry = inst.tools_registry['aikido-adopt']
-        assert entry['name'] == 'Aikido certconfig adopt'
+        assert entry['name'] == 'Aikido Combined Bundle'
+        # 'system' scope: needs root, and must still run when root has no
+        # user context (JAMF/MDM), unlike the user-scoped bundle tools.
         assert entry['scope'] == 'system'
         assert entry['setup_func'] == inst.setup_aikido_adopt
         assert entry['check_func'] == inst.check_aikido_adopt_status
         assert 'aikido' in entry['tags']
         assert 'aikido-adopt' in entry['tags']
-
-    def test_registry_entry_is_first(self):
-        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
-        assert next(iter(inst.tools_registry)) == 'aikido-adopt'
 
 
 class TestAikidoAdoptGating(FumitmTestCase):
@@ -873,7 +864,7 @@ class TestAikidoAdoptInvocation(FumitmTestCase):
             return MagicMock(returncode=0, stdout='', stderr='')
 
         with _doctor_on_path(inst), _patch_combined_pem(combined), \
-             patch('fumitm.os.geteuid', return_value=0), \
+             patch('fumitm.os.getuid', return_value=0), \
              patch('fumitm.subprocess.run', side_effect=fake_run) as mock_run:
             result = inst.setup_aikido_adopt()
         assert result.status == 'configured'
@@ -891,7 +882,7 @@ class TestAikidoAdoptInvocation(FumitmTestCase):
             return MagicMock(returncode=0, stdout='', stderr='')
 
         with _doctor_on_path(inst), _patch_combined_pem(combined), \
-             patch('fumitm.os.geteuid', return_value=501), \
+             patch('fumitm.os.getuid', return_value=501), \
              patch('fumitm.sys.stdin') as mock_stdin, \
              patch('fumitm.subprocess.run', side_effect=fake_run) as mock_run:
             mock_stdin.isatty.return_value = True
@@ -905,7 +896,7 @@ class TestAikidoAdoptInvocation(FumitmTestCase):
         combined.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
         inst = _adopt_instance(tmp_path)
         with _doctor_on_path(inst), _patch_combined_pem(combined), \
-             patch('fumitm.os.geteuid', return_value=501), \
+             patch('fumitm.os.getuid', return_value=501), \
              patch('fumitm.sys.stdin') as mock_stdin, \
              patch.object(inst, '_prompt', return_value='n'), \
              patch('fumitm.subprocess.run') as mock_run:
@@ -924,7 +915,7 @@ class TestAikidoAdoptNonInteractive(FumitmTestCase):
         combined.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
         inst = _adopt_instance(tmp_path, **kwargs)
         with _doctor_on_path(inst), _patch_combined_pem(combined), \
-             patch('fumitm.os.geteuid', return_value=501), \
+             patch('fumitm.os.getuid', return_value=501), \
              patch('fumitm.sys.stdin') as mock_stdin, \
              patch('fumitm.subprocess.run') as mock_run:
             mock_stdin.isatty.return_value = False
@@ -949,7 +940,7 @@ class TestAikidoAdoptNonInteractive(FumitmTestCase):
         combined.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
         inst = _adopt_instance(tmp_path, headless=True, auto_yes=True)
         with _doctor_on_path(inst), _patch_combined_pem(combined), \
-             patch('fumitm.os.geteuid', return_value=501), \
+             patch('fumitm.os.getuid', return_value=501), \
              patch('fumitm.subprocess.run') as mock_run:
             result = inst.setup_aikido_adopt()
         assert result.status == 'skipped'
@@ -966,7 +957,7 @@ class TestAikidoAdoptFailure(FumitmTestCase):
         inst = _adopt_instance(tmp_path)
         fail = MagicMock(returncode=1, stdout='', stderr='boom')
         with _doctor_on_path(inst), _patch_combined_pem(combined), \
-             patch('fumitm.os.geteuid', return_value=0), \
+             patch('fumitm.os.getuid', return_value=0), \
              patch('fumitm.subprocess.run', return_value=fail):
             result = inst.setup_aikido_adopt()
         assert result.status == 'failed'
@@ -977,25 +968,26 @@ class TestAikidoAdoptFailure(FumitmTestCase):
         combined.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
         inst = _adopt_instance(tmp_path)
         with _doctor_on_path(inst), _patch_combined_pem(combined), \
-             patch('fumitm.os.geteuid', return_value=0), \
+             patch('fumitm.os.getuid', return_value=0), \
              patch('fumitm.subprocess.run',
                    side_effect=FileNotFoundError('no aikido-doctor')):
             result = inst.setup_aikido_adopt()
         assert result.status == 'failed'
         assert 'no aikido-doctor' in result.message
 
-    def test_success_exit_but_root_absent_fails(self, tmp_path):
+    def test_success_exit_but_root_absent_warns(self, tmp_path, capsys):
+        # The agent owns when it rewrites the bundle, so a clean exit with the
+        # root not yet visible warns rather than failing the run.
         combined = tmp_path / 'combined.pem'
         combined.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
         inst = _adopt_instance(tmp_path)
         ok = MagicMock(returncode=0, stdout='', stderr='')
         with _doctor_on_path(inst), _patch_combined_pem(combined), \
-             patch('fumitm.os.geteuid', return_value=0), \
-             patch('fumitm.time.sleep'), \
+             patch('fumitm.os.getuid', return_value=0), \
              patch('fumitm.subprocess.run', return_value=ok):
             result = inst.setup_aikido_adopt()
-        assert result.status == 'failed'
-        assert 'not found in combined bundle' in result.message
+        assert result.status == 'configured'
+        assert 'not visible in Aikido' in capsys.readouterr().out
 
 
 class TestAikidoAdoptStatus(FumitmTestCase):

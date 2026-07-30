@@ -110,15 +110,13 @@ signals are absent, supply the root with `--aikido-cert /path/to/aikido-root.pem
 macOS/Linux (`fumitm.py`); the Windows port does not yet add the Aikido root.
 
 Newer Aikido agents ship `aikido-doctor certconfig adopt <pem>`, which teaches
-Aikido's own combined CA bundle an external root. When the `aikido-doctor`
-binary is on PATH, `--fix` runs it against the primary provider's root (the
-`aikido-adopt` tool key), so the bundle Aikido env-injects at tools also trusts
-the primary proxy. Running it needs root: as a non-root user fumitm asks for
-confirmation (`--yes` auto-confirms) and invokes it via `sudo`; in a non-root
-run without a terminal it prints the exact command to run manually and moves
-on. The defensive workarounds for the pre-adopt world (env-var reclaim, curlrc
-override handling, exports kept last in shell startup files) all remain in
-place for hosts where the agent predates `certconfig` or adopt has not run.
+Aikido's own combined bundle an external root. When that binary is on PATH,
+`--fix` runs it against the primary provider's root (tool key `aikido-adopt`)
+so the bundle Aikido env-injects also trusts the primary proxy. It needs root:
+non-root runs ask for confirmation (`--yes` auto-confirms) and use `sudo`, and
+without a terminal they print the command to run manually instead. The existing
+workarounds (trust-var reclaim, curlrc override, exports kept last in shell
+startup files) stay in place for hosts whose agent predates `certconfig`.
 
 ### Windows-Specific
 - `warp-cli.exe` command must be available 
