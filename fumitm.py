@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import argparse
+import base64
+import hashlib
 import json
 import os
 import platform
@@ -197,6 +199,15 @@ SUPPLEMENTAL_ROOTS = {
         'combined_pem': (
             '/Library/Application Support/AikidoSecurity/'
             'EndpointProtection/run/endpoint-protection-pip-combined-ca.pem'
+        ),
+        # Aikido records each CA adopted via `certconfig adopt` as a
+        # <sha256>.pem here, world-readable and keyed by the same fingerprint
+        # `adopt --forget` takes. This is the authoritative record of adoption:
+        # presence in the bundles above is not, since those are built from the
+        # system trust store and so already carry any keychain-installed root.
+        'adopted_dir': (
+            '/Library/Application Support/AikidoSecurity/'
+            'EndpointProtection/run/adopted-cas'
         ),
         'cert_path': '~/.aikido-ca.pem',
         'keytool_alias': 'aikido-root',
@@ -711,14 +722,8 @@ class FumitmPython:
         with openssl. This is what rejects Aikido's ephemeral hex-CN
         interception intermediate while keeping the long-lived root.
         """
-        marker = '-----END CERTIFICATE-----'
-        blocks = []
-        for chunk in pem_text.split(marker):
-            if '-----BEGIN CERTIFICATE-----' in chunk:
-                blocks.append(chunk[chunk.index('-----BEGIN CERTIFICATE-----'):] + marker + '\n')
-
         matching = []
-        for block in blocks:
+        for block in self._pem_blocks(pem_text):
             subject = self._openssl_subject(block)
             if subject is None:
                 continue
@@ -726,6 +731,69 @@ class FumitmPython:
             if cn and cn.startswith(cn_prefix):
                 matching.append(block.strip())
         return matching
+
+    @staticmethod
+    def _pem_blocks(pem_text):
+        """Split PEM text into individual certificate blocks."""
+        marker = '-----END CERTIFICATE-----'
+        begin = '-----BEGIN CERTIFICATE-----'
+        blocks = []
+        for chunk in pem_text.split(marker):
+            if begin in chunk:
+                blocks.append(chunk[chunk.index(begin):] + marker + '\n')
+        return blocks
+
+    def _cert_fingerprints(self, path):
+        """Return the SHA-256 fingerprint of every certificate in a PEM file.
+
+        Same value as `openssl x509 -fingerprint -sha256` (a digest over the
+        DER body), lowercased and unseparated — the form Aikido names its
+        adopted-CA files with. Computed in-process rather than by shelling out
+        per certificate, which the subprocess budget would notice.
+        """
+        text = self._read_text_or_none(path)
+        if text is None:
+            return []
+        fingerprints = []
+        for block in self._pem_blocks(text):
+            body = ''.join(block.split('-----BEGIN CERTIFICATE-----')[1]
+                                .split('-----END CERTIFICATE-----')[0].split())
+            try:
+                fingerprints.append(hashlib.sha256(base64.b64decode(body)).hexdigest())
+            except Exception as e:
+                self.print_debug(f"Could not fingerprint a block of {path}: {e}")
+        return fingerprints
+
+    def _aikido_has_adopted(self, cert_path):
+        """Return True when Aikido has adopted every certificate in cert_path.
+
+        Returns None when Aikido keeps no adopted-CA store, i.e. the agent is
+        too old to have a `certconfig adopt` to call, so callers fall back to
+        inspecting the bundles themselves.
+        """
+        adopted_dir = SUPPLEMENTAL_ROOTS['aikido']['adopted_dir']
+        if not os.path.isdir(adopted_dir):
+            return None
+        fingerprints = self._cert_fingerprints(cert_path)
+        if not fingerprints:
+            return None
+        return all(os.path.exists(os.path.join(adopted_dir, f'{fp}.pem'))
+                   for fp in fingerprints)
+
+    def _aikido_trusts_root(self, cert_path):
+        """Return True when Aikido's CA bundles already carry cert_path's roots.
+
+        Prefers the adopted-CA store, which is exact. Falls back to looking in
+        a built bundle for agents that keep no such store: a weaker signal,
+        since a root installed in the system trust store turns up there without
+        anyone having adopted it, but the only one such an agent offers.
+        """
+        adopted = self._aikido_has_adopted(cert_path)
+        if adopted is not None:
+            return adopted
+        combined_pem = SUPPLEMENTAL_ROOTS['aikido']['combined_pem']
+        return (os.path.exists(combined_pem)
+                and self.certificate_exists_in_file(cert_path, combined_pem))
 
     def _openssl_subject(self, cert_pem):
         """Return the openssl subject line for a single PEM cert, or None if invalid."""
@@ -3140,13 +3208,14 @@ class FumitmPython:
         return default
 
     def setup_aikido_adopt(self):
-        """Adopt the primary provider root into Aikido's combined CA bundle.
+        """Adopt the primary provider root into Aikido's own CA bundles.
 
         Newer Aikido agents ship `aikido-doctor certconfig adopt <pem>`, which
-        teaches the agent's own combined bundle an external root, so the bundle
-        Aikido env-injects also trusts the primary provider. The defensive
-        machinery elsewhere (trust-var reclaim, curlrc override, exports kept
-        last) stays for hosts where the agent predates certconfig.
+        registers an external root and rebuilds every bundle it maintains (node,
+        npm, pip, git, ruby, curl, nix, bazel) around it, so the bundles Aikido
+        env-injects trust the primary provider too. The defensive machinery
+        elsewhere (trust-var reclaim, curlrc override, exports kept last) stays
+        for hosts where the agent predates certconfig.
         """
         if not any(e['key'] == 'aikido' for e in self.extra_roots):
             return ToolResult('aikido-adopt', 'skipped', 'Aikido not active')
@@ -3155,11 +3224,10 @@ class FumitmPython:
         if not os.path.exists(self.cert_path):
             return ToolResult('aikido-adopt', 'skipped', 'Provider root certificate not materialized')
 
-        combined_pem = SUPPLEMENTAL_ROOTS['aikido']['combined_pem']
         short = self.provider['short_name']
-        if os.path.exists(combined_pem) and self.certificate_exists_in_file(self.cert_path, combined_pem):
-            self.print_info(f"  ✓ {short} root already present in Aikido's combined bundle")
-            return ToolResult('aikido-adopt', 'already_ok', 'Provider root already in Aikido combined bundle')
+        if self._aikido_trusts_root(self.cert_path):
+            self.print_info(f"  ✓ {short} root already adopted by Aikido")
+            return ToolResult('aikido-adopt', 'already_ok', 'Provider root already adopted by Aikido')
 
         as_root = os.getuid() == 0
         argv = ['aikido-doctor', 'certconfig', 'adopt', self.cert_path]
@@ -3176,12 +3244,12 @@ class FumitmPython:
             # even under --yes. Hand the command over rather than let _prompt
             # raise NonInteractiveError and abort the whole run with exit code 2.
             if self.headless or not sys.stdin.isatty():
-                self.print_warn(f"Adopting the {short} root into Aikido's bundle requires sudo")
+                self.print_warn(f"Adopting the {short} root into Aikido's bundles requires sudo")
                 self.print_action(f"Run manually: {command_str}")
                 return ToolResult('aikido-adopt', 'skipped', 'Requires sudo; run manually')
             response = self._prompt(
                 f"Run 'sudo aikido-doctor certconfig adopt' to add the {short} "
-                "root to Aikido's combined bundle? (Y/n) ")
+                "root to Aikido's CA bundles? (Y/n) ")
             if response.lower() == 'n':
                 return ToolResult('aikido-adopt', 'skipped', 'Declined by user')
 
@@ -3199,16 +3267,12 @@ class FumitmPython:
             self.print_error(message)
             return ToolResult('aikido-adopt', 'failed', message)
 
-        # The agent owns when it rewrites the bundle, so an immediate re-check
-        # missing the root is not proof of failure; warn and let the next status
-        # run be the judge rather than failing a run that may well have worked.
-        if os.path.exists(combined_pem) and not self.certificate_exists_in_file(
-                self.cert_path, combined_pem):
-            self.print_warn(f"  ⚠ {short} root not visible in Aikido's combined bundle yet")
-            self.print_action("    Re-check with ./fumitm.py --tools aikido-adopt")
-        else:
-            self.print_info(f"  ✓ Adopted {short} root into Aikido's combined bundle")
-        return ToolResult('aikido-adopt', 'configured', 'Adopted provider root into Aikido combined bundle')
+        if self._aikido_has_adopted(self.cert_path) is False:
+            message = f'aikido-doctor exited 0 but did not adopt the {short} root'
+            self.print_error(message)
+            return ToolResult('aikido-adopt', 'failed', message)
+        self.print_info(f"  ✓ Adopted {short} root into Aikido's CA bundles")
+        return ToolResult('aikido-adopt', 'configured', 'Adopted provider root into Aikido CA bundles')
 
     def setup_brew_cacerts(self):
         """Regenerate Homebrew's ca-certificates bundle to include the proxy CA.
@@ -5915,14 +5979,10 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         if not self.command_exists('aikido-doctor'):
             self.print_info("  - aikido-doctor not found in PATH (agent predates certconfig adopt)")
             return has_issues
-        combined_pem = SUPPLEMENTAL_ROOTS['aikido']['combined_pem']
-        if not os.path.exists(combined_pem):
-            self.print_info("  - Aikido combined bundle not present (agent not running?)")
-            return has_issues
-        if self.certificate_exists_in_file(temp_warp_cert, combined_pem):
-            self.print_info("  ✓ Provider root present in Aikido's combined bundle")
+        if self._aikido_trusts_root(temp_warp_cert):
+            self.print_info("  ✓ Provider root adopted into Aikido's CA bundles")
         else:
-            self.print_warn("  ✗ Provider root not in Aikido's combined bundle")
+            self.print_warn("  ✗ Provider root not adopted by Aikido")
             self.print_action("    Run with --fix to adopt it via aikido-doctor")
             has_issues = True
         return has_issues

@@ -109,14 +109,23 @@ signals are absent, supply the root with `--aikido-cert /path/to/aikido-root.pem
 `~/.aikido-ca.pem` from an earlier run. Aikido support currently targets
 macOS/Linux (`fumitm.py`); the Windows port does not yet add the Aikido root.
 
-Newer Aikido agents ship `aikido-doctor certconfig adopt <pem>`, which teaches
-Aikido's own combined bundle an external root. When that binary is on PATH,
-`--fix` runs it against the primary provider's root (tool key `aikido-adopt`)
-so the bundle Aikido env-injects also trusts the primary proxy. It needs root:
-non-root runs ask for confirmation (`--yes` auto-confirms) and use `sudo`, and
-without a terminal they print the command to run manually instead. The existing
-workarounds (trust-var reclaim, curlrc override, exports kept last in shell
-startup files) stay in place for hosts whose agent predates `certconfig`.
+Newer Aikido agents ship `aikido-doctor certconfig adopt <pem>`, which registers
+an external root and rebuilds every bundle Aikido maintains (node, npm, pip,
+git, ruby, curl, nix, bazel) around it. When that binary is on PATH, `--fix`
+runs it against the primary provider's root (tool key `aikido-adopt`) so the
+bundles Aikido env-injects trust the primary proxy too. It needs root: non-root
+runs ask for confirmation (`--yes` auto-confirms) and use `sudo`, and without a
+terminal they print the command to run manually instead.
+
+Whether the root has been adopted is read from Aikido's own record of it,
+`EndpointProtection/run/adopted-cas/<sha256>.pem`, so repeat runs report
+`already_ok` without asking for sudo. Note that finding the root *inside* one of
+Aikido's bundles proves nothing on its own — those are built from the system
+trust store, so any keychain-installed root appears there without having been
+adopted; that weaker check is used only for agents that keep no such record.
+The existing workarounds (trust-var reclaim, curlrc override, exports kept last
+in shell startup files) stay in place for hosts whose agent predates
+`certconfig`.
 
 ### Windows-Specific
 - `warp-cli.exe` command must be available 
