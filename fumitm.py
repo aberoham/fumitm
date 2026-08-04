@@ -10,6 +10,7 @@ import pwd
 import re
 import shutil
 import ssl
+import stat
 import subprocess
 import sys
 import tempfile
@@ -3231,6 +3232,47 @@ class FumitmPython:
             os.close(fd)
         return staged
 
+    @staticmethod
+    def _trusted_system_executable(path):
+        """Return a canonical executable path only when its chain is trusted.
+
+        The aikido-adopt tool may execute this binary as root, so a path
+        selected from a target user's PATH must not be trusted merely because
+        it exists. Require the executable and every parent directory to be
+        root-owned and not writable by group or other users, then execute the
+        canonical path so a user-controlled symlink cannot be swapped after
+        validation.
+        """
+        try:
+            resolved = os.path.realpath(path)
+            if not os.path.isabs(resolved) or not os.path.isfile(resolved):
+                return None
+            if not os.access(resolved, os.X_OK):
+                return None
+
+            current = resolved
+            while True:
+                info = os.stat(current)
+                if info.st_uid != 0 or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                    return None
+                parent = os.path.dirname(current)
+                if parent == current:
+                    break
+                current = parent
+            return resolved
+        except OSError:
+            return None
+
+    def _find_aikido_doctor(self):
+        """Find aikido-doctor without selecting an untrusted user executable."""
+        for directory in os.environ.get('PATH', '').split(os.pathsep):
+            directory = directory or os.curdir
+            candidate = os.path.join(directory, 'aikido-doctor')
+            trusted = self._trusted_system_executable(candidate)
+            if trusted:
+                return trusted
+        return None
+
     def setup_aikido_adopt(self):
         """Adopt the primary provider root into Aikido's own CA bundles.
 
@@ -3248,12 +3290,15 @@ class FumitmPython:
             # Support, so adoption elsewhere could never be recognized and
             # every run would repeat it.
             return ToolResult('aikido-adopt', 'skipped', 'Aikido adoption is macOS-only')
-        # Resolved to an absolute path because sudo's secure_path usually
-        # excludes user-local and Homebrew directories, so the bare name found
-        # on the invoking user's PATH may not resolve under sudo.
-        doctor = shutil.which('aikido-doctor')
+        # This runs as root, directly or through sudo. Do not resolve from a
+        # user-writable PATH entry: --run-as-user deliberately adds the target
+        # user's Homebrew and ~/.local/bin directories to PATH.
+        doctor = self._find_aikido_doctor()
         if not doctor:
-            return ToolResult('aikido-adopt', 'skipped', 'aikido-doctor not found in PATH')
+            return ToolResult(
+                'aikido-adopt', 'skipped',
+                'aikido-doctor not found in trusted system PATH'
+            )
         staged = self._stage_adoption_cert()
         if staged is None:
             return ToolResult('aikido-adopt', 'skipped', 'Provider root certificate not materialized')
@@ -6024,8 +6069,11 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         if platform.system() != 'Darwin':
             self.print_info("  - Aikido adoption is macOS-only")
             return has_issues
-        if not shutil.which('aikido-doctor'):
-            self.print_info("  - aikido-doctor not found in PATH (agent predates certconfig adopt)")
+        if not self._find_aikido_doctor():
+            self.print_info(
+                "  - aikido-doctor not found in trusted system PATH "
+                "(agent predates certconfig adopt)"
+            )
             return has_issues
         if self._aikido_trusts_root(temp_warp_cert):
             self.print_info("  ✓ Provider root adopted into Aikido's CA bundles")

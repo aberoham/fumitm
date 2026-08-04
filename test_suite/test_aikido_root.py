@@ -797,13 +797,23 @@ DOCTOR = '/usr/local/bin/aikido-doctor'
 
 
 def _doctor_on_path(inst):
-    return patch('fumitm.shutil.which',
-                 side_effect=lambda c: DOCTOR if c == 'aikido-doctor' else None)
+    return patch.object(inst, '_find_aikido_doctor', return_value=DOCTOR)
 
 
 def _on_macos():
     """Adoption is gated to Darwin, so its tests must not depend on the host OS."""
     return patch('fumitm.platform.system', return_value='Darwin')
+
+
+class TestAikidoDoctorPathSafety(FumitmTestCase):
+    """The privileged adoption path must reject user-owned executables."""
+
+    def test_rejects_user_owned_executable(self, tmp_path):
+        doctor = tmp_path / 'aikido-doctor'
+        doctor.write_text('#!/bin/sh\n')
+        doctor.chmod(0o755)
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+        assert inst._trusted_system_executable(str(doctor)) is None
 
 
 def _adopts_on_run(tmp_path, returncode=0, seen=None):
