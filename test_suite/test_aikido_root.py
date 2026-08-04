@@ -793,14 +793,30 @@ def _patch_aikido_paths(tmp_path, adopted=False, store=True, bundle_has_root=Fal
     return patch.dict(fumitm.SUPPLEMENTAL_ROOTS['aikido'], overrides)
 
 
+DOCTOR = '/usr/local/bin/aikido-doctor'
+
+
 def _doctor_on_path(inst):
-    return patch.object(inst, 'command_exists',
-                        side_effect=lambda c: c == 'aikido-doctor')
+    return patch('fumitm.shutil.which',
+                 side_effect=lambda c: DOCTOR if c == 'aikido-doctor' else None)
 
 
-def _adopts_on_run(tmp_path, returncode=0):
-    """subprocess.run side effect that writes the adopted-CA files, as adopt does."""
+def _on_macos():
+    """Adoption is gated to Darwin, so its tests must not depend on the host OS."""
+    return patch('fumitm.platform.system', return_value='Darwin')
+
+
+def _adopts_on_run(tmp_path, returncode=0, seen=None):
+    """subprocess.run side effect that writes the adopted-CA files, as adopt does.
+
+    When a `seen` dict is supplied, records the argv and the content of the
+    certificate path handed to the doctor, read at invocation time — the staged
+    copy is deleted before the setup function returns.
+    """
     def run(argv, **kwargs):
+        if seen is not None:
+            seen['argv'] = argv
+            seen['cert_content'] = Path(argv[-1]).read_text()
         if returncode == 0:
             for fp in _fingerprints(mock_data.MOCK_CERTIFICATE):
                 (tmp_path / 'adopted-cas' / f'{fp}.pem').write_text(mock_data.MOCK_CERTIFICATE)
@@ -905,7 +921,8 @@ class TestAikidoAdoptGating(FumitmTestCase):
 
     def test_skipped_when_doctor_absent(self, tmp_path):
         inst = _adopt_instance(tmp_path)
-        with patch.object(inst, 'command_exists', return_value=False), \
+        with _on_macos(), \
+             patch('fumitm.shutil.which', return_value=None), \
              patch('fumitm.subprocess.run') as mock_run:
             result = inst.setup_aikido_adopt()
         assert result.status == 'skipped'
@@ -915,11 +932,22 @@ class TestAikidoAdoptGating(FumitmTestCase):
     def test_skipped_when_provider_root_missing(self, tmp_path):
         inst = _adopt_instance(tmp_path)
         inst.cert_path = str(tmp_path / 'nonexistent.pem')
-        with _doctor_on_path(inst), \
+        with _on_macos(), _doctor_on_path(inst), \
              patch('fumitm.subprocess.run') as mock_run:
             result = inst.setup_aikido_adopt()
         assert result.status == 'skipped'
         assert 'not materialized' in result.message
+        mock_run.assert_not_called()
+
+    def test_skipped_on_non_darwin(self, tmp_path):
+        # Aikido's adopted-CA record lives under /Library/Application Support,
+        # so adoption elsewhere could never be recognized as done.
+        inst = _adopt_instance(tmp_path)
+        with patch('fumitm.platform.system', return_value='Linux'), \
+             patch('fumitm.subprocess.run') as mock_run:
+            result = inst.setup_aikido_adopt()
+        assert result.status == 'skipped'
+        assert 'macOS-only' in result.message
         mock_run.assert_not_called()
 
 
@@ -928,7 +956,8 @@ class TestAikidoAdoptIdempotency(FumitmTestCase):
 
     def test_already_ok_when_adopted(self, tmp_path):
         inst = _adopt_instance(tmp_path)
-        with _doctor_on_path(inst), _patch_aikido_paths(tmp_path, adopted=True), \
+        with _on_macos(), _doctor_on_path(inst), \
+             _patch_aikido_paths(tmp_path, adopted=True), \
              patch('fumitm.subprocess.run') as mock_run:
             result = inst.setup_aikido_adopt()
         assert result.status == 'already_ok'
@@ -938,7 +967,7 @@ class TestAikidoAdoptIdempotency(FumitmTestCase):
         # Regression: a root present only because it is in the system trust
         # store must not be mistaken for one Aikido has adopted.
         inst = _adopt_instance(tmp_path)
-        with _doctor_on_path(inst), \
+        with _on_macos(), _doctor_on_path(inst), \
              _patch_aikido_paths(tmp_path, adopted=False, bundle_has_root=True), \
              patch('fumitm.os.getuid', return_value=0), \
              patch('fumitm.subprocess.run',
@@ -953,13 +982,15 @@ class TestAikidoAdoptDryRun(FumitmTestCase):
 
     def test_dry_run_prints_command_and_skips(self, tmp_path, capsys):
         inst = _adopt_instance(tmp_path, mode='status')
-        with _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
+        with _on_macos(), _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
              patch('fumitm.subprocess.run') as mock_run:
             result = inst.setup_aikido_adopt()
         assert result.status == 'skipped'
         assert result.message == 'Dry run'
         mock_run.assert_not_called()
-        assert f'aikido-doctor certconfig adopt {inst.cert_path}' in capsys.readouterr().out
+        # The printed command shows the durable cert path, not the staged copy,
+        # since that copy is gone by the time a user could run it.
+        assert f'{DOCTOR} certconfig adopt {inst.cert_path}' in capsys.readouterr().out
 
 
 class TestAikidoAdoptInvocation(FumitmTestCase):
@@ -967,31 +998,40 @@ class TestAikidoAdoptInvocation(FumitmTestCase):
 
     def test_root_runs_doctor_directly(self, tmp_path):
         inst = _adopt_instance(tmp_path)
-        with _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
+        seen = {}
+        with _on_macos(), _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
              patch('fumitm.os.getuid', return_value=0), \
              patch('fumitm.subprocess.run',
-                   side_effect=_adopts_on_run(tmp_path)) as mock_run:
+                   side_effect=_adopts_on_run(tmp_path, seen=seen)):
             result = inst.setup_aikido_adopt()
         assert result.status == 'configured'
-        assert mock_run.call_args[0][0] == [
-            'aikido-doctor', 'certconfig', 'adopt', inst.cert_path]
+        assert seen['argv'][:3] == [DOCTOR, 'certconfig', 'adopt']
+        # The doctor must read a staged private copy, never the user-writable
+        # cert path itself, so the file cannot be swapped between fumitm's
+        # checks and the privileged read.
+        staged = seen['argv'][3]
+        assert staged != inst.cert_path
+        assert seen['cert_content'] == mock_data.MOCK_CERTIFICATE
+        assert not Path(staged).exists()
 
     def test_non_root_uses_sudo_after_prompt(self, tmp_path):
         inst = _adopt_instance(tmp_path, auto_yes=True)
-        with _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
+        seen = {}
+        with _on_macos(), _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
              patch('fumitm.os.getuid', return_value=501), \
              patch('fumitm.sys.stdin') as mock_stdin, \
              patch('fumitm.subprocess.run',
-                   side_effect=_adopts_on_run(tmp_path)) as mock_run:
+                   side_effect=_adopts_on_run(tmp_path, seen=seen)):
             mock_stdin.isatty.return_value = True
             result = inst.setup_aikido_adopt()
         assert result.status == 'configured'
-        assert mock_run.call_args[0][0] == [
-            'sudo', 'aikido-doctor', 'certconfig', 'adopt', inst.cert_path]
+        assert seen['argv'][:4] == ['sudo', DOCTOR, 'certconfig', 'adopt']
+        assert seen['argv'][4] != inst.cert_path
+        assert seen['cert_content'] == mock_data.MOCK_CERTIFICATE
 
     def test_prompt_declined_skips(self, tmp_path):
         inst = _adopt_instance(tmp_path)
-        with _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
+        with _on_macos(), _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
              patch('fumitm.os.getuid', return_value=501), \
              patch('fumitm.sys.stdin') as mock_stdin, \
              patch.object(inst, '_prompt', return_value='n'), \
@@ -1008,7 +1048,7 @@ class TestAikidoAdoptNonInteractive(FumitmTestCase):
 
     def _run_non_interactive(self, tmp_path, capsys, **kwargs):
         inst = _adopt_instance(tmp_path, **kwargs)
-        with _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
+        with _on_macos(), _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
              patch('fumitm.os.getuid', return_value=501), \
              patch('fumitm.sys.stdin') as mock_stdin, \
              patch('fumitm.subprocess.run') as mock_run:
@@ -1021,7 +1061,7 @@ class TestAikidoAdoptNonInteractive(FumitmTestCase):
         result, out = self._run_non_interactive(tmp_path, capsys)
         assert result.status == 'skipped'
         assert 'Requires sudo' in result.message
-        assert 'sudo aikido-doctor certconfig adopt' in out
+        assert f'sudo {DOCTOR} certconfig adopt' in out
 
     def test_no_tty_with_yes_still_skips(self, tmp_path, capsys):
         # sudo would hang reading a password with no TTY, so --yes must not
@@ -1031,7 +1071,7 @@ class TestAikidoAdoptNonInteractive(FumitmTestCase):
 
     def test_headless_non_root_skips(self, tmp_path, capsys):
         inst = _adopt_instance(tmp_path, headless=True, auto_yes=True)
-        with _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
+        with _on_macos(), _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
              patch('fumitm.os.getuid', return_value=501), \
              patch('fumitm.subprocess.run') as mock_run:
             result = inst.setup_aikido_adopt()
@@ -1046,7 +1086,7 @@ class TestAikidoAdoptFailure(FumitmTestCase):
     def test_nonzero_exit_fails_with_stderr(self, tmp_path):
         inst = _adopt_instance(tmp_path)
         fail = MagicMock(returncode=1, stdout='', stderr='boom')
-        with _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
+        with _on_macos(), _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
              patch('fumitm.os.getuid', return_value=0), \
              patch('fumitm.subprocess.run', return_value=fail):
             result = inst.setup_aikido_adopt()
@@ -1055,7 +1095,7 @@ class TestAikidoAdoptFailure(FumitmTestCase):
 
     def test_oserror_fails(self, tmp_path):
         inst = _adopt_instance(tmp_path)
-        with _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
+        with _on_macos(), _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
              patch('fumitm.os.getuid', return_value=0), \
              patch('fumitm.subprocess.run',
                    side_effect=FileNotFoundError('no aikido-doctor')):
@@ -1068,7 +1108,7 @@ class TestAikidoAdoptFailure(FumitmTestCase):
         # real failure rather than a timing artefact.
         inst = _adopt_instance(tmp_path)
         ok = MagicMock(returncode=0, stdout='', stderr='')
-        with _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
+        with _on_macos(), _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
              patch('fumitm.os.getuid', return_value=0), \
              patch('fumitm.subprocess.run', return_value=ok):
             result = inst.setup_aikido_adopt()
@@ -1080,11 +1120,25 @@ class TestAikidoAdoptFailure(FumitmTestCase):
         # the exit code stands.
         inst = _adopt_instance(tmp_path)
         ok = MagicMock(returncode=0, stdout='', stderr='')
-        with _doctor_on_path(inst), _patch_aikido_paths(tmp_path, store=False), \
+        with _on_macos(), _doctor_on_path(inst), \
+             _patch_aikido_paths(tmp_path, store=False), \
              patch('fumitm.os.getuid', return_value=0), \
              patch('fumitm.subprocess.run', return_value=ok):
             result = inst.setup_aikido_adopt()
         assert result.status == 'configured'
+
+    def test_staged_copy_removed_after_failure(self, tmp_path):
+        # The staged private copy must not accumulate in the temp directory,
+        # whichever way the adoption ends.
+        inst = _adopt_instance(tmp_path)
+        seen = {}
+        with _on_macos(), _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
+             patch('fumitm.os.getuid', return_value=0), \
+             patch('fumitm.subprocess.run',
+                   side_effect=_adopts_on_run(tmp_path, returncode=1, seen=seen)):
+            result = inst.setup_aikido_adopt()
+        assert result.status == 'failed'
+        assert not Path(seen['argv'][-1]).exists()
 
 
 class TestAikidoAdoptStatus(FumitmTestCase):
@@ -1101,21 +1155,31 @@ class TestAikidoAdoptStatus(FumitmTestCase):
 
     def test_false_when_doctor_missing(self, tmp_path):
         inst = _adopt_instance(tmp_path, mode='status')
-        with patch.object(inst, 'command_exists', return_value=False):
+        with _on_macos(), patch('fumitm.shutil.which', return_value=None):
             assert inst.check_aikido_adopt_status(self._temp_cert(tmp_path)) is False
+
+    def test_false_on_non_darwin(self, tmp_path, capsys):
+        # Without a recognizable adoption record off macOS, status must not
+        # nag about a step --fix would only skip.
+        inst = _adopt_instance(tmp_path, mode='status')
+        with patch('fumitm.platform.system', return_value='Linux'):
+            assert inst.check_aikido_adopt_status(self._temp_cert(tmp_path)) is False
+        assert 'macOS-only' in capsys.readouterr().out
 
     def test_false_when_adopted(self, tmp_path):
         inst = _adopt_instance(tmp_path, mode='status')
-        with _doctor_on_path(inst), _patch_aikido_paths(tmp_path, adopted=True):
+        with _on_macos(), _doctor_on_path(inst), \
+             _patch_aikido_paths(tmp_path, adopted=True):
             assert inst.check_aikido_adopt_status(self._temp_cert(tmp_path)) is False
 
     def test_true_when_not_adopted(self, tmp_path):
         inst = _adopt_instance(tmp_path, mode='status')
-        with _doctor_on_path(inst), _patch_aikido_paths(tmp_path, adopted=False):
+        with _on_macos(), _doctor_on_path(inst), \
+             _patch_aikido_paths(tmp_path, adopted=False):
             assert inst.check_aikido_adopt_status(self._temp_cert(tmp_path)) is True
 
     def test_true_when_bundle_has_root_but_not_adopted(self, tmp_path):
         inst = _adopt_instance(tmp_path, mode='status')
-        with _doctor_on_path(inst), \
+        with _on_macos(), _doctor_on_path(inst), \
              _patch_aikido_paths(tmp_path, adopted=False, bundle_has_root=True):
             assert inst.check_aikido_adopt_status(self._temp_cert(tmp_path)) is True

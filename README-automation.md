@@ -33,7 +33,9 @@ When the agent ships the `aikido-doctor` CLI, `--fix` also adopts the primary
 provider root into Aikido's own combined bundle (tool key `aikido-adopt`). This
 needs root, so run fumitm as root (JAMF/launchd) for it to apply automatically;
 a non-root run without a TTY records the step as `skipped` and prints the `sudo`
-command instead, rather than exiting 2.
+command instead, rather than exiting 2. The adoption step is macOS-only —
+Aikido's adopted-CA record lives under `/Library/Application Support`, so on
+other platforms the step is skipped; the bundle inclusion above still applies.
 
 ## Exit Codes
 
@@ -97,7 +99,7 @@ Each tool in the registry has a scope that determines whether it runs without us
 
 | Scope | Tools | Why |
 |-------|-------|-----|
-| System | `brew-cacerts` | Reads/writes system paths, not `$HOME` |
+| System | `brew-cacerts`, `aikido-adopt` | Reads/writes system paths, not `$HOME` |
 | User | `node`, `python`, `gcloud`, `git`, `curl`, `java`, `jenv`, `gradle`, `dbeaver`, `wget`, `android` | Write to `$HOME` (shell configs, env vars, user bundles) |
 | Hybrid | `podman`, `rancher`, `colima` | Write to `~/.docker/certs.d/` and interact with user VMs |
 

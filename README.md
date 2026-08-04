@@ -115,7 +115,9 @@ git, ruby, curl, nix, bazel) around it. When that binary is on PATH, `--fix`
 runs it against the primary provider's root (tool key `aikido-adopt`) so the
 bundles Aikido env-injects trust the primary proxy too. It needs root: non-root
 runs ask for confirmation (`--yes` auto-confirms) and use `sudo`, and without a
-terminal they print the command to run manually instead.
+terminal they print the command to run manually instead. Adoption is macOS-only,
+since the adopted-CA record it is verified against lives under
+`/Library/Application Support`; bundle inclusion still works everywhere.
 
 Whether the root has been adopted is read from Aikido's own record of it,
 `EndpointProtection/run/adopted-cas/<sha256>.pem`, so repeat runs report

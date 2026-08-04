@@ -3207,6 +3207,30 @@ class FumitmPython:
             )
         return default
 
+    def _stage_adoption_cert(self):
+        """Copy the provider root into a private temp file for adoption.
+
+        The materialized root lives in a home directory the target user can
+        write, so handing that path to a root-level aikido-doctor invocation
+        would let that user swap the file between fumitm's checks and the
+        privileged read. The staged copy is created by mkstemp with 0600
+        permissions and owned by the invoking user, and every read in the
+        adoption flow — idempotency check, the doctor itself, post-run
+        verification — sees the same bytes. Returns None when the root is not
+        materialized or unreadable.
+        """
+        try:
+            with open(self.cert_path, 'rb') as f:
+                content = f.read()
+        except OSError:
+            return None
+        fd, staged = tempfile.mkstemp(prefix='fumitm-aikido-adopt-', suffix='.pem')
+        try:
+            os.write(fd, content)
+        finally:
+            os.close(fd)
+        return staged
+
     def setup_aikido_adopt(self):
         """Adopt the primary provider root into Aikido's own CA bundles.
 
@@ -3219,60 +3243,81 @@ class FumitmPython:
         """
         if not any(e['key'] == 'aikido' for e in self.extra_roots):
             return ToolResult('aikido-adopt', 'skipped', 'Aikido not active')
-        if not self.command_exists('aikido-doctor'):
+        if platform.system() != 'Darwin':
+            # Aikido's adopted-CA record lives under /Library/Application
+            # Support, so adoption elsewhere could never be recognized and
+            # every run would repeat it.
+            return ToolResult('aikido-adopt', 'skipped', 'Aikido adoption is macOS-only')
+        # Resolved to an absolute path because sudo's secure_path usually
+        # excludes user-local and Homebrew directories, so the bare name found
+        # on the invoking user's PATH may not resolve under sudo.
+        doctor = shutil.which('aikido-doctor')
+        if not doctor:
             return ToolResult('aikido-adopt', 'skipped', 'aikido-doctor not found in PATH')
-        if not os.path.exists(self.cert_path):
+        staged = self._stage_adoption_cert()
+        if staged is None:
             return ToolResult('aikido-adopt', 'skipped', 'Provider root certificate not materialized')
 
-        short = self.provider['short_name']
-        if self._aikido_trusts_root(self.cert_path):
-            self.print_info(f"  ✓ {short} root already adopted by Aikido")
-            return ToolResult('aikido-adopt', 'already_ok', 'Provider root already adopted by Aikido')
-
-        as_root = os.getuid() == 0
-        argv = ['aikido-doctor', 'certconfig', 'adopt', self.cert_path]
-        if not as_root:
-            argv = ['sudo'] + argv
-        command_str = ' '.join(argv)
-
-        if not self.is_install_mode():
-            self.print_action(f"Would run: {command_str}")
-            return ToolResult('aikido-adopt', 'skipped', 'Dry run')
-
-        if not as_root:
-            # sudo reads its password from the TTY, so without one it would hang
-            # even under --yes. Hand the command over rather than let _prompt
-            # raise NonInteractiveError and abort the whole run with exit code 2.
-            if self.headless or not sys.stdin.isatty():
-                self.print_warn(f"Adopting the {short} root into Aikido's bundles requires sudo")
-                self.print_action(f"Run manually: {command_str}")
-                return ToolResult('aikido-adopt', 'skipped', 'Requires sudo; run manually')
-            response = self._prompt(
-                f"Run 'sudo aikido-doctor certconfig adopt' to add the {short} "
-                "root to Aikido's CA bundles? (Y/n) ")
-            if response.lower() == 'n':
-                return ToolResult('aikido-adopt', 'skipped', 'Declined by user')
-
-        self.print_status(f"Running: {command_str}")
         try:
-            result = subprocess.run(argv, capture_output=True, text=True,
-                                    check=False, timeout=300)
-        except (subprocess.TimeoutExpired, OSError) as e:
-            self.print_error(f"aikido-doctor failed to run: {e}")
-            return ToolResult('aikido-adopt', 'failed', f'aikido-doctor failed to run: {e}')
+            short = self.provider['short_name']
+            if self._aikido_trusts_root(staged):
+                self.print_info(f"  ✓ {short} root already adopted by Aikido")
+                return ToolResult('aikido-adopt', 'already_ok',
+                                  'Provider root already adopted by Aikido')
 
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout or '').strip()
-            message = f'aikido-doctor exited {result.returncode}: {detail[:200]}'
-            self.print_error(message)
-            return ToolResult('aikido-adopt', 'failed', message)
+            as_root = os.getuid() == 0
+            argv = [doctor, 'certconfig', 'adopt', staged]
+            if not as_root:
+                argv = ['sudo'] + argv
+            # Messages reference the durable cert path, not the staged copy,
+            # which is gone by the time a user could rerun the command.
+            command_str = ' '.join(
+                (['sudo'] if not as_root else []) + [doctor, 'certconfig', 'adopt', self.cert_path])
 
-        if self._aikido_has_adopted(self.cert_path) is False:
-            message = f'aikido-doctor exited 0 but did not adopt the {short} root'
-            self.print_error(message)
-            return ToolResult('aikido-adopt', 'failed', message)
-        self.print_info(f"  ✓ Adopted {short} root into Aikido's CA bundles")
-        return ToolResult('aikido-adopt', 'configured', 'Adopted provider root into Aikido CA bundles')
+            if not self.is_install_mode():
+                self.print_action(f"Would run: {command_str}")
+                return ToolResult('aikido-adopt', 'skipped', 'Dry run')
+
+            if not as_root:
+                # sudo reads its password from the TTY, so without one it would hang
+                # even under --yes. Hand the command over rather than let _prompt
+                # raise NonInteractiveError and abort the whole run with exit code 2.
+                if self.headless or not sys.stdin.isatty():
+                    self.print_warn(f"Adopting the {short} root into Aikido's bundles requires sudo")
+                    self.print_action(f"Run manually: {command_str}")
+                    return ToolResult('aikido-adopt', 'skipped', 'Requires sudo; run manually')
+                response = self._prompt(
+                    f"Run 'sudo aikido-doctor certconfig adopt' to add the {short} "
+                    "root to Aikido's CA bundles? (Y/n) ")
+                if response.lower() == 'n':
+                    return ToolResult('aikido-adopt', 'skipped', 'Declined by user')
+
+            self.print_status(f"Running: {command_str}")
+            try:
+                result = subprocess.run(argv, capture_output=True, text=True,
+                                        check=False, timeout=300)
+            except (subprocess.TimeoutExpired, OSError) as e:
+                self.print_error(f"aikido-doctor failed to run: {e}")
+                return ToolResult('aikido-adopt', 'failed', f'aikido-doctor failed to run: {e}')
+
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or '').strip()
+                message = f'aikido-doctor exited {result.returncode}: {detail[:200]}'
+                self.print_error(message)
+                return ToolResult('aikido-adopt', 'failed', message)
+
+            if self._aikido_has_adopted(staged) is False:
+                message = f'aikido-doctor exited 0 but did not adopt the {short} root'
+                self.print_error(message)
+                return ToolResult('aikido-adopt', 'failed', message)
+            self.print_info(f"  ✓ Adopted {short} root into Aikido's CA bundles")
+            return ToolResult('aikido-adopt', 'configured',
+                              'Adopted provider root into Aikido CA bundles')
+        finally:
+            try:
+                os.unlink(staged)
+            except OSError:
+                pass
 
     def setup_brew_cacerts(self):
         """Regenerate Homebrew's ca-certificates bundle to include the proxy CA.
@@ -5976,7 +6021,10 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         if not any(e['key'] == 'aikido' for e in self.extra_roots):
             self.print_info("  - Aikido not active")
             return has_issues
-        if not self.command_exists('aikido-doctor'):
+        if platform.system() != 'Darwin':
+            self.print_info("  - Aikido adoption is macOS-only")
+            return has_issues
+        if not shutil.which('aikido-doctor'):
             self.print_info("  - aikido-doctor not found in PATH (agent predates certconfig adopt)")
             return has_issues
         if self._aikido_trusts_root(temp_warp_cert):
