@@ -3462,10 +3462,101 @@ class TestBareReturnsFixed(FumitmTestCase):
         instance = self.create_fumitm_instance(mode='install')
         with patch.object(instance, 'command_exists', return_value=True), \
              patch.object(instance, 'find_java_cacerts', return_value='/fake/cacerts'), \
+             patch.object(instance, 'ensure_gradle_custom_truststore',
+                          return_value='already_ok'), \
              patch.object(instance, 'update_properties_file', return_value=False):
             result = instance.setup_gradle_cert()
             assert result.status == 'already_ok'
             assert result.tool == 'gradle'
+
+    def test_gradle_rewrites_duplicate_override_block_to_single_custom_store(self, tmp_path):
+        """setup_gradle_cert removes duplicate trustStore keys and writes one final block."""
+        instance = self.create_fumitm_instance(mode='install')
+        gradle_props = tmp_path / 'gradle.properties'
+        gradle_props.write_text(
+            'systemProp.javax.net.ssl.trustStore=/old/jdk/cacerts\n'
+            'systemProp.javax.net.ssl.trustStorePassword=changeit\n'
+            'systemProp.https.protocols=TLSv1.2\n'
+            '# aikido-endpoint-java-gradle-cert-config-start\n'
+            'systemProp.javax.net.ssl.trustStore=/vendor/custom-cacerts\n'
+            'systemProp.javax.net.ssl.trustStorePassword=changeit\n'
+            'systemProp.javax.net.ssl.trustStoreType=PKCS12\n'
+            '# aikido-endpoint-java-gradle-cert-config-end\n'
+        )
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'find_java_cacerts', return_value='/fake/cacerts'), \
+             patch.object(instance, 'get_gradle_properties_path',
+                          return_value=str(gradle_props)), \
+             patch.object(instance, 'get_gradle_custom_cacerts_path',
+                          return_value='/Users/test/.gradle/custom-cacerts'), \
+             patch.object(instance, 'ensure_gradle_custom_truststore',
+                          return_value='already_ok'):
+            result = instance.setup_gradle_cert()
+
+        assert result.status == 'configured'
+        content = gradle_props.read_text()
+        assert content.count('systemProp.javax.net.ssl.trustStore=') == 1
+        assert content.count('systemProp.javax.net.ssl.trustStorePassword=') == 1
+        assert content.count('systemProp.javax.net.ssl.trustStoreType=') == 1
+        assert content.splitlines()[-4:] == [
+            'systemProp.javax.net.ssl.trustStore=/Users/test/.gradle/custom-cacerts',
+            'systemProp.javax.net.ssl.trustStorePassword=changeit',
+            'systemProp.javax.net.ssl.trustStoreType=PKCS12',
+            'systemProp.https.protocols=TLSv1.2',
+        ]
+
+    def test_gradle_custom_truststore_rebuild_imports_each_proxy_cert(self, tmp_path):
+        """ensure_gradle_custom_truststore rebuilds PKCS12 and imports each proxy cert."""
+        instance = self.create_fumitm_instance(mode='install')
+        source_cacerts = tmp_path / 'cacerts'
+        source_cacerts.write_text('placeholder')
+        gradle_cacerts = tmp_path / 'custom-cacerts'
+        netskope_chain = tmp_path / 'netskope-chain.pem'
+        netskope_chain.write_text(
+            mock_data.MOCK_CERTIFICATE + '\n' + mock_data.MOCK_AIKIDO_ROOT_CERT
+        )
+        aikido_root = tmp_path / 'aikido-root.pem'
+        aikido_root.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
+
+        instance.cert_path = str(netskope_chain)
+        instance.extra_roots = [{
+            'key': 'aikido',
+            'name': 'Aikido Endpoint Protection',
+            'short_name': 'Aikido',
+            'keytool_alias': 'aikido-root',
+            'container_cert_name': 'aikido',
+            'path': str(aikido_root),
+        }]
+
+        def run_side_effect(cmd, **kwargs):
+            result = MagicMock(returncode=0, stdout='', stderr='')
+            if cmd[:2] == ['keytool', '-list']:
+                result.returncode = 1
+                result.stdout = b''
+            elif cmd[:2] == ['keytool', '-importkeystore']:
+                Path(cmd[cmd.index('-destkeystore') + 1]).write_text('seeded')
+            return result
+
+        with patch.object(instance, '_detect_keystore_type', return_value='JKS'), \
+             patch('subprocess.run', side_effect=run_side_effect) as mock_run:
+            result = instance.ensure_gradle_custom_truststore(
+                str(source_cacerts), str(gradle_cacerts)
+            )
+
+        assert result == 'configured'
+        commands = [call.args[0] for call in mock_run.call_args_list]
+        assert any(cmd[:2] == ['keytool', '-importkeystore'] for cmd in commands)
+        imported_aliases = [
+            cmd[cmd.index('-alias') + 1]
+            for cmd in commands
+            if cmd[:2] == ['keytool', '-import']
+        ]
+        assert imported_aliases == [
+            'cloudflare-zerotrust',
+            'cloudflare-zerotrust-2',
+            'aikido-root',
+        ]
 
 
 class TestAwsVerification(FumitmTestCase):

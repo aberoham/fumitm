@@ -1867,6 +1867,11 @@ class FumitmPython:
         gradle_home = os.environ.get('GRADLE_USER_HOME', os.path.expanduser('~/.gradle'))
         return os.path.join(gradle_home, 'gradle.properties')
 
+    def get_gradle_custom_cacerts_path(self):
+        """Return the managed PKCS12 truststore path for Gradle."""
+        gradle_home = os.environ.get('GRADLE_USER_HOME', os.path.expanduser('~/.gradle'))
+        return os.path.join(gradle_home, 'custom-cacerts')
+
     def read_properties_file(self, path):
         """Read Java-style .properties file into a dict."""
         props = {}
@@ -1887,31 +1892,35 @@ class FumitmPython:
                 existing_lines = f.readlines()
 
         current_props = {}
+        key_counts = {key: 0 for key in props_to_set}
         for line in existing_lines:
             line = line.strip()
             if '=' in line and not line.startswith('#'):
                 key, val = line.split('=', 1)
                 current_props[key] = val
+                if key in key_counts:
+                    key_counts[key] += 1
 
-        if all(current_props.get(k) == v for k, v in props_to_set.items()):
+        if (all(current_props.get(k) == v for k, v in props_to_set.items())
+                and all(key_counts[key] == 1 for key in props_to_set)):
             return False
 
         self.print_info(f"Setting up {desc}...")
 
         updated_lines = []
-        remaining = props_to_set.copy()
+        managed_keys = set(props_to_set)
         for line in existing_lines:
             stripped = line.strip()
-            replaced = False
-            for key in list(remaining):
-                if stripped.startswith(key + '='):
-                    updated_lines.append(f"{key}={remaining.pop(key)}\n")
-                    replaced = True
-                    break
-            if not replaced:
-                updated_lines.append(line)
+            if any(stripped.startswith(key + '=') for key in managed_keys):
+                continue
+            updated_lines.append(line)
 
-        for key, value in remaining.items():
+        while updated_lines and updated_lines[-1].strip() == '':
+            updated_lines.pop()
+        if updated_lines:
+            updated_lines.append('\n')
+
+        for key, value in props_to_set.items():
             updated_lines.append(f"{key}={value}\n")
 
         if not self.is_install_mode():
@@ -2992,19 +3001,85 @@ class FumitmPython:
         )
         return pairs
 
-    def _keytool_alias_present(self, keytool_bin, keystore, alias):
-        """Return True if alias is already present in the Java keystore."""
+    def _split_pem_certificates(self, cert_path):
+        """Return each PEM certificate in cert_path as a standalone string."""
+        try:
+            with open(cert_path, 'r') as f:
+                content = f.read()
+        except OSError:
+            return []
+
+        certs = []
+        current = []
+        in_cert = False
+        for line in content.splitlines():
+            if '-----BEGIN CERTIFICATE-----' in line:
+                current = ['-----BEGIN CERTIFICATE-----']
+                in_cert = True
+                continue
+            if not in_cert:
+                continue
+            current.append(line)
+            if '-----END CERTIFICATE-----' in line:
+                certs.append('\n'.join(current) + '\n')
+                current = []
+                in_cert = False
+        return certs
+
+    def _expanded_root_aliases(self):
+        """Return per-certificate (alias, path) pairs, splitting PEM chains."""
+        pairs = []
+        temp_paths = []
+        for alias, cert_path in self._all_root_aliases():
+            certs = self._split_pem_certificates(cert_path)
+            if len(certs) <= 1:
+                pairs.append((alias, cert_path))
+                continue
+            for idx, cert_text in enumerate(certs, start=1):
+                with tempfile.NamedTemporaryFile(
+                        mode='w', suffix='.pem', delete=False) as tf:
+                    tf.write(cert_text)
+                    temp_path = tf.name
+                temp_paths.append(temp_path)
+                expanded_alias = alias if idx == 1 else f'{alias}-{idx}'
+                pairs.append((expanded_alias, temp_path))
+        return pairs, temp_paths
+
+    def _detect_keystore_type(self, keystore, storepass='changeit'):
+        """Return the keystore type reported by keytool, or an empty string."""
         try:
             result = subprocess.run(
-                [keytool_bin, '-list', '-alias', alias,
-                 '-keystore', keystore, '-storepass', 'changeit'],
+                ['keytool', '-list', '-keystore', keystore, '-storepass', storepass],
+                capture_output=True, text=True, check=False
+            )
+        except Exception as e:
+            self.print_debug(f"Could not detect keystore type for {keystore}: {e}")
+            return ''
+
+        if result.returncode != 0:
+            return ''
+        for line in result.stdout.splitlines():
+            if line.lower().startswith('keystore type:'):
+                return line.split(':', 1)[1].strip()
+        return ''
+
+    def _keytool_alias_present(self, keytool_bin, keystore, alias, storetype=None):
+        """Return True if alias is already present in the Java keystore."""
+        try:
+            cmd = [keytool_bin, '-list', '-alias', alias,
+                   '-keystore', keystore, '-storepass', 'changeit']
+            if storetype:
+                cmd.extend(['-storetype', storetype])
+            result = subprocess.run(
+                cmd,
                 capture_output=True, check=False
             )
-            return result.returncode == 0 and alias in result.stdout.decode()
+            stdout = result.stdout.decode() if isinstance(result.stdout, bytes) else result.stdout
+            return result.returncode == 0 and alias in stdout
         except Exception:
             return False
 
-    def _ensure_roots_in_keystore(self, keytool_bin, keystore, label):
+    def _ensure_roots_in_keystore(self, keytool_bin, keystore, label, storetype=None):
         """Import every proxy root (primary + supplemental) into a Java keystore.
 
         Each root is imported under its own alias and skipped when already
@@ -3014,38 +3089,131 @@ class FumitmPython:
         """
         imported = False
         failed = False
-        for alias, cert_path in self._all_root_aliases():
-            if self._keytool_alias_present(keytool_bin, keystore, alias):
-                continue
-            if not self.is_install_mode():
-                self.print_action(f"    Would import {alias} certificate to: {keystore}")
-                imported = True
-                continue
-            result = subprocess.run(
-                [keytool_bin, '-import', '-trustcacerts', '-alias', alias,
-                 '-file', cert_path, '-keystore', keystore, '-storepass', 'changeit',
-                 '-noprompt'],
-                capture_output=True, text=True, check=False
-            )
-            if result.returncode == 0:
-                self.print_info(f"    ✓ {label}: {alias} added successfully")
-                imported = True
-            else:
-                self.print_warn(f"    ✗ {label}: Failed to add {alias} (may require sudo)")
-                self.print_info("      Fix with:")
-                print(f"        sudo {keytool_bin} -import -trustcacerts \\")
-                print(f"          -alias {alias} \\")
-                print(f"          -file {cert_path} \\")
-                print(f"          -keystore {keystore} \\")
-                print("          -storepass changeit -noprompt")
-                if result.stdout:
-                    self.print_warn(f"      Keytool response: {result.stdout}")
-                failed = True
+        alias_pairs, temp_paths = self._expanded_root_aliases()
+        try:
+            for alias, cert_path in alias_pairs:
+                if self._keytool_alias_present(keytool_bin, keystore, alias, storetype=storetype):
+                    continue
+                if not self.is_install_mode():
+                    self.print_action(f"    Would import {alias} certificate to: {keystore}")
+                    imported = True
+                    continue
+                cmd = [keytool_bin, '-import', '-trustcacerts', '-alias', alias,
+                       '-file', cert_path, '-keystore', keystore, '-storepass', 'changeit']
+                if storetype:
+                    cmd.extend(['-storetype', storetype])
+                cmd.append('-noprompt')
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True, text=True, check=False
+                )
+                if result.returncode == 0:
+                    self.print_info(f"    ✓ {label}: {alias} added successfully")
+                    imported = True
+                else:
+                    self.print_warn(f"    ✗ {label}: Failed to add {alias} (may require sudo)")
+                    self.print_info("      Fix with:")
+                    print(f"        sudo {keytool_bin} -import -trustcacerts \\")
+                    print(f"          -alias {alias} \\")
+                    print(f"          -file {cert_path} \\")
+                    print(f"          -keystore {keystore} \\")
+                    if storetype:
+                        print(f"          -storetype {storetype} \\")
+                    print("          -storepass changeit -noprompt")
+                    if result.stdout:
+                        self.print_warn(f"      Keytool response: {result.stdout}")
+                    failed = True
+        finally:
+            for path in temp_paths:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
         if failed and not imported:
             return 'failed'
         if imported:
             return 'configured'
         return 'already_ok'
+
+    def _gradle_custom_truststore_has_roots(self, gradle_cacerts):
+        """Return True if the managed Gradle truststore contains every proxy CA."""
+        if not os.path.exists(gradle_cacerts):
+            return False
+        alias_pairs, temp_paths = self._expanded_root_aliases()
+        try:
+            return all(
+                self._keytool_alias_present(
+                    'keytool', gradle_cacerts, alias, storetype='PKCS12'
+                )
+                for alias, _ in alias_pairs
+            )
+        finally:
+            for path in temp_paths:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+    def ensure_gradle_custom_truststore(self, source_cacerts, gradle_cacerts):
+        """Ensure Gradle's managed PKCS12 truststore exists and contains proxy roots."""
+        if self._gradle_custom_truststore_has_roots(gradle_cacerts):
+            return 'already_ok'
+
+        if not self.is_install_mode():
+            self.print_action(
+                f"Would rebuild Gradle PKCS12 truststore at {gradle_cacerts} "
+                f"from {source_cacerts}"
+            )
+            return 'skipped'
+
+        source_type = self._detect_keystore_type(source_cacerts)
+        if not source_type:
+            self.print_error(f"Could not determine keystore type for {source_cacerts}")
+            return 'failed'
+
+        self._safe_makedirs(os.path.dirname(gradle_cacerts))
+        fd, temp_keystore = tempfile.mkstemp(
+            prefix='custom-cacerts-', suffix='.p12', dir=os.path.dirname(gradle_cacerts)
+        )
+        os.close(fd)
+        try:
+            os.unlink(temp_keystore)
+        except OSError:
+            pass
+
+        try:
+            result = subprocess.run(
+                ['keytool', '-importkeystore', '-noprompt',
+                 '-srckeystore', source_cacerts, '-srcstorepass', 'changeit',
+                 '-srcstoretype', source_type,
+                 '-destkeystore', temp_keystore, '-deststorepass', 'changeit',
+                 '-deststoretype', 'PKCS12'],
+                capture_output=True, text=True, check=False
+            )
+            if result.returncode != 0:
+                self.print_error("Failed to seed Gradle custom truststore from Java cacerts")
+                if result.stdout:
+                    self.print_warn(result.stdout)
+                if result.stderr:
+                    self.print_warn(result.stderr)
+                return 'failed'
+
+            status = self._ensure_roots_in_keystore(
+                'keytool', temp_keystore, 'Gradle custom truststore', storetype='PKCS12'
+            )
+            if status == 'failed':
+                return 'failed'
+
+            shutil.move(temp_keystore, gradle_cacerts)
+            self._fix_ownership(gradle_cacerts)
+            self.print_info(f"Rebuilt Gradle custom truststore at {gradle_cacerts}")
+            return 'configured'
+        finally:
+            if os.path.exists(temp_keystore):
+                try:
+                    os.unlink(temp_keystore)
+                except OSError:
+                    pass
 
     def _all_container_certs(self):
         """Return (container_cert_name, cert_path) for the primary and each supplemental root."""
@@ -4766,17 +4934,23 @@ class FumitmPython:
             self.print_error("Could not find Java cacerts file for Gradle")
             return ToolResult('gradle', 'skipped', 'Java cacerts file not found')
 
+        gradle_cacerts = self.get_gradle_custom_cacerts_path()
+        truststore_status = self.ensure_gradle_custom_truststore(cacerts, gradle_cacerts)
+        if truststore_status == 'failed':
+            return ToolResult('gradle', 'failed', 'Failed to rebuild Gradle custom truststore')
+
         props_to_set = {
-            'systemProp.javax.net.ssl.trustStore': cacerts,
+            'systemProp.javax.net.ssl.trustStore': gradle_cacerts,
             'systemProp.javax.net.ssl.trustStorePassword': 'changeit',
+            'systemProp.javax.net.ssl.trustStoreType': 'PKCS12',
             'systemProp.https.protocols': 'TLSv1.2'
         }
 
         changed = self.update_properties_file(gradle_props, props_to_set, "Gradle properties")
-        if not changed:
+        if not changed and truststore_status == 'already_ok':
             return ToolResult('gradle', 'already_ok', 'Gradle properties already configured')
         if self.is_install_mode():
-            return ToolResult('gradle', 'configured', 'Updated Gradle properties')
+            return ToolResult('gradle', 'configured', 'Configured Gradle custom truststore')
         return ToolResult('gradle', 'skipped', 'Dry run')
 
     def setup_dbeaver_cert(self):
@@ -6269,10 +6443,11 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         if self.command_exists('gradle') or os.path.exists(gradle_props):
             if os.path.exists(gradle_props):
                 current_props = self.read_properties_file(gradle_props)
-                cacerts = self.find_java_cacerts()
+                gradle_cacerts = self.get_gradle_custom_cacerts_path()
                 expected = {
-                    'systemProp.javax.net.ssl.trustStore': cacerts,
+                    'systemProp.javax.net.ssl.trustStore': gradle_cacerts,
                     'systemProp.javax.net.ssl.trustStorePassword': 'changeit',
+                    'systemProp.javax.net.ssl.trustStoreType': 'PKCS12',
                     'systemProp.https.protocols': 'TLSv1.2'
                 }
 
@@ -6283,6 +6458,11 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     else:
                         self.print_warn(f"  ✗ {key} not set correctly in Gradle properties")
                         has_issues = True
+                if self._gradle_custom_truststore_has_roots(gradle_cacerts):
+                    self.print_info("  ✓ Gradle custom truststore contains current proxy root(s)")
+                else:
+                    self.print_warn("  ✗ Gradle custom truststore is missing current proxy root(s)")
+                    has_issues = True
             else:
                 self.print_warn("  ✗ Gradle properties file not found")
                 has_issues = True
