@@ -138,7 +138,7 @@ Something amiss or not quite right? Please post the full output of a run to an i
 - **Rancher Desktop**: installs certificate in `~/.docker/certs.d/` (persistent) and Rancher VM's trust store (if running)
 - **Colima**: installs certificate in `~/.docker/certs.d/` (persistent, applied on start) and Colima VM's trust store (if running)
 - **Android Emulator**: helps install certificate on running Android emulators
-- **Gradle**: sets `systemProp` entries in `gradle.properties` (respecting `GRADLE_USER_HOME`) for the provider certificate.
+- **Gradle**: rebuilds `~/.gradle/custom-cacerts` (respecting `GRADLE_USER_HOME`) as a PKCS12 truststore seeded from the active Java `cacerts`, imports the current proxy CA chain, and points `gradle.properties` at that managed store.
  
 ### Windows
 - **Node.js/npm**: configures `NODE_EXTRA_CA_CERTS` for Node.js and the cafile setting for npm
