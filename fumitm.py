@@ -1893,12 +1893,19 @@ class FumitmPython:
 
         current_props = {}
         key_counts = {key: 0 for key in props_to_set}
-        for line in existing_lines:
-            line = line.strip()
+        in_vendor_block = False
+        for raw_line in existing_lines:
+            line = raw_line.strip()
+            if line.startswith('#') and line.endswith('-start'):
+                in_vendor_block = True
+                continue
+            if line.startswith('#') and line.endswith('-end'):
+                in_vendor_block = False
+                continue
             if '=' in line and not line.startswith('#'):
                 key, val = line.split('=', 1)
                 current_props[key] = val
-                if key in key_counts:
+                if key in key_counts and not in_vendor_block:
                     key_counts[key] += 1
 
         if (all(current_props.get(k) == v for k, v in props_to_set.items())
@@ -1909,9 +1916,19 @@ class FumitmPython:
 
         updated_lines = []
         managed_keys = set(props_to_set)
+        in_vendor_block = False
         for line in existing_lines:
             stripped = line.strip()
-            if any(stripped.startswith(key + '=') for key in managed_keys):
+            if stripped.startswith('#') and stripped.endswith('-start'):
+                in_vendor_block = True
+                updated_lines.append(line)
+                continue
+            if stripped.startswith('#') and stripped.endswith('-end'):
+                in_vendor_block = False
+                updated_lines.append(line)
+                continue
+            if (not in_vendor_block
+                    and any(stripped.startswith(key + '=') for key in managed_keys)):
                 continue
             updated_lines.append(line)
 
@@ -3026,11 +3043,26 @@ class FumitmPython:
                 in_cert = False
         return certs
 
-    def _expanded_root_aliases(self):
-        """Return per-certificate (alias, path) pairs, splitting PEM chains."""
+    def _expanded_alias_names(self, alias_pairs):
+        """Return the alias names that a split PEM chain would import under."""
+        names = []
+        for alias, cert_path in alias_pairs:
+            certs = self._split_pem_certificates(cert_path)
+            if len(certs) <= 1:
+                names.append(alias)
+                continue
+            for idx, _ in enumerate(certs, start=1):
+                names.append(alias if idx == 1 else f'{alias}-{idx}')
+        return names
+
+    def _materialize_alias_pairs(self, alias_pairs, split_chains=False):
+        """Return importable (alias, path) pairs and temp files for PEM chains."""
+        if not split_chains:
+            return alias_pairs, []
+
         pairs = []
         temp_paths = []
-        for alias, cert_path in self._all_root_aliases():
+        for alias, cert_path in alias_pairs:
             certs = self._split_pem_certificates(cert_path)
             if len(certs) <= 1:
                 pairs.append((alias, cert_path))
@@ -3079,7 +3111,8 @@ class FumitmPython:
         except Exception:
             return False
 
-    def _ensure_roots_in_keystore(self, keytool_bin, keystore, label, storetype=None):
+    def _ensure_roots_in_keystore(self, keytool_bin, keystore, label, storetype=None,
+                                  alias_pairs=None, split_chains=False):
         """Import every proxy root (primary + supplemental) into a Java keystore.
 
         Each root is imported under its own alias and skipped when already
@@ -3089,7 +3122,10 @@ class FumitmPython:
         """
         imported = False
         failed = False
-        alias_pairs, temp_paths = self._expanded_root_aliases()
+        alias_pairs = alias_pairs if alias_pairs is not None else self._all_root_aliases()
+        alias_pairs, temp_paths = self._materialize_alias_pairs(
+            alias_pairs, split_chains=split_chains
+        )
         try:
             for alias, cert_path in alias_pairs:
                 if self._keytool_alias_present(keytool_bin, keystore, alias, storetype=storetype):
@@ -3139,20 +3175,13 @@ class FumitmPython:
         """Return True if the managed Gradle truststore contains every proxy CA."""
         if not os.path.exists(gradle_cacerts):
             return False
-        alias_pairs, temp_paths = self._expanded_root_aliases()
-        try:
-            return all(
-                self._keytool_alias_present(
-                    'keytool', gradle_cacerts, alias, storetype='PKCS12'
-                )
-                for alias, _ in alias_pairs
+        alias_names = self._expanded_alias_names(self._all_root_aliases())
+        return all(
+            self._keytool_alias_present(
+                'keytool', gradle_cacerts, alias, storetype='PKCS12'
             )
-        finally:
-            for path in temp_paths:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+            for alias in alias_names
+        )
 
     def ensure_gradle_custom_truststore(self, source_cacerts, gradle_cacerts):
         """Ensure Gradle's managed PKCS12 truststore exists and contains proxy roots."""
@@ -3199,7 +3228,8 @@ class FumitmPython:
                 return 'failed'
 
             status = self._ensure_roots_in_keystore(
-                'keytool', temp_keystore, 'Gradle custom truststore', storetype='PKCS12'
+                'keytool', temp_keystore, 'Gradle custom truststore',
+                storetype='PKCS12', split_chains=True
             )
             if status == 'failed':
                 return 'failed'
