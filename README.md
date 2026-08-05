@@ -141,7 +141,7 @@ Something amiss or not quite right? Please post the full output of a run to an i
 
 ### Linux/macOS
 `./fumitm.py --list-tools` currently reports these Linux/macOS tool keys:
-`aikido-adopt`, `brew-cacerts`, `node`, `python`, `gcloud`, `java`, `jenv`, `gradle`, `dbeaver`, `wget`, `podman`, `rancher`, `android`, `colima`, `git`, `curl`, `aws`.
+`aikido-adopt`, `brew-cacerts`, `node`, `python`, `gcloud`, `java`, `jenv`, `gradle`, `dbeaver`, `docker`, `wget`, `podman`, `rancher`, `android`, `colima`, `git`, `curl`, `aws`.
 
 - **Homebrew CA Certificates (`brew-cacerts`)**: configures Homebrew's CA bundle (covers Homebrew OpenSSL consumers)
 - **Node.js/npm**: configures `NODE_EXTRA_CA_CERTS` for Node.js and the cafile setting for npm

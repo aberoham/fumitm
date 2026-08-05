@@ -58,7 +58,9 @@ The project has a pytest-based test suite in `test_suite/`:
 ```bash
 # Run all tests
 cd test_suite
-uvx pytest test_fumitm_integration.py test_netskope_provider.py test_suspicious_bundles.py test_headless_mdm.py -v
+uvx pytest test_fumitm_integration.py test_netskope_provider.py \
+  test_suspicious_bundles.py test_headless_mdm.py test_curlrc.py \
+  test_aikido_root.py -v
 
 # Run specific test files or classes
 uvx pytest test_fumitm_integration.py::TestStatusFunctionContracts -v
@@ -105,6 +107,14 @@ Key test categories in `test_headless_mdm.py`:
 - **TestUserScopeGating**: User-scoped tools skipped without user context
 - **TestSudoHelperUpdates**: Updated sudo helpers use `_target_uid`
 
+Key test categories in `test_aikido_root.py`:
+- **TestAikidoDetection / TestAikidoCnFilter / TestAikidoRootExtraction**: Aikido discovery and root/intermediate selection
+- **TestAikidoBundleAssembly / TestAikidoIdempotency / TestAikidoAbsentNoOp / TestVendorInjectedBundle**: additive bundle behavior and vendor-bundle boundaries
+- **TestAikidoResolution / TestAikidoForcedSources / TestAikidoContainerStatus / TestAikidoBrewPostinstall**: source selection and tool-specific integration
+- **TestAikidoPythonTrustVars / TestAikidoGcloudReauthTrust / TestAikidoWget / TestAikidoCertFileExpansion / TestMultiRootMatching**: downstream trust configuration and multi-root matching
+- **TestAikidoDoctorPathSafety / TestCertFingerprints / TestAikidoAdoptionState**: trusted doctor resolution and exact adopted-CA state
+- **TestAikidoAdoptRegistry / TestAikidoAdoptGating / TestAikidoAdoptIdempotency / TestAikidoAdoptDryRun / TestAikidoAdoptInvocation / TestAikidoAdoptNonInteractive / TestAikidoAdoptFailure / TestAikidoAdoptStatus**: adoption workflow, failure handling, and status contracts
+
 ## Architecture Overview
 
 The script follows a modular architecture with these key components:
@@ -120,7 +130,7 @@ The script follows a modular architecture with these key components:
    - **WARP**: Downloads certificate from `warp-cli certs`, stores at `~/.cloudflare-ca.pem`
    - **Netskope**: Reads from known file paths (`nscacert_combined.pem` preferred over `nscacert.pem`), with macOS keychain fallback extracting root (`-c "certadmin"`) and intermediate (`-c "goskope"`) CAs. Stores at `~/.netskope-ca.pem`. Detects encrypted `.enc` certs and directs users to `--cert-file`.
    - Checks for updates and certificate validity
-   - **Aikido supplemental root** (`SUPPLEMENTAL_ROOTS` dict): auto-detected and added to every managed bundle alongside the primary provider root (`--with-aikido`/`--no-aikido`/`--aikido-cert`). The `aikido-adopt` registry tool is the forward path (macOS-only — Aikido's adoption record lives under `/Library/Application Support`, so elsewhere the step is skipped): on agents shipping the `aikido-doctor` CLI it runs `[sudo] aikido-doctor certconfig adopt <staged-root>`, with the doctor resolved to an absolute path via `shutil.which` (sudo secure_path may not carry the user's PATH) and the provider root staged into a private mkstemp copy (`_stage_adoption_cert`) so the user-writable cert file cannot be swapped between fumitm's checks and the privileged read, so Aikido's own CA bundles trust the primary provider. Adoption is detected via Aikido's `adopted-cas/<sha256>.pem` record (`_aikido_has_adopted`), not by looking inside its bundles — those are built from the system trust store and so already contain any keychain-installed root, which would make the bundle check falsely report success. `_aikido_trusts_root` falls back to the bundle only when no such record directory exists. The env-var reclaim, curlrc-override fix, and stub-last shell machinery remain as defense-in-depth for hosts where adopt hasn't run.
+   - **Aikido supplemental root** (`SUPPLEMENTAL_ROOTS` dict): auto-detected and added to every managed bundle alongside the primary provider root (`--with-aikido`/`--no-aikido`/`--aikido-cert`). The `aikido-adopt` registry tool is the forward path (macOS-only — Aikido's adoption record lives under `/Library/Application Support`, so elsewhere the step is skipped): on agents shipping the `aikido-doctor` CLI it runs `[sudo] aikido-doctor certconfig adopt <staged-root>`, with the doctor resolved to an absolute path through a root-owned, non-writable PATH check (sudo secure_path may not carry the user's PATH) and the provider root staged into a private mkstemp copy (`_stage_adoption_cert`) so the user-writable cert file cannot be swapped between fumitm's checks and the privileged read, so Aikido's own CA bundles trust the primary provider. Adoption is detected via Aikido's `adopted-cas/<sha256>.pem` record (`_aikido_has_adopted`), not by looking inside its bundles — those are built from the system trust store and so already contain any keychain-installed root, which would make the bundle check falsely report success. `_aikido_trusts_root` falls back to the bundle only when no such record directory exists. The env-var reclaim, curlrc-override fix, and stub-last shell machinery remain as defense-in-depth for hosts where adopt hasn't run.
 
 4. **Tool-Specific Setup Functions**:
    - Each supported tool has its own `setup_*_cert()` function

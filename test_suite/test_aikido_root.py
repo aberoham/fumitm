@@ -869,6 +869,19 @@ class TestCertFingerprints(FumitmTestCase):
         inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
         assert inst._cert_fingerprints(str(tmp_path / 'nope.pem')) == []
 
+    def test_invalid_certificate_block_logs_debug(self, tmp_path):
+        pem = tmp_path / 'invalid.pem'
+        pem.write_text(
+            '-----BEGIN CERTIFICATE-----\n'
+            'not-base64\n'
+            '-----END CERTIFICATE-----\n'
+        )
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+        with patch.object(inst, 'print_debug') as debug:
+            assert inst._cert_fingerprints(str(pem)) == []
+        debug.assert_called_once()
+        assert 'Could not fingerprint' in debug.call_args.args[0]
+
 
 class TestAikidoAdoptionState(FumitmTestCase):
     """The adopted-CA store is authoritative; the bundle is only a fallback."""
@@ -883,6 +896,30 @@ class TestAikidoAdoptionState(FumitmTestCase):
         inst = _adopt_instance(tmp_path)
         with _patch_aikido_paths(tmp_path, adopted=False):
             assert inst._aikido_has_adopted(inst.cert_path) is False
+
+    def test_not_adopted_when_store_has_only_one_of_two(self, tmp_path):
+        inst = _adopt_instance(tmp_path)
+        both = tmp_path / 'two-certs.pem'
+        both.write_text(
+            mock_data.MOCK_CERTIFICATE + '\n'
+            + mock_data.MOCK_AIKIDO_ROOT_CERT
+        )
+        inst.cert_path = str(both)
+        with _patch_aikido_paths(tmp_path, adopted=False):
+            fingerprints = _fingerprints(both.read_text())
+            (tmp_path / 'adopted-cas' / f'{fingerprints[0]}.pem').write_text(
+                mock_data.MOCK_CERTIFICATE
+            )
+            assert inst._aikido_has_adopted(inst.cert_path) is False
+
+    def test_empty_cert_is_not_reported_as_adopted(self, tmp_path):
+        inst = _adopt_instance(tmp_path)
+        empty = tmp_path / 'empty.pem'
+        empty.write_text('')
+        inst.cert_path = str(empty)
+        with _patch_aikido_paths(tmp_path, adopted=False):
+            assert inst._aikido_has_adopted(inst.cert_path) is None
+            assert inst._aikido_trusts_root(inst.cert_path) is False
 
     def test_bundle_presence_alone_is_not_adoption(self, tmp_path):
         # The bundles are built from the system trust store, so a keychain-
@@ -907,7 +944,7 @@ class TestAikidoAdoptRegistry(FumitmTestCase):
     def test_registry_entry_exists(self):
         inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
         entry = inst.tools_registry['aikido-adopt']
-        assert entry['name'] == 'Aikido Combined Bundle'
+        assert entry['name'] == 'Aikido CA Bundles'
         # 'system' scope: needs root, and must still run when root has no
         # user context (JAMF/MDM), unlike the user-scoped bundle tools.
         assert entry['scope'] == 'system'
@@ -1083,7 +1120,9 @@ class TestAikidoAdoptNonInteractive(FumitmTestCase):
         inst = _adopt_instance(tmp_path, headless=True, auto_yes=True)
         with _on_macos(), _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
              patch('fumitm.os.getuid', return_value=501), \
+             patch('fumitm.sys.stdin') as mock_stdin, \
              patch('fumitm.subprocess.run') as mock_run:
+            mock_stdin.isatty.return_value = True
             result = inst.setup_aikido_adopt()
         assert result.status == 'skipped'
         assert 'Requires sudo' in result.message
@@ -1112,6 +1151,21 @@ class TestAikidoAdoptFailure(FumitmTestCase):
             result = inst.setup_aikido_adopt()
         assert result.status == 'failed'
         assert 'no aikido-doctor' in result.message
+
+    def test_timeout_fails_and_preserves_timeout_guard(self, tmp_path):
+        import subprocess
+
+        inst = _adopt_instance(tmp_path)
+        with _on_macos(), _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
+             patch('fumitm.os.getuid', return_value=0), \
+             patch('fumitm.subprocess.run',
+                   side_effect=subprocess.TimeoutExpired(DOCTOR, timeout=300)) as mock_run:
+            result = inst.setup_aikido_adopt()
+        assert result.status == 'failed'
+        assert 'timed out' in result.message
+        assert mock_run.call_args.kwargs['timeout'] == 300
+        staged = mock_run.call_args.args[0][-1]
+        assert not Path(staged).exists()
 
     def test_clean_exit_without_adoption_fails(self, tmp_path):
         # The store is exact, so a clean exit that left nothing in it is a

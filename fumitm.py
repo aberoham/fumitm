@@ -342,11 +342,11 @@ class FumitmPython:
         # --run-as-user: 'system' tools run always, 'user' tools need $HOME.
         self.tools_registry = {
             'aikido-adopt': {
-                'name': 'Aikido Combined Bundle',
+                'name': 'Aikido CA Bundles',
                 'tags': ['aikido', 'aikido-adopt', 'aikido-doctor', 'certconfig'],
                 'setup_func': self.setup_aikido_adopt,
                 'check_func': self.check_aikido_adopt_status,
-                'description': "Aikido's own CA bundle (via aikido-doctor certconfig adopt)",
+                'description': "Aikido's own CA bundles (via aikido-doctor certconfig adopt)",
                 'scope': 'system',
             },
             'brew-cacerts': {
@@ -6061,7 +6061,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         return result
     
     def check_aikido_adopt_status(self, temp_warp_cert):
-        """Check whether Aikido's combined bundle contains the provider root."""
+        """Check whether Aikido has adopted the provider root."""
         has_issues = False
         if not any(e['key'] == 'aikido' for e in self.extra_roots):
             self.print_info("  - Aikido not active")

@@ -30,7 +30,7 @@ Aikido support targets macOS/Linux; the Windows port does not yet add the Aikido
 root.
 
 When the agent ships the `aikido-doctor` CLI, `--fix` also adopts the primary
-provider root into Aikido's own combined bundle (tool key `aikido-adopt`). This
+provider root into Aikido's own CA bundles (tool key `aikido-adopt`). This
 needs root, so run fumitm as root (JAMF/launchd) for it to apply automatically;
 a non-root run without a TTY records the step as `skipped` and prints the `sudo`
 command instead, rather than exiting 2. The adoption step is macOS-only —
@@ -101,7 +101,7 @@ Each tool in the registry has a scope that determines whether it runs without us
 |-------|-------|-----|
 | System | `brew-cacerts`, `aikido-adopt` | Reads/writes system paths, not `$HOME` |
 | User | `node`, `python`, `gcloud`, `git`, `curl`, `java`, `jenv`, `gradle`, `dbeaver`, `wget`, `android` | Write to `$HOME` (shell configs, env vars, user bundles) |
-| Hybrid | `podman`, `rancher`, `colima` | Write to `~/.docker/certs.d/` and interact with user VMs |
+| Hybrid | `podman`, `rancher`, `colima`, `docker` | Write to `~/.docker/certs.d/` and interact with user VMs |
 
 When running as root without `--run-as-user` and without `SUDO_USER`, user-scoped and hybrid-scoped tools are skipped with a warning. System-scoped tools (cert download, detection, brew-cacerts) still run.
 
