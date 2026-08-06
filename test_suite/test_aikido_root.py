@@ -745,3 +745,505 @@ class TestMultiRootMatching(FumitmTestCase):
         empty = tmp_path / 'empty.pem'
         empty.write_text('')
         assert inst.certificate_likely_exists_in_file(str(single), str(empty)) is False
+
+
+def _fingerprints(pem_text):
+    """SHA-256 of each cert's DER body — how Aikido names adopted-CA files."""
+    import base64
+    import hashlib
+    out = []
+    for block in pem_text.split('-----END CERTIFICATE-----'):
+        if '-----BEGIN CERTIFICATE-----' not in block:
+            continue
+        body = ''.join(block.split('-----BEGIN CERTIFICATE-----')[1].split())
+        out.append(hashlib.sha256(base64.b64decode(body)).hexdigest())
+    return out
+
+
+def _adopt_instance(tmp_path, mode='install', **kwargs):
+    """WARP instance with Aikido active and the provider root materialized."""
+    inst = FumitmTestCase.create_fumitm_instance(provider='warp', mode=mode, **kwargs)
+    primary = tmp_path / 'primary.pem'
+    primary.write_text(mock_data.MOCK_CERTIFICATE)
+    inst.cert_path = str(primary)
+    inst.extra_roots = [{'key': 'aikido', 'short_name': 'Aikido'}]
+    return inst
+
+
+def _patch_aikido_paths(tmp_path, adopted=False, store=True, bundle_has_root=False):
+    """Point Aikido's adopted-CA store and combined bundle at test files.
+
+    store=False models an agent old enough to keep no adopted-CA directory, the
+    only case in which the weaker bundle check is consulted.
+    """
+    import fumitm
+    overrides = {}
+    store_dir = tmp_path / 'adopted-cas'
+    if store:
+        store_dir.mkdir(exist_ok=True)
+        if adopted:
+            for fp in _fingerprints(mock_data.MOCK_CERTIFICATE):
+                (store_dir / f'{fp}.pem').write_text(mock_data.MOCK_CERTIFICATE)
+    overrides['adopted_dir'] = str(store_dir)
+
+    combined = tmp_path / 'combined.pem'
+    combined.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT
+                        + ('\n' + mock_data.MOCK_CERTIFICATE if bundle_has_root else ''))
+    overrides['combined_pem'] = str(combined)
+    return patch.dict(fumitm.SUPPLEMENTAL_ROOTS['aikido'], overrides)
+
+
+DOCTOR = '/usr/local/bin/aikido-doctor'
+
+
+def _doctor_on_path(inst):
+    return patch.object(inst, '_find_aikido_doctor', return_value=DOCTOR)
+
+
+def _on_macos():
+    """Adoption is gated to Darwin, so its tests must not depend on the host OS."""
+    return patch('fumitm.platform.system', return_value='Darwin')
+
+
+class TestAikidoDoctorPathSafety(FumitmTestCase):
+    """The privileged adoption path must reject user-owned executables."""
+
+    def test_rejects_user_owned_executable(self, tmp_path):
+        doctor = tmp_path / 'aikido-doctor'
+        doctor.write_text('#!/bin/sh\n')
+        doctor.chmod(0o755)
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+        assert inst._trusted_system_executable(str(doctor)) is None
+
+
+def _adopts_on_run(tmp_path, returncode=0, seen=None):
+    """subprocess.run side effect that writes the adopted-CA files, as adopt does.
+
+    When a `seen` dict is supplied, records the argv and the content of the
+    certificate path handed to the doctor, read at invocation time — the staged
+    copy is deleted before the setup function returns.
+    """
+    def run(argv, **kwargs):
+        if seen is not None:
+            seen['argv'] = argv
+            seen['cert_content'] = Path(argv[-1]).read_text()
+        if returncode == 0:
+            for fp in _fingerprints(mock_data.MOCK_CERTIFICATE):
+                (tmp_path / 'adopted-cas' / f'{fp}.pem').write_text(mock_data.MOCK_CERTIFICATE)
+        return MagicMock(returncode=returncode, stdout='', stderr='')
+    return run
+
+
+class TestCertFingerprints(FumitmTestCase):
+    """_cert_fingerprints matches openssl, per certificate in a bundle."""
+
+    def test_matches_openssl(self, tmp_path):
+        # Cross-check against openssl on a real certificate: the mock PEMs are
+        # not DER-valid, and this is what pins the digest to the value Aikido
+        # names its adopted-CA files with.
+        import subprocess
+        pem = tmp_path / 'cert.pem'
+        subprocess.run(
+            ['openssl', 'req', '-x509', '-newkey', 'ec',
+             '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes',
+             '-keyout', str(tmp_path / 'key.pem'), '-out', str(pem),
+             '-days', '1', '-subj', '/CN=fumitm-test'],
+            capture_output=True, check=True,
+        )
+        expected = subprocess.run(
+            ['openssl', 'x509', '-in', str(pem), '-noout', '-fingerprint', '-sha256'],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip().split('=')[1].replace(':', '').lower()
+
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+        assert inst._cert_fingerprints(str(pem)) == [expected]
+
+    def test_one_per_certificate(self, tmp_path):
+        pem = tmp_path / 'two.pem'
+        pem.write_text(mock_data.MOCK_CERTIFICATE + '\n' + mock_data.MOCK_AIKIDO_ROOT_CERT)
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+        fps = inst._cert_fingerprints(str(pem))
+        assert len(fps) == 2 and len(set(fps)) == 2
+
+    def test_missing_file_is_empty(self, tmp_path):
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+        assert inst._cert_fingerprints(str(tmp_path / 'nope.pem')) == []
+
+    def test_invalid_certificate_block_logs_debug(self, tmp_path):
+        pem = tmp_path / 'invalid.pem'
+        pem.write_text(
+            '-----BEGIN CERTIFICATE-----\n'
+            'not-base64\n'
+            '-----END CERTIFICATE-----\n'
+        )
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+        with patch.object(inst, 'print_debug') as debug:
+            assert inst._cert_fingerprints(str(pem)) == []
+        debug.assert_called_once()
+        assert 'Could not fingerprint' in debug.call_args.args[0]
+
+
+class TestAikidoAdoptionState(FumitmTestCase):
+    """The adopted-CA store is authoritative; the bundle is only a fallback."""
+
+    def test_adopted_when_every_fingerprint_present(self, tmp_path):
+        inst = _adopt_instance(tmp_path)
+        with _patch_aikido_paths(tmp_path, adopted=True):
+            assert inst._aikido_has_adopted(inst.cert_path) is True
+            assert inst._aikido_trusts_root(inst.cert_path) is True
+
+    def test_not_adopted_when_store_lacks_fingerprint(self, tmp_path):
+        inst = _adopt_instance(tmp_path)
+        with _patch_aikido_paths(tmp_path, adopted=False):
+            assert inst._aikido_has_adopted(inst.cert_path) is False
+
+    def test_not_adopted_when_store_has_only_one_of_two(self, tmp_path):
+        inst = _adopt_instance(tmp_path)
+        both = tmp_path / 'two-certs.pem'
+        both.write_text(
+            mock_data.MOCK_CERTIFICATE + '\n'
+            + mock_data.MOCK_AIKIDO_ROOT_CERT
+        )
+        inst.cert_path = str(both)
+        with _patch_aikido_paths(tmp_path, adopted=False):
+            fingerprints = _fingerprints(both.read_text())
+            (tmp_path / 'adopted-cas' / f'{fingerprints[0]}.pem').write_text(
+                mock_data.MOCK_CERTIFICATE
+            )
+            assert inst._aikido_has_adopted(inst.cert_path) is False
+
+    def test_empty_cert_is_not_reported_as_adopted(self, tmp_path):
+        inst = _adopt_instance(tmp_path)
+        empty = tmp_path / 'empty.pem'
+        empty.write_text('')
+        inst.cert_path = str(empty)
+        with _patch_aikido_paths(tmp_path, adopted=False):
+            assert inst._aikido_has_adopted(inst.cert_path) is None
+            assert inst._aikido_trusts_root(inst.cert_path) is False
+
+    def test_bundle_presence_alone_is_not_adoption(self, tmp_path):
+        # The bundles are built from the system trust store, so a keychain-
+        # installed root appears in them without anyone having adopted it.
+        inst = _adopt_instance(tmp_path)
+        with _patch_aikido_paths(tmp_path, adopted=False, bundle_has_root=True):
+            assert inst._aikido_has_adopted(inst.cert_path) is False
+            assert inst._aikido_trusts_root(inst.cert_path) is False
+
+    def test_falls_back_to_bundle_without_a_store(self, tmp_path):
+        inst = _adopt_instance(tmp_path)
+        with _patch_aikido_paths(tmp_path, store=False, bundle_has_root=True):
+            assert inst._aikido_has_adopted(inst.cert_path) is None
+            assert inst._aikido_trusts_root(inst.cert_path) is True
+        with _patch_aikido_paths(tmp_path, store=False, bundle_has_root=False):
+            assert inst._aikido_trusts_root(inst.cert_path) is False
+
+
+class TestAikidoAdoptRegistry(FumitmTestCase):
+    """The aikido-adopt tool is registered with the right shape."""
+
+    def test_registry_entry_exists(self):
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+        entry = inst.tools_registry['aikido-adopt']
+        assert entry['name'] == 'Aikido CA Bundles'
+        # 'system' scope: needs root, and must still run when root has no
+        # user context (JAMF/MDM), unlike the user-scoped bundle tools.
+        assert entry['scope'] == 'system'
+        assert entry['setup_func'] == inst.setup_aikido_adopt
+        assert entry['check_func'] == inst.check_aikido_adopt_status
+        assert 'aikido' in entry['tags']
+        assert 'aikido-adopt' in entry['tags']
+
+
+class TestAikidoAdoptGating(FumitmTestCase):
+    """setup_aikido_adopt skips cleanly when its preconditions are absent."""
+
+    def test_skipped_when_aikido_inactive(self):
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True,
+                                           mode='install')
+        with patch('fumitm.subprocess.run') as mock_run:
+            result = inst.setup_aikido_adopt()
+        assert result.status == 'skipped'
+        assert 'not active' in result.message
+        mock_run.assert_not_called()
+
+    def test_skipped_when_doctor_absent(self, tmp_path):
+        inst = _adopt_instance(tmp_path)
+        with _on_macos(), \
+             patch('fumitm.shutil.which', return_value=None), \
+             patch('fumitm.subprocess.run') as mock_run:
+            result = inst.setup_aikido_adopt()
+        assert result.status == 'skipped'
+        assert 'aikido-doctor not found' in result.message
+        mock_run.assert_not_called()
+
+    def test_skipped_when_provider_root_missing(self, tmp_path):
+        inst = _adopt_instance(tmp_path)
+        inst.cert_path = str(tmp_path / 'nonexistent.pem')
+        with _on_macos(), _doctor_on_path(inst), \
+             patch('fumitm.subprocess.run') as mock_run:
+            result = inst.setup_aikido_adopt()
+        assert result.status == 'skipped'
+        assert 'not materialized' in result.message
+        mock_run.assert_not_called()
+
+    def test_skipped_on_non_darwin(self, tmp_path):
+        # Aikido's adopted-CA record lives under /Library/Application Support,
+        # so adoption elsewhere could never be recognized as done.
+        inst = _adopt_instance(tmp_path)
+        with patch('fumitm.platform.system', return_value='Linux'), \
+             patch('fumitm.subprocess.run') as mock_run:
+            result = inst.setup_aikido_adopt()
+        assert result.status == 'skipped'
+        assert 'macOS-only' in result.message
+        mock_run.assert_not_called()
+
+
+class TestAikidoAdoptIdempotency(FumitmTestCase):
+    """Adopt is a no-op only when the store says the root is already adopted."""
+
+    def test_already_ok_when_adopted(self, tmp_path):
+        inst = _adopt_instance(tmp_path)
+        with _on_macos(), _doctor_on_path(inst), \
+             _patch_aikido_paths(tmp_path, adopted=True), \
+             patch('fumitm.subprocess.run') as mock_run:
+            result = inst.setup_aikido_adopt()
+        assert result.status == 'already_ok'
+        mock_run.assert_not_called()
+
+    def test_runs_adopt_when_bundle_has_root_but_store_does_not(self, tmp_path):
+        # Regression: a root present only because it is in the system trust
+        # store must not be mistaken for one Aikido has adopted.
+        inst = _adopt_instance(tmp_path)
+        with _on_macos(), _doctor_on_path(inst), \
+             _patch_aikido_paths(tmp_path, adopted=False, bundle_has_root=True), \
+             patch('fumitm.os.getuid', return_value=0), \
+             patch('fumitm.subprocess.run',
+                   side_effect=_adopts_on_run(tmp_path)) as mock_run:
+            result = inst.setup_aikido_adopt()
+        assert result.status == 'configured'
+        mock_run.assert_called_once()
+
+
+class TestAikidoAdoptDryRun(FumitmTestCase):
+    """Status mode reports the command it would run without executing it."""
+
+    def test_dry_run_prints_command_and_skips(self, tmp_path, capsys):
+        inst = _adopt_instance(tmp_path, mode='status')
+        with _on_macos(), _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
+             patch('fumitm.subprocess.run') as mock_run:
+            result = inst.setup_aikido_adopt()
+        assert result.status == 'skipped'
+        assert result.message == 'Dry run'
+        mock_run.assert_not_called()
+        # The printed command shows the durable cert path, not the staged copy,
+        # since that copy is gone by the time a user could run it.
+        assert f'{DOCTOR} certconfig adopt {inst.cert_path}' in capsys.readouterr().out
+
+
+class TestAikidoAdoptInvocation(FumitmTestCase):
+    """Exact argv for the root and sudo execution paths."""
+
+    def test_root_runs_doctor_directly(self, tmp_path):
+        inst = _adopt_instance(tmp_path)
+        seen = {}
+        with _on_macos(), _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
+             patch('fumitm.os.getuid', return_value=0), \
+             patch('fumitm.subprocess.run',
+                   side_effect=_adopts_on_run(tmp_path, seen=seen)):
+            result = inst.setup_aikido_adopt()
+        assert result.status == 'configured'
+        assert seen['argv'][:3] == [DOCTOR, 'certconfig', 'adopt']
+        # The doctor must read a staged private copy, never the user-writable
+        # cert path itself, so the file cannot be swapped between fumitm's
+        # checks and the privileged read.
+        staged = seen['argv'][3]
+        assert staged != inst.cert_path
+        assert seen['cert_content'] == mock_data.MOCK_CERTIFICATE
+        assert not Path(staged).exists()
+
+    def test_non_root_uses_sudo_after_prompt(self, tmp_path):
+        inst = _adopt_instance(tmp_path, auto_yes=True)
+        seen = {}
+        with _on_macos(), _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
+             patch('fumitm.os.getuid', return_value=501), \
+             patch('fumitm.sys.stdin') as mock_stdin, \
+             patch('fumitm.subprocess.run',
+                   side_effect=_adopts_on_run(tmp_path, seen=seen)):
+            mock_stdin.isatty.return_value = True
+            result = inst.setup_aikido_adopt()
+        assert result.status == 'configured'
+        assert seen['argv'][:4] == ['sudo', DOCTOR, 'certconfig', 'adopt']
+        assert seen['argv'][4] != inst.cert_path
+        assert seen['cert_content'] == mock_data.MOCK_CERTIFICATE
+
+    def test_prompt_declined_skips(self, tmp_path):
+        inst = _adopt_instance(tmp_path)
+        with _on_macos(), _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
+             patch('fumitm.os.getuid', return_value=501), \
+             patch('fumitm.sys.stdin') as mock_stdin, \
+             patch.object(inst, '_prompt', return_value='n'), \
+             patch('fumitm.subprocess.run') as mock_run:
+            mock_stdin.isatty.return_value = True
+            result = inst.setup_aikido_adopt()
+        assert result.status == 'skipped'
+        assert 'Declined' in result.message
+        mock_run.assert_not_called()
+
+
+class TestAikidoAdoptNonInteractive(FumitmTestCase):
+    """Non-root without a TTY skips with the command printed, never exit-2."""
+
+    def _run_non_interactive(self, tmp_path, capsys, **kwargs):
+        inst = _adopt_instance(tmp_path, **kwargs)
+        with _on_macos(), _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
+             patch('fumitm.os.getuid', return_value=501), \
+             patch('fumitm.sys.stdin') as mock_stdin, \
+             patch('fumitm.subprocess.run') as mock_run:
+            mock_stdin.isatty.return_value = False
+            result = inst.setup_aikido_adopt()
+        mock_run.assert_not_called()
+        return result, capsys.readouterr().out
+
+    def test_no_tty_skips_with_command(self, tmp_path, capsys):
+        result, out = self._run_non_interactive(tmp_path, capsys)
+        assert result.status == 'skipped'
+        assert 'Requires sudo' in result.message
+        assert f'sudo {DOCTOR} certconfig adopt' in out
+
+    def test_no_tty_with_yes_still_skips(self, tmp_path, capsys):
+        # sudo would hang reading a password with no TTY, so --yes must not
+        # push the run into the sudo call.
+        result, _ = self._run_non_interactive(tmp_path, capsys, auto_yes=True)
+        assert result.status == 'skipped'
+
+    def test_headless_non_root_skips(self, tmp_path, capsys):
+        inst = _adopt_instance(tmp_path, headless=True, auto_yes=True)
+        with _on_macos(), _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
+             patch('fumitm.os.getuid', return_value=501), \
+             patch('fumitm.sys.stdin') as mock_stdin, \
+             patch('fumitm.subprocess.run') as mock_run:
+            mock_stdin.isatty.return_value = True
+            result = inst.setup_aikido_adopt()
+        assert result.status == 'skipped'
+        assert 'Requires sudo' in result.message
+        mock_run.assert_not_called()
+
+
+class TestAikidoAdoptFailure(FumitmTestCase):
+    """Failures surface the doctor's output and never raise."""
+
+    def test_nonzero_exit_fails_with_stderr(self, tmp_path):
+        inst = _adopt_instance(tmp_path)
+        fail = MagicMock(returncode=1, stdout='', stderr='boom')
+        with _on_macos(), _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
+             patch('fumitm.os.getuid', return_value=0), \
+             patch('fumitm.subprocess.run', return_value=fail):
+            result = inst.setup_aikido_adopt()
+        assert result.status == 'failed'
+        assert 'boom' in result.message
+
+    def test_oserror_fails(self, tmp_path):
+        inst = _adopt_instance(tmp_path)
+        with _on_macos(), _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
+             patch('fumitm.os.getuid', return_value=0), \
+             patch('fumitm.subprocess.run',
+                   side_effect=FileNotFoundError('no aikido-doctor')):
+            result = inst.setup_aikido_adopt()
+        assert result.status == 'failed'
+        assert 'no aikido-doctor' in result.message
+
+    def test_timeout_fails_and_preserves_timeout_guard(self, tmp_path):
+        import subprocess
+
+        inst = _adopt_instance(tmp_path)
+        with _on_macos(), _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
+             patch('fumitm.os.getuid', return_value=0), \
+             patch('fumitm.subprocess.run',
+                   side_effect=subprocess.TimeoutExpired(DOCTOR, timeout=300)) as mock_run:
+            result = inst.setup_aikido_adopt()
+        assert result.status == 'failed'
+        assert 'timed out' in result.message
+        assert mock_run.call_args.kwargs['timeout'] == 300
+        staged = mock_run.call_args.args[0][-1]
+        assert not Path(staged).exists()
+
+    def test_clean_exit_without_adoption_fails(self, tmp_path):
+        # The store is exact, so a clean exit that left nothing in it is a
+        # real failure rather than a timing artefact.
+        inst = _adopt_instance(tmp_path)
+        ok = MagicMock(returncode=0, stdout='', stderr='')
+        with _on_macos(), _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
+             patch('fumitm.os.getuid', return_value=0), \
+             patch('fumitm.subprocess.run', return_value=ok):
+            result = inst.setup_aikido_adopt()
+        assert result.status == 'failed'
+        assert 'did not adopt' in result.message
+
+    def test_clean_exit_trusted_without_a_store(self, tmp_path):
+        # With no adopted-CA store there is nothing authoritative to check, so
+        # the exit code stands.
+        inst = _adopt_instance(tmp_path)
+        ok = MagicMock(returncode=0, stdout='', stderr='')
+        with _on_macos(), _doctor_on_path(inst), \
+             _patch_aikido_paths(tmp_path, store=False), \
+             patch('fumitm.os.getuid', return_value=0), \
+             patch('fumitm.subprocess.run', return_value=ok):
+            result = inst.setup_aikido_adopt()
+        assert result.status == 'configured'
+
+    def test_staged_copy_removed_after_failure(self, tmp_path):
+        # The staged private copy must not accumulate in the temp directory,
+        # whichever way the adoption ends.
+        inst = _adopt_instance(tmp_path)
+        seen = {}
+        with _on_macos(), _doctor_on_path(inst), _patch_aikido_paths(tmp_path), \
+             patch('fumitm.os.getuid', return_value=0), \
+             patch('fumitm.subprocess.run',
+                   side_effect=_adopts_on_run(tmp_path, returncode=1, seen=seen)):
+            result = inst.setup_aikido_adopt()
+        assert result.status == 'failed'
+        assert not Path(seen['argv'][-1]).exists()
+
+
+class TestAikidoAdoptStatus(FumitmTestCase):
+    """check_aikido_adopt_status boolean contract across all gates."""
+
+    def _temp_cert(self, tmp_path):
+        cert = tmp_path / 'temp_cert.pem'
+        cert.write_text(mock_data.MOCK_CERTIFICATE)
+        return str(cert)
+
+    def test_false_when_aikido_inactive(self, tmp_path):
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+        assert inst.check_aikido_adopt_status(self._temp_cert(tmp_path)) is False
+
+    def test_false_when_doctor_missing(self, tmp_path):
+        inst = _adopt_instance(tmp_path, mode='status')
+        with _on_macos(), patch('fumitm.shutil.which', return_value=None):
+            assert inst.check_aikido_adopt_status(self._temp_cert(tmp_path)) is False
+
+    def test_false_on_non_darwin(self, tmp_path, capsys):
+        # Without a recognizable adoption record off macOS, status must not
+        # nag about a step --fix would only skip.
+        inst = _adopt_instance(tmp_path, mode='status')
+        with patch('fumitm.platform.system', return_value='Linux'):
+            assert inst.check_aikido_adopt_status(self._temp_cert(tmp_path)) is False
+        assert 'macOS-only' in capsys.readouterr().out
+
+    def test_false_when_adopted(self, tmp_path):
+        inst = _adopt_instance(tmp_path, mode='status')
+        with _on_macos(), _doctor_on_path(inst), \
+             _patch_aikido_paths(tmp_path, adopted=True):
+            assert inst.check_aikido_adopt_status(self._temp_cert(tmp_path)) is False
+
+    def test_true_when_not_adopted(self, tmp_path):
+        inst = _adopt_instance(tmp_path, mode='status')
+        with _on_macos(), _doctor_on_path(inst), \
+             _patch_aikido_paths(tmp_path, adopted=False):
+            assert inst.check_aikido_adopt_status(self._temp_cert(tmp_path)) is True
+
+    def test_true_when_bundle_has_root_but_not_adopted(self, tmp_path):
+        inst = _adopt_instance(tmp_path, mode='status')
+        with _on_macos(), _doctor_on_path(inst), \
+             _patch_aikido_paths(tmp_path, adopted=False, bundle_has_root=True):
+            assert inst.check_aikido_adopt_status(self._temp_cert(tmp_path)) is True
