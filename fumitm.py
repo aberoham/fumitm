@@ -9,6 +9,7 @@ import os
 import platform
 import pwd
 import re
+import shlex
 import shutil
 import ssl
 import stat
@@ -3563,8 +3564,11 @@ class FumitmPython:
             if not as_root:
                 argv = ['sudo'] + argv
             # Messages reference the durable cert path, not the staged copy,
-            # which is gone by the time a user could rerun the command.
-            command_str = ' '.join(
+            # which is gone by the time a user could rerun the command. The
+            # parts are shell-quoted because the doctor resolves into an
+            # application bundle whose name contains spaces, and this string is
+            # printed for the user to paste into a shell.
+            command_str = shlex.join(
                 (['sudo'] if not as_root else []) + [doctor, 'certconfig', 'adopt', self.cert_path])
 
             if not self.is_install_mode():

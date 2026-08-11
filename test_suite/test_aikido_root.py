@@ -911,6 +911,22 @@ class TestAikidoDoctorPathSafety(FumitmTestCase):
         with _stat_override({str(tmp_path): (501, 80, 0o755)}):
             assert inst._trusted_system_executable(str(doctor)) is None
 
+    def test_manual_command_is_shell_quoted(self, tmp_path, capsys):
+        # The doctor resolves into "/Applications/Aikido Endpoint
+        # Protection.app/...", so an unquoted instruction fails the moment a
+        # user pastes it.
+        inst = _adopt_instance(tmp_path)
+        spaced = '/Applications/Aikido Endpoint Protection.app/bin/aikido-doctor'
+        with _on_macos(), patch.object(inst, '_find_aikido_doctor', return_value=spaced), \
+             _patch_aikido_paths(tmp_path, store=False), \
+             patch('fumitm.os.getuid', return_value=501), \
+             patch('fumitm.sys.stdin') as fake_stdin:
+            fake_stdin.isatty.return_value = False
+            result = inst.setup_aikido_adopt()
+        assert result.status == 'skipped'
+        printed = capsys.readouterr().out
+        assert "'/Applications/Aikido Endpoint Protection.app/bin/aikido-doctor'" in printed
+
     def test_rejected_candidate_is_reported_rather_than_passed_over(self, tmp_path):
         # "not found" and "found but untrusted" call for different fixes.
         doctor = self._doctor(tmp_path)
