@@ -7,6 +7,8 @@ These tests cover detection, root extraction (root kept, ephemeral intermediate
 rejected), additive bundle assembly, idempotency, and the absent-Aikido no-op.
 """
 
+import os
+import stat
 from pathlib import Path
 from unittest.mock import MagicMock, mock_open, patch
 
@@ -841,8 +843,36 @@ def _on_macos():
     return patch('fumitm.platform.system', return_value='Darwin')
 
 
+def _stat_override(overrides):
+    """Patch os.stat so chosen paths report crafted ownership and mode.
+
+    A test cannot chown anything to root, so the ownership walk is fed synthetic
+    values: every path reports root:wheel 0755 unless named in `overrides`,
+    which maps an absolute path to (uid, gid, mode).
+    """
+    real_stat = os.stat
+
+    def fake(path, *args, **kwargs):
+        info = real_stat(path, *args, **kwargs)
+        uid, gid, mode = overrides.get(str(path), (0, 0, 0o755))
+        return os.stat_result((
+            stat.S_IFMT(info.st_mode) | mode, info.st_ino, info.st_dev,
+            info.st_nlink, uid, gid, info.st_size, 0, 0, 0,
+        ))
+
+    return patch('fumitm.os.stat', side_effect=fake)
+
+
 class TestAikidoDoctorPathSafety(FumitmTestCase):
     """The privileged adoption path must reject user-owned executables."""
+
+    def _doctor(self, tmp_path):
+        bin_dir = tmp_path / 'bin'
+        bin_dir.mkdir()
+        doctor = bin_dir / 'aikido-doctor'
+        doctor.write_text('#!/bin/sh\n')
+        doctor.chmod(0o755)
+        return doctor
 
     def test_rejects_user_owned_executable(self, tmp_path):
         doctor = tmp_path / 'aikido-doctor'
@@ -850,6 +880,46 @@ class TestAikidoDoctorPathSafety(FumitmTestCase):
         doctor.chmod(0o755)
         inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
         assert inst._trusted_system_executable(str(doctor)) is None
+
+    def test_accepts_a_binary_under_a_group_writable_applications_dir(self, tmp_path):
+        # macOS ships /Applications as root:admin drwxrwxr-x, so rejecting
+        # group-writable directories outright made every vendor agent installed
+        # as an application bundle permanently undiscoverable.
+        doctor = self._doctor(tmp_path)
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+        applications = str(tmp_path)
+        with _stat_override({applications: (0, 80, 0o775)}):
+            assert inst._trusted_system_executable(str(doctor)) == str(doctor)
+
+    def test_rejects_group_writable_by_an_unprivileged_group(self, tmp_path):
+        # staff contains every local user on macOS, so a root:staff writable
+        # directory is exactly the escalation this check exists to prevent.
+        doctor = self._doctor(tmp_path)
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+        with _stat_override({str(tmp_path): (0, 20, 0o775)}):
+            assert inst._trusted_system_executable(str(doctor)) is None
+
+    def test_rejects_world_writable_even_under_a_privileged_group(self, tmp_path):
+        doctor = self._doctor(tmp_path)
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+        with _stat_override({str(tmp_path): (0, 80, 0o777)}):
+            assert inst._trusted_system_executable(str(doctor)) is None
+
+    def test_rejects_a_non_root_owner_however_privileged_the_group(self, tmp_path):
+        doctor = self._doctor(tmp_path)
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+        with _stat_override({str(tmp_path): (501, 80, 0o755)}):
+            assert inst._trusted_system_executable(str(doctor)) is None
+
+    def test_rejected_candidate_is_reported_rather_than_passed_over(self, tmp_path):
+        # "not found" and "found but untrusted" call for different fixes.
+        doctor = self._doctor(tmp_path)
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+        with patch.dict(os.environ, {'PATH': str(doctor.parent)}), \
+             _stat_override({str(doctor.parent): (501, 20, 0o755)}), \
+             patch.object(inst, 'print_debug') as debug:
+            assert inst._find_aikido_doctor() is None
+        assert any('aikido-doctor' in call.args[0] for call in debug.call_args_list)
 
 
 def _adopts_into_bundles(tmp_path, returncode=0):
@@ -1063,9 +1133,10 @@ class TestAikidoAdoptGating(FumitmTestCase):
         mock_run.assert_not_called()
 
     def test_skipped_when_doctor_absent(self, tmp_path):
+        # Patch the lookup itself: shutil.which is not what resolves the doctor,
+        # so this passed only on hosts where the real binary was undiscoverable.
         inst = _adopt_instance(tmp_path)
-        with _on_macos(), \
-             patch('fumitm.shutil.which', return_value=None), \
+        with _on_macos(), _no_doctor(inst), \
              patch('fumitm.subprocess.run') as mock_run:
             result = inst.setup_aikido_adopt()
         assert result.status == 'skipped'
@@ -1343,7 +1414,7 @@ class TestAikidoAdoptStatus(FumitmTestCase):
 
     def test_false_when_doctor_missing(self, tmp_path):
         inst = _adopt_instance(tmp_path, mode='status')
-        with _on_macos(), patch('fumitm.shutil.which', return_value=None):
+        with _on_macos(), _no_doctor(inst):
             assert inst.check_aikido_adopt_status(self._temp_cert(tmp_path)) is False
 
     def test_false_on_non_darwin(self, tmp_path, capsys):

@@ -190,6 +190,15 @@ PROVIDERS = {
 # exclusion of others — when detected, their root is added to every bundle
 # fumitm builds *alongside* the primary provider's root. They are deliberately
 # kept out of PROVIDERS so _resolve_provider can never return one.
+# Groups whose write access to a root-owned directory grants nothing its members
+# do not already hold. macOS ships /Applications as root:admin drwxrwxr-x, so
+# treating group-writability as disqualifying would reject every binary living in
+# an application bundle — which is where vendor agents install. Membership of
+# admin already confers sudo, so honoring it costs no privilege boundary, while
+# the far more dangerous root:staff case (staff contains every local user) stays
+# rejected.
+PRIVILEGED_GROUPS = frozenset({0, 80})  # wheel, admin
+
 SUPPLEMENTAL_ROOTS = {
     'aikido': {
         'name': 'Aikido Endpoint Protection',
@@ -3480,7 +3489,9 @@ class FumitmPython:
             current = resolved
             while True:
                 info = os.stat(current)
-                if info.st_uid != 0 or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                if info.st_uid != 0 or info.st_mode & stat.S_IWOTH:
+                    return None
+                if info.st_mode & stat.S_IWGRP and info.st_gid not in PRIVILEGED_GROUPS:
                     return None
                 parent = os.path.dirname(current)
                 if parent == current:
@@ -3491,13 +3502,23 @@ class FumitmPython:
             return None
 
     def _find_aikido_doctor(self):
-        """Find aikido-doctor without selecting an untrusted user executable."""
+        """Find aikido-doctor without selecting an untrusted user executable.
+
+        Rejected candidates are reported at debug level rather than passed over
+        silently: a present-but-rejected binary and an absent one lead to very
+        different diagnoses, and conflating them sent one investigation down the
+        wrong path entirely.
+        """
         for directory in os.environ.get('PATH', '').split(os.pathsep):
             directory = directory or os.curdir
             candidate = os.path.join(directory, 'aikido-doctor')
             trusted = self._trusted_system_executable(candidate)
             if trusted:
                 return trusted
+            if os.path.exists(candidate):
+                self.print_debug(
+                    f"Ignoring {candidate}: not owned by root through its whole path"
+                )
         return None
 
     def setup_aikido_adopt(self):
@@ -6305,7 +6326,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         if not self._find_aikido_doctor():
             self.print_info(
                 "  - aikido-doctor not found in trusted system PATH "
-                "(agent predates certconfig adopt)"
+                "(run with --debug to see whether a candidate was rejected)"
             )
             return has_issues
         if self._aikido_trusts_root(temp_warp_cert):
