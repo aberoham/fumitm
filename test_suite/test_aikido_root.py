@@ -761,8 +761,13 @@ def _fingerprints(pem_text):
 
 
 def _adopt_instance(tmp_path, mode='install', **kwargs):
-    """WARP instance with Aikido active and the provider root materialized."""
-    inst = FumitmTestCase.create_fumitm_instance(provider='warp', mode=mode, **kwargs)
+    """Netskope instance with Aikido active and the provider root materialized.
+
+    Netskope rather than the suite's default WARP because that is the pairing
+    Aikido is actually deployed alongside; the adoption path itself reads the
+    provider only through `short_name`.
+    """
+    inst = FumitmTestCase.create_fumitm_instance(provider='netskope', mode=mode, **kwargs)
     primary = tmp_path / 'primary.pem'
     primary.write_text(mock_data.MOCK_CERTIFICATE)
     inst.cert_path = str(primary)
@@ -770,11 +775,13 @@ def _adopt_instance(tmp_path, mode='install', **kwargs):
     return inst
 
 
-def _patch_aikido_paths(tmp_path, adopted=False, store=True, bundle_has_root=False):
-    """Point Aikido's adopted-CA store and combined bundle at test files.
+def _patch_aikido_paths(tmp_path, adopted=False, store=True, bundle_has_root=False,
+                        one_bundle_lags=False):
+    """Point Aikido's adopted-CA store and built bundles at test files.
 
-    store=False models an agent old enough to keep no adopted-CA directory, the
-    only case in which the weaker bundle check is consulted.
+    store=False models an agent that keeps no adopted-CA directory.
+    one_bundle_lags models the disagreement observed in the wild, where the pip
+    bundle carries the provider root and the openssl bundle does not.
     """
     import fumitm
     overrides = {}
@@ -786,10 +793,30 @@ def _patch_aikido_paths(tmp_path, adopted=False, store=True, bundle_has_root=Fal
                 (store_dir / f'{fp}.pem').write_text(mock_data.MOCK_CERTIFICATE)
     overrides['adopted_dir'] = str(store_dir)
 
-    combined = tmp_path / 'combined.pem'
-    combined.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT
-                        + ('\n' + mock_data.MOCK_CERTIFICATE if bundle_has_root else ''))
-    overrides['combined_pem'] = str(combined)
+    run_dir = tmp_path / 'run'
+    run_dir.mkdir(exist_ok=True)
+
+    def _bundle(name, with_root):
+        path = run_dir / name
+        path.write_text(
+            mock_data.MOCK_AIKIDO_ROOT_CERT
+            + ('\n' + mock_data.MOCK_CERTIFICATE if with_root else '')
+        )
+        return path
+
+    pip_bundle = _bundle('endpoint-protection-pip-combined-ca.pem', bundle_has_root)
+    _bundle('endpoint-protection-openssl-combined-ca.pem',
+            bundle_has_root and not one_bundle_lags)
+    _bundle('endpoint-protection-npm-cafile.pem', bundle_has_root)
+    # Aikido's own root, alone. The globs must never match this file: it can
+    # never contain an adopted root, so matching it would fail the check on
+    # every host forever.
+    (run_dir / 'endpoint-protection-proxy-ca-crt.pem').write_text(
+        mock_data.MOCK_AIKIDO_ROOT_CERT
+    )
+
+    overrides['run_dir'] = str(run_dir)
+    overrides['combined_pem'] = str(pip_bundle)
     return patch.dict(fumitm.SUPPLEMENTAL_ROOTS['aikido'], overrides)
 
 
@@ -798,6 +825,15 @@ DOCTOR = '/usr/local/bin/aikido-doctor'
 
 def _doctor_on_path(inst):
     return patch.object(inst, '_find_aikido_doctor', return_value=DOCTOR)
+
+
+def _no_doctor(inst):
+    """Model an agent whose CLI predates certconfig adopt.
+
+    Always patched explicitly rather than left to the real PATH, since a
+    developer machine running Aikido genuinely has the binary installed.
+    """
+    return patch.object(inst, '_find_aikido_doctor', return_value=None)
 
 
 def _on_macos():
@@ -814,6 +850,24 @@ class TestAikidoDoctorPathSafety(FumitmTestCase):
         doctor.chmod(0o755)
         inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
         assert inst._trusted_system_executable(str(doctor)) is None
+
+
+def _adopts_into_bundles(tmp_path, returncode=0):
+    """subprocess.run side effect that adds the root to the built bundles only.
+
+    Models an agent that repairs its bundles without leaving a record in the
+    adopted-CA directory — a shape fumitm cannot rule out from the outside.
+    """
+    def run(argv, **kwargs):
+        if returncode == 0:
+            run_dir = tmp_path / 'run'
+            for pattern in ('*-combined-ca.pem', '*-cafile.pem'):
+                for bundle in run_dir.glob(pattern):
+                    bundle.write_text(
+                        bundle.read_text() + '\n' + mock_data.MOCK_CERTIFICATE
+                    )
+        return MagicMock(returncode=returncode, stdout='', stderr='')
+    return run
 
 
 def _adopts_on_run(tmp_path, returncode=0, seen=None):
@@ -884,7 +938,7 @@ class TestCertFingerprints(FumitmTestCase):
 
 
 class TestAikidoAdoptionState(FumitmTestCase):
-    """The adopted-CA store is authoritative; the bundle is only a fallback."""
+    """Either the adopted-CA record or every built bundle establishes trust."""
 
     def test_adopted_when_every_fingerprint_present(self, tmp_path):
         inst = _adopt_instance(tmp_path)
@@ -921,20 +975,62 @@ class TestAikidoAdoptionState(FumitmTestCase):
             assert inst._aikido_has_adopted(inst.cert_path) is None
             assert inst._aikido_trusts_root(inst.cert_path) is False
 
-    def test_bundle_presence_alone_is_not_adoption(self, tmp_path):
-        # The bundles are built from the system trust store, so a keychain-
-        # installed root appears in them without anyone having adopted it.
+    def test_missing_store_is_not_adopted_when_the_doctor_exists(self, tmp_path):
+        # Aikido creates the record on first adoption, so an agent that ships
+        # the CLI and has no record has simply adopted nothing.
         inst = _adopt_instance(tmp_path)
-        with _patch_aikido_paths(tmp_path, adopted=False, bundle_has_root=True):
+        with _patch_aikido_paths(tmp_path, store=False), _doctor_on_path(inst):
             assert inst._aikido_has_adopted(inst.cert_path) is False
+
+    def test_missing_store_is_unknown_without_the_doctor(self, tmp_path):
+        inst = _adopt_instance(tmp_path)
+        with _patch_aikido_paths(tmp_path, store=False), _no_doctor(inst):
+            assert inst._aikido_has_adopted(inst.cert_path) is None
+
+    def test_every_bundle_carrying_the_root_establishes_trust(self, tmp_path):
+        # What matters downstream is whether the tools Aikido points at these
+        # bundles trust the root, however it got there.
+        inst = _adopt_instance(tmp_path)
+        with _patch_aikido_paths(tmp_path, adopted=False, bundle_has_root=True), \
+             _doctor_on_path(inst):
+            assert inst._aikido_has_adopted(inst.cert_path) is False
+            assert inst._aikido_trusts_root(inst.cert_path) is True
+
+    def test_one_lagging_bundle_denies_trust(self, tmp_path):
+        # The case that motivated this: pip and node carried the Netskope chain
+        # while openssl and ruby did not, and checking pip alone hid it.
+        inst = _adopt_instance(tmp_path)
+        with _patch_aikido_paths(tmp_path, adopted=False, bundle_has_root=True,
+                                 one_bundle_lags=True), _doctor_on_path(inst):
+            assert inst._aikido_bundles_contain(inst.cert_path) is False
             assert inst._aikido_trusts_root(inst.cert_path) is False
 
-    def test_falls_back_to_bundle_without_a_store(self, tmp_path):
+    def test_proxy_ca_file_is_not_treated_as_a_bundle(self, tmp_path):
+        # It holds Aikido's own root alone, so matching it would deny trust on
+        # every host no matter how many adoptions had run.
         inst = _adopt_instance(tmp_path)
-        with _patch_aikido_paths(tmp_path, store=False, bundle_has_root=True):
+        with _patch_aikido_paths(tmp_path, bundle_has_root=True):
+            bundles = inst._aikido_built_bundles()
+        assert bundles
+        assert not any('proxy-ca-crt' in b for b in bundles)
+
+    def test_no_bundles_at_all_denies_trust(self, tmp_path):
+        inst = _adopt_instance(tmp_path)
+        import fumitm
+        empty_run = tmp_path / 'empty-run'
+        empty_run.mkdir()
+        with patch.dict(fumitm.SUPPLEMENTAL_ROOTS['aikido'],
+                        {'run_dir': str(empty_run)}):
+            assert inst._aikido_bundles_contain(inst.cert_path) is False
+
+    def test_falls_back_to_bundles_without_a_store(self, tmp_path):
+        inst = _adopt_instance(tmp_path)
+        with _patch_aikido_paths(tmp_path, store=False, bundle_has_root=True), \
+             _no_doctor(inst):
             assert inst._aikido_has_adopted(inst.cert_path) is None
             assert inst._aikido_trusts_root(inst.cert_path) is True
-        with _patch_aikido_paths(tmp_path, store=False, bundle_has_root=False):
+        with _patch_aikido_paths(tmp_path, store=False, bundle_has_root=False), \
+             _no_doctor(inst):
             assert inst._aikido_trusts_root(inst.cert_path) is False
 
 
@@ -999,7 +1095,7 @@ class TestAikidoAdoptGating(FumitmTestCase):
 
 
 class TestAikidoAdoptIdempotency(FumitmTestCase):
-    """Adopt is a no-op only when the store says the root is already adopted."""
+    """Adopt runs when trust is incomplete and is a no-op once it is not."""
 
     def test_already_ok_when_adopted(self, tmp_path):
         inst = _adopt_instance(tmp_path)
@@ -1010,18 +1106,32 @@ class TestAikidoAdoptIdempotency(FumitmTestCase):
         assert result.status == 'already_ok'
         mock_run.assert_not_called()
 
-    def test_runs_adopt_when_bundle_has_root_but_store_does_not(self, tmp_path):
-        # Regression: a root present only because it is in the system trust
-        # store must not be mistaken for one Aikido has adopted.
+    def test_runs_adopt_when_one_bundle_lags(self, tmp_path):
+        # Regression for the observed host: the pip bundle carried the provider
+        # root and the openssl bundle did not, and checking pip alone reported
+        # success and skipped the adoption that would have fixed openssl.
         inst = _adopt_instance(tmp_path)
         with _on_macos(), _doctor_on_path(inst), \
-             _patch_aikido_paths(tmp_path, adopted=False, bundle_has_root=True), \
+             _patch_aikido_paths(tmp_path, adopted=False, bundle_has_root=True,
+                                 one_bundle_lags=True), \
              patch('fumitm.os.getuid', return_value=0), \
              patch('fumitm.subprocess.run',
                    side_effect=_adopts_on_run(tmp_path)) as mock_run:
             result = inst.setup_aikido_adopt()
         assert result.status == 'configured'
         mock_run.assert_called_once()
+
+    def test_second_run_is_a_no_op_when_only_the_bundles_record_it(self, tmp_path):
+        # An adoption Aikido books somewhere other than the record directory
+        # must not be repeated on every subsequent run: that would re-prompt for
+        # sudo and report a change on every play.
+        inst = _adopt_instance(tmp_path)
+        with _on_macos(), _doctor_on_path(inst), \
+             _patch_aikido_paths(tmp_path, store=False, bundle_has_root=True), \
+             patch('fumitm.subprocess.run') as mock_run:
+            result = inst.setup_aikido_adopt()
+        assert result.status == 'already_ok'
+        mock_run.assert_not_called()
 
 
 class TestAikidoAdoptDryRun(FumitmTestCase):
@@ -1179,15 +1289,29 @@ class TestAikidoAdoptFailure(FumitmTestCase):
         assert result.status == 'failed'
         assert 'did not adopt' in result.message
 
-    def test_clean_exit_trusted_without_a_store(self, tmp_path):
-        # With no adopted-CA store there is nothing authoritative to check, so
-        # the exit code stands.
+    def test_clean_exit_leaving_no_trace_is_a_failure(self, tmp_path):
+        # A zero exit that leaves neither an adoption record nor the root in the
+        # bundles has not adopted anything, whatever it printed.
         inst = _adopt_instance(tmp_path)
         ok = MagicMock(returncode=0, stdout='', stderr='')
         with _on_macos(), _doctor_on_path(inst), \
              _patch_aikido_paths(tmp_path, store=False), \
              patch('fumitm.os.getuid', return_value=0), \
              patch('fumitm.subprocess.run', return_value=ok):
+            result = inst.setup_aikido_adopt()
+        assert result.status == 'failed'
+        assert 'did not adopt' in result.message
+
+    def test_adoption_booked_only_in_the_bundles_succeeds(self, tmp_path):
+        # Where Aikido keeps its bookkeeping is undocumented. An adoption that
+        # reaches every bundle without leaving a record must still count, or it
+        # would be reported as a failure and repeated on every run.
+        inst = _adopt_instance(tmp_path)
+        with _on_macos(), _doctor_on_path(inst), \
+             _patch_aikido_paths(tmp_path, store=False), \
+             patch('fumitm.os.getuid', return_value=0), \
+             patch('fumitm.subprocess.run',
+                   side_effect=_adopts_into_bundles(tmp_path)):
             result = inst.setup_aikido_adopt()
         assert result.status == 'configured'
 
@@ -1242,8 +1366,17 @@ class TestAikidoAdoptStatus(FumitmTestCase):
              _patch_aikido_paths(tmp_path, adopted=False):
             assert inst.check_aikido_adopt_status(self._temp_cert(tmp_path)) is True
 
-    def test_true_when_bundle_has_root_but_not_adopted(self, tmp_path):
+    def test_true_when_one_bundle_lags(self, tmp_path):
+        # Status must flag the host whose bundles disagree, which is the state
+        # that leaves openssl- and ruby-based tools without the provider root.
+        inst = _adopt_instance(tmp_path, mode='status')
+        with _on_macos(), _doctor_on_path(inst), \
+             _patch_aikido_paths(tmp_path, adopted=False, bundle_has_root=True,
+                                 one_bundle_lags=True):
+            assert inst.check_aikido_adopt_status(self._temp_cert(tmp_path)) is True
+
+    def test_false_when_every_bundle_carries_the_root(self, tmp_path):
         inst = _adopt_instance(tmp_path, mode='status')
         with _on_macos(), _doctor_on_path(inst), \
              _patch_aikido_paths(tmp_path, adopted=False, bundle_has_root=True):
-            assert inst.check_aikido_adopt_status(self._temp_cert(tmp_path)) is True
+            assert inst.check_aikido_adopt_status(self._temp_cert(tmp_path)) is False

@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+import glob
 import hashlib
 import json
 import os
@@ -197,15 +198,25 @@ SUPPLEMENTAL_ROOTS = {
         # "- org-NNNNNN" suffix varies, so we always match on the prefix.
         'keychain_label_prefix': 'Aikido Endpoint Protection Root CA',
         'support_dir': '/Library/Application Support/AikidoSecurity/',
+        'run_dir': (
+            '/Library/Application Support/AikidoSecurity/EndpointProtection/run'
+        ),
         'combined_pem': (
             '/Library/Application Support/AikidoSecurity/'
             'EndpointProtection/run/endpoint-protection-pip-combined-ca.pem'
         ),
+        # Aikido builds one CA bundle per tool family and they do not agree with
+        # one another: on an observed host the pip and node bundles carried the
+        # Netskope chain while the openssl and ruby bundles did not. Whether
+        # Aikido trusts a root therefore cannot be answered from a single file.
+        # The proxy CA is deliberately unmatched — it holds Aikido's own root
+        # alone, so including it would fail the check permanently.
+        'bundle_globs': ('*-combined-ca.pem', '*-cafile.pem'),
         # Aikido records each CA adopted via `certconfig adopt` as a
-        # <sha256>.pem here, world-readable and keyed by the same fingerprint
-        # `adopt --forget` takes. This is the authoritative record of adoption:
-        # presence in the bundles above is not, since those are built from the
-        # system trust store and so already carry any keychain-installed root.
+        # <sha256>.pem here, keyed by the same fingerprint `adopt --forget`
+        # takes. The directory is created on first adoption, so its absence
+        # means nothing has been adopted rather than that adoption is
+        # unavailable.
         'adopted_dir': (
             '/Library/Application Support/AikidoSecurity/'
             'EndpointProtection/run/adopted-cas'
@@ -766,35 +777,53 @@ class FumitmPython:
         return fingerprints
 
     def _aikido_has_adopted(self, cert_path):
-        """Return True when Aikido has adopted every certificate in cert_path.
+        """Return True when Aikido's adopted-CA record covers every cert in cert_path.
 
-        Returns None when Aikido keeps no adopted-CA store, i.e. the agent is
-        too old to have a `certconfig adopt` to call, so callers fall back to
-        inspecting the bundles themselves.
+        Aikido creates the record directory on first adoption, so its absence on
+        an agent that ships the `aikido-doctor` CLI means nothing has been
+        adopted. Only an agent without that CLI leaves the question unanswered,
+        which is reported as None.
         """
         adopted_dir = SUPPLEMENTAL_ROOTS['aikido']['adopted_dir']
         if not os.path.isdir(adopted_dir):
-            return None
+            return False if self._find_aikido_doctor() else None
         fingerprints = self._cert_fingerprints(cert_path)
         if not fingerprints:
             return None
         return all(os.path.exists(os.path.join(adopted_dir, f'{fp}.pem'))
                    for fp in fingerprints)
 
-    def _aikido_trusts_root(self, cert_path):
-        """Return True when Aikido's CA bundles already carry cert_path's roots.
+    def _aikido_built_bundles(self):
+        """Return every CA bundle Aikido builds and keeps current."""
+        descriptor = SUPPLEMENTAL_ROOTS['aikido']
+        bundles = []
+        for pattern in descriptor['bundle_globs']:
+            bundles.extend(glob.glob(os.path.join(descriptor['run_dir'], pattern)))
+        return sorted(set(bundles))
 
-        Prefers the adopted-CA store, which is exact. Falls back to looking in
-        a built bundle for agents that keep no such store: a weaker signal,
-        since a root installed in the system trust store turns up there without
-        anyone having adopted it, but the only one such an agent offers.
+    def _aikido_bundles_contain(self, cert_path):
+        """Return True when every bundle Aikido builds carries cert_path's roots.
+
+        Every bundle must carry them, not merely one: Aikido's bundles disagree,
+        so a root present in the pip bundle says nothing about the openssl one.
+        An agent with no bundles at all answers False rather than vacuously True.
         """
-        adopted = self._aikido_has_adopted(cert_path)
-        if adopted is not None:
-            return adopted
-        combined_pem = SUPPLEMENTAL_ROOTS['aikido']['combined_pem']
-        return (os.path.exists(combined_pem)
-                and self.certificate_exists_in_file(cert_path, combined_pem))
+        bundles = self._aikido_built_bundles()
+        return bool(bundles) and all(
+            self.certificate_exists_in_file(cert_path, bundle) for bundle in bundles
+        )
+
+    def _aikido_trusts_root(self, cert_path):
+        """Return True when Aikido already trusts cert_path's roots.
+
+        Accepts either signal. The adopted-CA record is exact but its location
+        is undocumented, so an adoption Aikido books elsewhere would otherwise
+        read as a failure and be repeated on every run; the bundles then answer
+        the question that actually matters, which is whether the tools Aikido
+        points at those bundles trust the root.
+        """
+        return (self._aikido_has_adopted(cert_path) is True
+                or self._aikido_bundles_contain(cert_path))
 
     def _openssl_subject(self, cert_pem):
         """Return the openssl subject line for a single PEM cert, or None if invalid."""
@@ -3549,7 +3578,7 @@ class FumitmPython:
                 self.print_error(message)
                 return ToolResult('aikido-adopt', 'failed', message)
 
-            if self._aikido_has_adopted(staged) is False:
+            if not self._aikido_trusts_root(staged):
                 message = f'aikido-doctor exited 0 but did not adopt the {short} root'
                 self.print_error(message)
                 return ToolResult('aikido-adopt', 'failed', message)
