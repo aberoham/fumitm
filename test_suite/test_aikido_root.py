@@ -957,7 +957,13 @@ def _adopts_into_bundles(tmp_path, returncode=0):
 
 
 def _adopts_on_run(tmp_path, returncode=0, seen=None):
-    """subprocess.run side effect that writes the adopted-CA files, as adopt does.
+    """subprocess.run side effect modelling a successful `certconfig adopt`.
+
+    Observed against agent 1.7.28: adoption writes the adopted-CA record *and*
+    reinstalls every certconfig rule, so each built bundle gains the root — the
+    openssl and ruby bundles went from 128 to 130 certificates in one pass. A
+    mock that only wrote the record would let a regression through, since the
+    trust predicate reads the bundles.
 
     When a `seen` dict is supplied, records the argv and the content of the
     certificate path handed to the doctor, read at invocation time — the staged
@@ -968,8 +974,11 @@ def _adopts_on_run(tmp_path, returncode=0, seen=None):
             seen['argv'] = argv
             seen['cert_content'] = Path(argv[-1]).read_text()
         if returncode == 0:
+            store = tmp_path / 'adopted-cas'
+            store.mkdir(exist_ok=True)
             for fp in _fingerprints(mock_data.MOCK_CERTIFICATE):
-                (tmp_path / 'adopted-cas' / f'{fp}.pem').write_text(mock_data.MOCK_CERTIFICATE)
+                (store / f'{fp}.pem').write_text(mock_data.MOCK_CERTIFICATE)
+            _adopts_into_bundles(tmp_path)(argv, **kwargs)
         return MagicMock(returncode=returncode, stdout='', stderr='')
     return run
 
@@ -1028,9 +1037,19 @@ class TestAikidoAdoptionState(FumitmTestCase):
 
     def test_adopted_when_every_fingerprint_present(self, tmp_path):
         inst = _adopt_instance(tmp_path)
-        with _patch_aikido_paths(tmp_path, adopted=True):
+        with _patch_aikido_paths(tmp_path, adopted=True, bundle_has_root=True):
             assert inst._aikido_has_adopted(inst.cert_path) is True
             assert inst._aikido_trusts_root(inst.cert_path) is True
+
+    def test_record_does_not_excuse_a_lagging_bundle(self, tmp_path):
+        # A root adopted once still vanishes from any bundle Aikido later
+        # rebuilds from a source that lacks it, and the record would go on
+        # asserting a trust that no longer exists.
+        inst = _adopt_instance(tmp_path)
+        with _patch_aikido_paths(tmp_path, adopted=True, bundle_has_root=True,
+                                 one_bundle_lags=True):
+            assert inst._aikido_has_adopted(inst.cert_path) is True
+            assert inst._aikido_trusts_root(inst.cert_path) is False
 
     def test_not_adopted_when_store_lacks_fingerprint(self, tmp_path):
         inst = _adopt_instance(tmp_path)
@@ -1187,7 +1206,7 @@ class TestAikidoAdoptIdempotency(FumitmTestCase):
     def test_already_ok_when_adopted(self, tmp_path):
         inst = _adopt_instance(tmp_path)
         with _on_macos(), _doctor_on_path(inst), \
-             _patch_aikido_paths(tmp_path, adopted=True), \
+             _patch_aikido_paths(tmp_path, adopted=True, bundle_has_root=True), \
              patch('fumitm.subprocess.run') as mock_run:
             result = inst.setup_aikido_adopt()
         assert result.status == 'already_ok'
@@ -1444,8 +1463,15 @@ class TestAikidoAdoptStatus(FumitmTestCase):
     def test_false_when_adopted(self, tmp_path):
         inst = _adopt_instance(tmp_path, mode='status')
         with _on_macos(), _doctor_on_path(inst), \
-             _patch_aikido_paths(tmp_path, adopted=True):
+             _patch_aikido_paths(tmp_path, adopted=True, bundle_has_root=True):
             assert inst.check_aikido_adopt_status(self._temp_cert(tmp_path)) is False
+
+    def test_true_when_the_record_masks_a_lagging_bundle(self, tmp_path):
+        inst = _adopt_instance(tmp_path, mode='status')
+        with _on_macos(), _doctor_on_path(inst), \
+             _patch_aikido_paths(tmp_path, adopted=True, bundle_has_root=True,
+                                 one_bundle_lags=True):
+            assert inst.check_aikido_adopt_status(self._temp_cert(tmp_path)) is True
 
     def test_true_when_not_adopted(self, tmp_path):
         inst = _adopt_instance(tmp_path, mode='status')

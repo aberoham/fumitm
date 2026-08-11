@@ -824,16 +824,21 @@ class FumitmPython:
         )
 
     def _aikido_trusts_root(self, cert_path):
-        """Return True when Aikido already trusts cert_path's roots.
+        """Return True when every bundle Aikido builds carries cert_path's roots.
 
-        Accepts either signal. The adopted-CA record is exact but its location
-        is undocumented, so an adoption Aikido books elsewhere would otherwise
-        read as a failure and be repeated on every run; the bundles then answer
-        the question that actually matters, which is whether the tools Aikido
-        points at those bundles trust the root.
+        The bundles are the ground truth, because they are what the tools Aikido
+        configures actually read. An adoption record cannot stand in for them: a
+        root adopted once still vanishes from any bundle Aikido later rebuilds
+        from a source that lacks it, and a record left behind would go on
+        asserting trust that no longer exists. Re-adopting is the cure for that
+        drift and converges rather than repeating, since `certconfig adopt`
+        reinstalls every rule and brings all bundles current. The record answers
+        only for an agent that exposes no bundles at all.
         """
-        return (self._aikido_has_adopted(cert_path) is True
-                or self._aikido_bundles_contain(cert_path))
+        bundles = self._aikido_built_bundles()
+        if bundles:
+            return self._aikido_bundles_contain(cert_path)
+        return self._aikido_has_adopted(cert_path) is True
 
     def _openssl_subject(self, cert_pem):
         """Return the openssl subject line for a single PEM cert, or None if invalid."""
