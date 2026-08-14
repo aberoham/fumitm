@@ -17,7 +17,7 @@ jobs:
     if: ${{ !contains(github.event.head_commit.message, '[skip-version]') && github.event.head_commit.author.name != 'github-actions[bot]' }}
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
         fetch-depth: 0
@@ -26,7 +26,7 @@ jobs:
       id: version
       run: |
         TODAY=$(date -u +%Y.%-m.%-d)
-        echo "date=$TODAY" >> $GITHUB_OUTPUT
+        echo "date=$TODAY" >> "$GITHUB_OUTPUT"
 
         # Check current version in the file
         CURRENT_VERSION=$(grep -oP '__version__\s*=\s*["'"'"']\K[0-9.]+' fumitm.py || echo "")
@@ -38,14 +38,14 @@ jobs:
           NEW_VERSION="$TODAY.1"
         elif [[ "$CURRENT_VERSION" =~ ^${TODAY}\.([0-9]+)$ ]]; then
           # Already has a patch number, increment it
-          PATCH=$((${BASH_REMATCH[1]} + 1))
+          PATCH=$((BASH_REMATCH[1] + 1))
           NEW_VERSION="$TODAY.$PATCH"
         else
           # Different date or no version, use today's date
           NEW_VERSION="$TODAY"
         fi
 
-        echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+        echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
         echo "New version will be: $NEW_VERSION"
 
     - name: Update version in fumitm.py

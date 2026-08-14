@@ -1139,6 +1139,7 @@ class TestStatusFunctionContracts(FumitmTestCase):
             with patch.object(instance, 'command_exists', return_value=False), \
                  patch.object(instance, 'get_jenv_java_homes', return_value=[]), \
                  patch.object(instance, 'find_all_java_homes', return_value=[]), \
+                 patch.object(instance, '_find_aikido_doctor', return_value=None), \
                  patch('os.path.exists', return_value=False):
 
                 result = method(str(cert_file))
@@ -1167,6 +1168,7 @@ class TestStatusFunctionContracts(FumitmTestCase):
             with patch.object(instance, 'command_exists', return_value=False), \
                  patch.object(instance, 'get_jenv_java_homes', return_value=[]), \
                  patch.object(instance, 'find_all_java_homes', return_value=[]), \
+                 patch.object(instance, '_find_aikido_doctor', return_value=None), \
                  patch('os.path.exists', return_value=False):
 
                 result = method(str(cert_file))

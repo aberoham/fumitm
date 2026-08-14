@@ -1224,7 +1224,7 @@ class TestShellEnvFileTrustBoundary(FumitmTestCase):
         doc = (Path(__file__).resolve().parent.parent
                / 'README-automation.md').read_text()
         match = re.search(r'^\s*sudo -u "\$target_user" (sh -c .*)$',
-                          doc, re.M)
+                          doc, re.MULTILINE)
         assert match, 'privilege-drop example not found in automation docs'
         example = match.group(1).replace(
             'dependent-command', 'printenv SSL_CERT_FILE')
