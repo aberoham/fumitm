@@ -1188,8 +1188,21 @@ class TestAikidoAdoptionState(FumitmTestCase):
         with _patch_aikido_paths(tmp_path, adopted=True, bundle_has_root=True), \
              patch('fumitm.os.listdir', side_effect=PermissionError('denied')), \
              patch.object(inst, 'print_debug') as debug:
-            assert inst._aikido_built_bundles() == []
+            assert inst._aikido_built_bundles() is None
+            assert inst._aikido_bundles_missing(inst.cert_path) is None
         assert any('bundle directory' in call.args[0] for call in debug.call_args_list)
+
+    def test_unreadable_run_dir_does_not_defer_to_the_record(self, tmp_path):
+        # The record exists and every bundle carries the root, but the directory
+        # cannot be read — so none of that is knowable. Deferring to the record
+        # here is the one answer that leaves Aikido-backed tools broken while
+        # reporting success.
+        inst = _adopt_instance(tmp_path)
+        with _patch_aikido_paths(tmp_path, adopted=True, bundle_has_root=True):
+            assert inst._aikido_trusts_root(inst.cert_path) is True
+            with patch('fumitm.os.listdir', side_effect=PermissionError('denied')):
+                assert inst._aikido_has_adopted(inst.cert_path) is True
+                assert inst._aikido_trusts_root(inst.cert_path) is False
 
     def test_no_bundles_at_all_falls_back_to_the_record(self, tmp_path):
         inst = _adopt_instance(tmp_path)
@@ -1506,6 +1519,19 @@ class TestAikidoAdoptFailure(FumitmTestCase):
         assert result.status == 'failed'
         assert 'did not adopt' in result.message
 
+    def test_unreadable_run_dir_fails_without_running_the_doctor(self, tmp_path):
+        # Adopting without being able to read the bundles is a privileged
+        # command run blind, with no way to tell afterwards whether it took.
+        inst = _adopt_instance(tmp_path)
+        with _on_macos(), _doctor_on_path(inst), \
+             _patch_aikido_paths(tmp_path, adopted=True, bundle_has_root=True), \
+             patch('fumitm.os.listdir', side_effect=PermissionError('denied')), \
+             patch('fumitm.subprocess.run') as mock_run:
+            result = inst.setup_aikido_adopt()
+        assert result.status == 'failed'
+        assert 'bundle directory' in result.message
+        mock_run.assert_not_called()
+
     def test_recorded_adoption_with_a_lagging_bundle_is_not_a_failure(self, tmp_path):
         # Bundles are rebuilt by the agent, not by the CLI's return, so a bundle
         # still behind after a recorded adoption is a state fumitm neither
@@ -1596,6 +1622,13 @@ class TestAikidoAdoptStatus(FumitmTestCase):
         with _on_macos(), _doctor_on_path(inst), \
              _patch_aikido_paths(tmp_path, adopted=False, bundle_has_root=True,
                                  one_bundle_lags=True):
+            assert inst.check_aikido_adopt_status(self._temp_cert(tmp_path)) is True
+
+    def test_true_when_the_run_dir_cannot_be_read(self, tmp_path):
+        inst = _adopt_instance(tmp_path, mode='status')
+        with _on_macos(), _doctor_on_path(inst), \
+             _patch_aikido_paths(tmp_path, adopted=True, bundle_has_root=True), \
+             patch('fumitm.os.listdir', side_effect=PermissionError('denied')):
             assert inst.check_aikido_adopt_status(self._temp_cert(tmp_path)) is True
 
     def test_true_when_bundles_carry_an_unregistered_root(self, tmp_path):

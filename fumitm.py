@@ -829,10 +829,11 @@ class FumitmPython:
     def _aikido_built_bundles(self):
         """Return every CA bundle `certconfig adopt` builds and keeps current.
 
-        The directory is listed rather than globbed so that an unreadable
-        run_dir is reported instead of being silently indistinguishable from an
-        agent that builds no bundles at all — glob swallows the error, and the
-        empty result would send the caller down the legacy-agent branch.
+        The directory is listed rather than globbed, and an unreadable run_dir
+        answers None rather than an empty list. glob swallows the error, and the
+        empty result it leaves behind is indistinguishable from an agent that
+        builds no bundles — which would send the caller to the adoption record
+        and let a filesystem fault read as a healthy adoption.
         """
         descriptor = SUPPLEMENTAL_ROOTS['aikido']
         run_dir = descriptor['run_dir']
@@ -840,7 +841,7 @@ class FumitmPython:
             entries = os.listdir(run_dir)
         except OSError as e:
             self.print_debug(f"Could not list Aikido's bundle directory {run_dir}: {e}")
-            return []
+            return None
         return sorted(
             os.path.join(run_dir, name)
             for name in entries
@@ -852,8 +853,12 @@ class FumitmPython:
 
         Every bundle must carry them, not merely one: Aikido's bundles disagree,
         so a root present in the pip bundle says nothing about the openssl one.
+        Returns None when the bundle directory could not be read at all.
         """
-        return [bundle for bundle in self._aikido_built_bundles()
+        bundles = self._aikido_built_bundles()
+        if bundles is None:
+            return None
+        return [bundle for bundle in bundles
                 if not self.certificate_exists_in_file(cert_path, bundle)]
 
     def _aikido_trusts_root(self, cert_path):
@@ -877,14 +882,21 @@ class FumitmPython:
         bundles from 128 to 130 certificates and created the record in the same
         pass. When the certificates cannot be fingerprinted the record is
         unanswerable and the bundles decide alone.
+
+        A bundle directory that cannot be read fails closed. Deferring to the
+        record there would let a filesystem fault read as a healthy adoption,
+        which is the one answer that leaves Aikido-backed tools broken while
+        reporting success.
         """
-        bundles = self._aikido_built_bundles()
-        if bundles and self._aikido_bundles_missing(cert_path):
+        missing = self._aikido_bundles_missing(cert_path)
+        if missing is None:
+            return False
+        if missing:
             return False
         record = self._aikido_has_adopted(cert_path)
         if record is not None:
             return record
-        return bool(bundles)
+        return bool(self._aikido_built_bundles())
 
     def _openssl_subject(self, cert_pem):
         """Return the openssl subject line for a single PEM cert, or None if invalid."""
@@ -3622,6 +3634,15 @@ class FumitmPython:
                 'aikido-adopt', 'skipped',
                 'aikido-doctor not found in trusted system PATH'
             )
+        if self._aikido_built_bundles() is None:
+            # Adopting without being able to read the bundles would be a
+            # privileged command run blind, with no way to tell afterwards
+            # whether it took. Report the directory instead; that is the fault
+            # to fix.
+            run_dir = SUPPLEMENTAL_ROOTS['aikido']['run_dir']
+            message = f"Could not read Aikido's bundle directory {run_dir}"
+            self.print_error(message)
+            return ToolResult('aikido-adopt', 'failed', message)
         staged = self._stage_adoption_cert()
         if staged is None:
             return ToolResult('aikido-adopt', 'skipped', 'Provider root certificate not materialized')
@@ -3687,8 +3708,8 @@ class FumitmPython:
                     message = f'aikido-doctor exited 0 but did not adopt the {short} root'
                     self.print_error(message)
                     return ToolResult('aikido-adopt', 'failed', message)
-                lagging = ', '.join(os.path.basename(b)
-                                    for b in self._aikido_bundles_missing(staged))
+                missing = self._aikido_bundles_missing(staged) or []
+                lagging = ', '.join(os.path.basename(b) for b in missing)
                 self.print_warn(
                     f"Aikido recorded the {short} root but has not yet rebuilt: {lagging}")
             self.print_info(f"  ✓ Adopted {short} root into Aikido's CA bundles")
@@ -6417,6 +6438,11 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 "(run with --debug to see whether a candidate was rejected)"
             )
             return has_issues
+        if self._aikido_built_bundles() is None:
+            run_dir = SUPPLEMENTAL_ROOTS['aikido']['run_dir']
+            self.print_warn(f"  ✗ Could not read Aikido's bundle directory {run_dir}")
+            self.print_action("    Adoption cannot be verified until that is readable")
+            return True
         if self._aikido_trusts_root(temp_warp_cert):
             self.print_info("  ✓ Provider root adopted into Aikido's CA bundles")
         else:
