@@ -1,9 +1,9 @@
-"""
-Tests for Netskope provider support in fumitm.
+"""Tests for the Netskope provider.
 
-Covers provider detection, certificate retrieval, configuration resolution,
-and verifies that provider-specific values flow through to bundle paths,
-keytool aliases, and container certificate filenames.
+These tests cover the detection of the provider, the retrieval of the
+certificate, and the resolution of the configuration. They confirm that the
+values of the provider reach the bundle paths, the keytool aliases, and the
+names of the container certificate files.
 """
 import os
 from typing import ClassVar

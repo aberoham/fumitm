@@ -1,7 +1,7 @@
-"""
-Test helpers and utilities for fumitm tests.
+"""Helpers for the fumitm tests.
 
-This module provides helper classes and functions to simplify test setup and assertions.
+This module gives the classes and the functions that make a test setup and an
+assertion easier to write.
 """
 from contextlib import contextmanager
 from unittest.mock import MagicMock, mock_open, patch
@@ -200,13 +200,15 @@ class FumitmTestCase:
                                auto_yes=False, no_color=False,
                                headless=False, skip_update_check=False,
                                run_as_user=None, no_aikido=True, **kwargs):
-        """Create a FumitmPython instance with proper mocking.
+        """Make a FumitmPython instance with the necessary mocks.
 
-        Defaults to provider='warp' to skip auto-detection, which would
-        otherwise trigger subprocess calls (pgrep) that consume mock responses.
-        Defaults to no_aikido=True so supplemental-root detection does not run
-        against the host (which may actually have Aikido installed); tests that
-        exercise Aikido pass no_aikido=False or with_aikido=True explicitly.
+        The default provider is 'warp', thus the instance does not run
+        auto-detection. Auto-detection makes a subprocess call to pgrep, which
+        consumes a mock response.
+
+        The default of no_aikido is True, thus the detection of a supplemental root
+        does not examine the host, which can have an Aikido agent. A test for Aikido
+        gives no_aikido=False or with_aikido=True.
         """
         import fumitm
         with patch('platform.system', return_value='Darwin'):
@@ -228,8 +230,8 @@ class FumitmTestCase:
 def import_fumitm_windows():
     """Import the Windows version of fumitm.
 
-    Since fumitm_windows.py is in the parent directory, we need to use
-    importlib to load it as a module.
+    fumitm_windows.py is in the parent directory, thus this uses importlib to
+    load it as a module.
     """
     import importlib.util
     import os

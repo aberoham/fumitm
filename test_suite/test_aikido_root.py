@@ -754,7 +754,10 @@ class TestMultiRootMatching(FumitmTestCase):
 
 
 def _fingerprints(pem_text):
-    """SHA-256 of each cert's DER body — how Aikido names adopted-CA files."""
+    """Return the SHA-256 of the DER body of each certificate.
+
+    Aikido uses this value for the names of its adopted-CA files.
+    """
     import base64
     import hashlib
     out = []

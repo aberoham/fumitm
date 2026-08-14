@@ -1,7 +1,6 @@
-"""
-Centralized mock data for fumitm tests.
+"""Mock data for the fumitm tests.
 
-This module contains all mock responses and test data used across the test suite.
+This module has each mock response and each item of test data that the suite uses.
 """
 
 # Certificate mock data

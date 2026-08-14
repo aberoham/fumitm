@@ -1,7 +1,8 @@
-"""Tests for curlrc cacert handling (issue #90).
+"""Tests for the cacert directive in curlrc (issue #90).
 
-A cacert directive in curl's config file outranks CURL_CA_BUNDLE, so fumitm
-must detect it and keep its own managed cacert block last in the file.
+A cacert directive in the config file of curl has more authority than
+CURL_CA_BUNDLE. Thus fumitm must find it and keep its own managed cacert block
+last in the file.
 """
 import os
 from unittest.mock import patch
