@@ -2,7 +2,7 @@
 
 import argparse
 import base64
-import glob
+import fnmatch
 import hashlib
 import json
 import os
@@ -186,20 +186,21 @@ PROVIDERS = {
     },
 }
 
+# Groups whose write access to a root-owned *directory* grants nothing its
+# members do not already hold. macOS ships /Applications as root:admin
+# drwxrwxr-x, so treating group-writability as disqualifying would reject every
+# binary living in an application bundle — which is where vendor agents install.
+# Membership of admin already confers sudo, so honoring it costs no privilege
+# boundary, while the far more dangerous root:staff case (staff contains every
+# local user) stays rejected. The exemption is for directories only; an
+# executable that is itself group-writable is rejected whatever the group.
+PRIVILEGED_GROUPS = frozenset({0, 80})  # wheel, admin
+
 # Supplemental root CAs: vendors that perform *selective* TLS interception on
 # top of a primary provider. Unlike PROVIDERS, these are never selected to the
 # exclusion of others — when detected, their root is added to every bundle
 # fumitm builds *alongside* the primary provider's root. They are deliberately
 # kept out of PROVIDERS so _resolve_provider can never return one.
-# Groups whose write access to a root-owned directory grants nothing its members
-# do not already hold. macOS ships /Applications as root:admin drwxrwxr-x, so
-# treating group-writability as disqualifying would reject every binary living in
-# an application bundle — which is where vendor agents install. Membership of
-# admin already confers sudo, so honoring it costs no privilege boundary, while
-# the far more dangerous root:staff case (staff contains every local user) stays
-# rejected.
-PRIVILEGED_GROUPS = frozenset({0, 80})  # wheel, admin
-
 SUPPLEMENTAL_ROOTS = {
     'aikido': {
         'name': 'Aikido Endpoint Protection',
@@ -219,9 +220,20 @@ SUPPLEMENTAL_ROOTS = {
         # one another: on an observed host the pip and node bundles carried the
         # Netskope chain while the openssl and ruby bundles did not. Whether
         # Aikido trusts a root therefore cannot be answered from a single file.
-        # The proxy CA is deliberately unmatched — it holds Aikido's own root
-        # alone, so including it would fail the check permanently.
-        'bundle_globs': ('*-combined-ca.pem', '*-cafile.pem'),
+        #
+        # Only the per-tool bundles qualify, and the tool segment in the pattern
+        # is what selects them. Two files in the same directory look like
+        # bundles but are not maintained by `certconfig adopt`: the proxy CA,
+        # which holds Aikido's own root alone, and the legacy
+        # endpoint-protection-combined-ca.pem, which an adoption run leaves
+        # untouched — observed six weeks stale at three certificates while every
+        # per-tool bundle was rewritten in the same pass. Requiring the provider
+        # root in a file nothing maintains would deny trust permanently and
+        # re-run adoption on every invocation.
+        'bundle_globs': (
+            'endpoint-protection-*-combined-ca.pem',
+            'endpoint-protection-*-cafile.pem',
+        ),
         # Aikido records each CA adopted via `certconfig adopt` as a
         # <sha256>.pem here, keyed by the same fingerprint `adopt --forget`
         # takes. The directory is created on first adoption, so its absence
@@ -787,58 +799,92 @@ class FumitmPython:
         return fingerprints
 
     def _aikido_has_adopted(self, cert_path):
-        """Return True when Aikido's adopted-CA record covers every cert in cert_path.
+        """Return True when Aikido's adopted-CA record covers cert_path.
 
-        Aikido creates the record directory on first adoption, so its absence on
-        an agent that ships the `aikido-doctor` CLI means nothing has been
-        adopted. Only an agent without that CLI leaves the question unanswered,
-        which is reported as None.
+        Aikido creates the record directory on first adoption, so its absence
+        means nothing has been adopted. Callers reach this only after
+        establishing that the agent ships the `aikido-doctor` CLI, which is what
+        makes that reading safe.
+
+        One recorded fingerprint suffices rather than all of them, because the
+        record answers a narrower question than the bundles do: whether Aikido
+        was ever told about this certificate file. A provider chain can carry an
+        intermediate alongside its root — Netskope's does — and an intermediate
+        that never earns a record of its own would otherwise deny adoption
+        forever. Completeness of trust is the bundles' question, and they are
+        checked for every certificate.
+
+        Returns None when the certificates cannot be fingerprinted, since that
+        leaves the question genuinely unanswered.
         """
         adopted_dir = SUPPLEMENTAL_ROOTS['aikido']['adopted_dir']
         if not os.path.isdir(adopted_dir):
-            return False if self._find_aikido_doctor() else None
+            return False
         fingerprints = self._cert_fingerprints(cert_path)
         if not fingerprints:
             return None
-        return all(os.path.exists(os.path.join(adopted_dir, f'{fp}.pem'))
+        return any(os.path.exists(os.path.join(adopted_dir, f'{fp}.pem'))
                    for fp in fingerprints)
 
     def _aikido_built_bundles(self):
-        """Return every CA bundle Aikido builds and keeps current."""
-        descriptor = SUPPLEMENTAL_ROOTS['aikido']
-        bundles = []
-        for pattern in descriptor['bundle_globs']:
-            bundles.extend(glob.glob(os.path.join(descriptor['run_dir'], pattern)))
-        return sorted(set(bundles))
+        """Return every CA bundle `certconfig adopt` builds and keeps current.
 
-    def _aikido_bundles_contain(self, cert_path):
-        """Return True when every bundle Aikido builds carries cert_path's roots.
+        The directory is listed rather than globbed so that an unreadable
+        run_dir is reported instead of being silently indistinguishable from an
+        agent that builds no bundles at all — glob swallows the error, and the
+        empty result would send the caller down the legacy-agent branch.
+        """
+        descriptor = SUPPLEMENTAL_ROOTS['aikido']
+        run_dir = descriptor['run_dir']
+        try:
+            entries = os.listdir(run_dir)
+        except OSError as e:
+            self.print_debug(f"Could not list Aikido's bundle directory {run_dir}: {e}")
+            return []
+        return sorted(
+            os.path.join(run_dir, name)
+            for name in entries
+            if any(fnmatch.fnmatch(name, p) for p in descriptor['bundle_globs'])
+        )
+
+    def _aikido_bundles_missing(self, cert_path):
+        """Return the bundles Aikido builds that are missing cert_path's roots.
 
         Every bundle must carry them, not merely one: Aikido's bundles disagree,
         so a root present in the pip bundle says nothing about the openssl one.
-        An agent with no bundles at all answers False rather than vacuously True.
         """
-        bundles = self._aikido_built_bundles()
-        return bool(bundles) and all(
-            self.certificate_exists_in_file(cert_path, bundle) for bundle in bundles
-        )
+        return [bundle for bundle in self._aikido_built_bundles()
+                if not self.certificate_exists_in_file(cert_path, bundle)]
 
     def _aikido_trusts_root(self, cert_path):
-        """Return True when every bundle Aikido builds carries cert_path's roots.
+        """Return True when Aikido both carries cert_path's roots and recorded them.
 
-        The bundles are the ground truth, because they are what the tools Aikido
-        configures actually read. An adoption record cannot stand in for them: a
-        root adopted once still vanishes from any bundle Aikido later rebuilds
-        from a source that lacks it, and a record left behind would go on
-        asserting trust that no longer exists. Re-adopting is the cure for that
-        drift and converges rather than repeating, since `certconfig adopt`
-        reinstalls every rule and brings all bundles current. The record answers
-        only for an agent that exposes no bundles at all.
+        The bundles are the ground truth for whether trust exists right now,
+        because they are what the tools Aikido configures actually read, so a
+        single lagging bundle denies trust outright and no adoption record
+        excuses it — a root adopted once still vanishes from any bundle Aikido
+        later rebuilds from a source that lacks it.
+
+        The record is nonetheless required whenever it can be read, because
+        bundles alone cannot distinguish trust Aikido was told to keep from
+        trust it happened to inherit. Aikido seeds some bundles from the macOS
+        System keychain, which already holds the provider root, so those bundles
+        can carry it while Aikido has never been told about it — and the next
+        rebuild from any other source drops it. Adopting registers it durably.
+
+        Re-adopting converges rather than repeating: `certconfig adopt`
+        reinstalls every rule, which on agent 1.7.28 took the openssl and ruby
+        bundles from 128 to 130 certificates and created the record in the same
+        pass. When the certificates cannot be fingerprinted the record is
+        unanswerable and the bundles decide alone.
         """
         bundles = self._aikido_built_bundles()
-        if bundles:
-            return self._aikido_bundles_contain(cert_path)
-        return self._aikido_has_adopted(cert_path) is True
+        if bundles and self._aikido_bundles_missing(cert_path):
+            return False
+        record = self._aikido_has_adopted(cert_path)
+        if record is not None:
+            return record
+        return bool(bundles)
 
     def _openssl_subject(self, cert_pem):
         """Return the openssl subject line for a single PEM cert, or None if invalid."""
@@ -3476,36 +3522,58 @@ class FumitmPython:
 
     @staticmethod
     def _trusted_system_executable(path):
-        """Return a canonical executable path only when its chain is trusted.
+        """Vet an executable for root-level invocation.
+
+        Returns `(resolved_path, None)` when the path is trusted, or
+        `(None, reason)` naming the specific disqualification. The reason is not
+        decoration: a rejected candidate is reported to the user, and a message
+        that blames the wrong cause is worse than none.
 
         The aikido-adopt tool may execute this binary as root, so a path
-        selected from a target user's PATH must not be trusted merely because
-        it exists. Require the executable and every parent directory to be
-        root-owned and not writable by group or other users, then execute the
-        canonical path so a user-controlled symlink cannot be swapped after
-        validation.
+        selected from a target user's PATH must not be trusted merely because it
+        exists. The executable itself must be root-owned and writable by nobody
+        else — group-writability is disqualifying whatever the group, since
+        anyone in it could rewrite the binary's bytes without ever holding root.
+        Its parent directories must likewise be root-owned and not
+        world-writable, but there group-writability is tolerated for
+        PRIVILEGED_GROUPS.
+
+        That tolerance leaves a residual race, stated plainly because the
+        earlier docstring denied it: write permission on a directory allows
+        unlinking and recreating the file it holds, so a process running as a
+        member of admin can replace a validated binary between this check and
+        the privileged execution. Resolving the symlink narrows the window but
+        does not close it. The exposure is accepted on the same ground as
+        PRIVILEGED_GROUPS itself — admin membership already confers sudo, so an
+        attacker who has it can invoke the doctor directly and gains nothing
+        from the swap.
         """
         try:
             resolved = os.path.realpath(path)
             if not os.path.isabs(resolved) or not os.path.isfile(resolved):
-                return None
+                return None, 'not an absolute path to a regular file'
             if not os.access(resolved, os.X_OK):
-                return None
+                return None, 'not executable'
 
             current = resolved
+            is_executable = True
             while True:
                 info = os.stat(current)
-                if info.st_uid != 0 or info.st_mode & stat.S_IWOTH:
-                    return None
-                if info.st_mode & stat.S_IWGRP and info.st_gid not in PRIVILEGED_GROUPS:
-                    return None
+                if info.st_uid != 0:
+                    return None, f'{current} is not owned by root'
+                if info.st_mode & stat.S_IWOTH:
+                    return None, f'{current} is world-writable'
+                if info.st_mode & stat.S_IWGRP and (
+                        is_executable or info.st_gid not in PRIVILEGED_GROUPS):
+                    return None, f'{current} is group-writable'
                 parent = os.path.dirname(current)
                 if parent == current:
                     break
                 current = parent
-            return resolved
-        except OSError:
-            return None
+                is_executable = False
+            return resolved, None
+        except OSError as e:
+            return None, f'could not be inspected: {e}'
 
     def _find_aikido_doctor(self):
         """Find aikido-doctor without selecting an untrusted user executable.
@@ -3518,13 +3586,14 @@ class FumitmPython:
         for directory in os.environ.get('PATH', '').split(os.pathsep):
             directory = directory or os.curdir
             candidate = os.path.join(directory, 'aikido-doctor')
-            trusted = self._trusted_system_executable(candidate)
+            trusted, reason = self._trusted_system_executable(candidate)
             if trusted:
                 return trusted
-            if os.path.exists(candidate):
-                self.print_debug(
-                    f"Ignoring {candidate}: not owned by root through its whole path"
-                )
+            # lexists, not exists: a dangling symlink is the likeliest shape of
+            # a broken install now that the doctor resolves into an application
+            # bundle, and following the link would hide exactly that case.
+            if os.path.lexists(candidate):
+                self.print_debug(f"Ignoring {candidate}: {reason}")
         return None
 
     def setup_aikido_adopt(self):
@@ -3565,16 +3634,14 @@ class FumitmPython:
                                   'Provider root already adopted by Aikido')
 
             as_root = os.getuid() == 0
-            argv = [doctor, 'certconfig', 'adopt', staged]
-            if not as_root:
-                argv = ['sudo'] + argv
+            prefix = [] if as_root else ['sudo']
+            argv = prefix + [doctor, 'certconfig', 'adopt', staged]
             # Messages reference the durable cert path, not the staged copy,
             # which is gone by the time a user could rerun the command. The
             # parts are shell-quoted because the doctor resolves into an
             # application bundle whose name contains spaces, and this string is
             # printed for the user to paste into a shell.
-            command_str = shlex.join(
-                (['sudo'] if not as_root else []) + [doctor, 'certconfig', 'adopt', self.cert_path])
+            command_str = shlex.join(argv[:-1] + [self.cert_path])
 
             if not self.is_install_mode():
                 self.print_action(f"Would run: {command_str}")
@@ -3609,9 +3676,21 @@ class FumitmPython:
                 return ToolResult('aikido-adopt', 'failed', message)
 
             if not self._aikido_trusts_root(staged):
-                message = f'aikido-doctor exited 0 but did not adopt the {short} root'
-                self.print_error(message)
-                return ToolResult('aikido-adopt', 'failed', message)
+                # A doctor that exited 0 without leaving a record did not adopt,
+                # and saying so is the whole point of verifying. But bundles are
+                # rebuilt by the agent, not by the CLI's return, so a bundle
+                # still lagging after a recorded adoption is a state we neither
+                # control nor can wait out — failing on it would turn every
+                # scheduled MDM run red for a condition the next agent pass
+                # clears. Name the laggards instead.
+                if self._aikido_has_adopted(staged) is not True:
+                    message = f'aikido-doctor exited 0 but did not adopt the {short} root'
+                    self.print_error(message)
+                    return ToolResult('aikido-adopt', 'failed', message)
+                lagging = ', '.join(os.path.basename(b)
+                                    for b in self._aikido_bundles_missing(staged))
+                self.print_warn(
+                    f"Aikido recorded the {short} root but has not yet rebuilt: {lagging}")
             self.print_info(f"  ✓ Adopted {short} root into Aikido's CA bundles")
             return ToolResult('aikido-adopt', 'configured',
                               'Adopted provider root into Aikido CA bundles')

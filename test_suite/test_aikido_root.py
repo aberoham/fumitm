@@ -879,7 +879,7 @@ class TestAikidoDoctorPathSafety(FumitmTestCase):
         doctor.write_text('#!/bin/sh\n')
         doctor.chmod(0o755)
         inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
-        assert inst._trusted_system_executable(str(doctor)) is None
+        assert inst._trusted_system_executable(str(doctor))[0] is None
 
     def test_accepts_a_binary_under_a_group_writable_applications_dir(self, tmp_path):
         # macOS ships /Applications as root:admin drwxrwxr-x, so rejecting
@@ -889,7 +889,19 @@ class TestAikidoDoctorPathSafety(FumitmTestCase):
         inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
         applications = str(tmp_path)
         with _stat_override({applications: (0, 80, 0o775)}):
-            assert inst._trusted_system_executable(str(doctor)) == str(doctor)
+            assert inst._trusted_system_executable(str(doctor)) == (str(doctor), None)
+
+    def test_rejects_a_group_writable_binary_however_privileged_the_group(self, tmp_path):
+        # The directory exemption exists because write access to a root-owned
+        # directory grants an admin member nothing new. Write access to the
+        # binary itself is a different thing entirely: it rewrites the bytes
+        # fumitm is about to run as root.
+        doctor = self._doctor(tmp_path)
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+        with _stat_override({str(doctor): (0, 80, 0o775)}):
+            resolved, reason = inst._trusted_system_executable(str(doctor))
+        assert resolved is None
+        assert 'group-writable' in reason
 
     def test_rejects_group_writable_by_an_unprivileged_group(self, tmp_path):
         # staff contains every local user on macOS, so a root:staff writable
@@ -897,19 +909,47 @@ class TestAikidoDoctorPathSafety(FumitmTestCase):
         doctor = self._doctor(tmp_path)
         inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
         with _stat_override({str(tmp_path): (0, 20, 0o775)}):
-            assert inst._trusted_system_executable(str(doctor)) is None
+            assert inst._trusted_system_executable(str(doctor))[0] is None
 
     def test_rejects_world_writable_even_under_a_privileged_group(self, tmp_path):
         doctor = self._doctor(tmp_path)
         inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
         with _stat_override({str(tmp_path): (0, 80, 0o777)}):
-            assert inst._trusted_system_executable(str(doctor)) is None
+            assert inst._trusted_system_executable(str(doctor))[0] is None
 
     def test_rejects_a_non_root_owner_however_privileged_the_group(self, tmp_path):
         doctor = self._doctor(tmp_path)
         inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
         with _stat_override({str(tmp_path): (501, 80, 0o755)}):
-            assert inst._trusted_system_executable(str(doctor)) is None
+            assert inst._trusted_system_executable(str(doctor))[0] is None
+
+    def test_rejection_reason_names_the_actual_cause(self, tmp_path):
+        # A diagnostic that blames root ownership for every rejection is worse
+        # than none: it sends the reader looking for a problem that isn't there.
+        doctor = self._doctor(tmp_path)
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+        with _stat_override({str(tmp_path): (0, 20, 0o775)}):
+            assert 'group-writable' in inst._trusted_system_executable(str(doctor))[1]
+        with _stat_override({str(tmp_path): (501, 0, 0o755)}):
+            assert 'not owned by root' in inst._trusted_system_executable(str(doctor))[1]
+        missing = tmp_path / 'nope' / 'aikido-doctor'
+        assert 'regular file' in inst._trusted_system_executable(str(missing))[1]
+        doctor.chmod(0o644)
+        assert 'not executable' in inst._trusted_system_executable(str(doctor))[1]
+
+    def test_dangling_symlink_is_reported_rather_than_passed_over(self, tmp_path):
+        # os.path.exists follows the link, so a broken install — the likeliest
+        # shape now that the doctor resolves into an application bundle — used to
+        # produce no diagnostic at all while the message told users to run
+        # --debug for one.
+        bin_dir = tmp_path / 'bin'
+        bin_dir.mkdir()
+        (bin_dir / 'aikido-doctor').symlink_to(tmp_path / 'gone' / 'aikido-doctor')
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+        with patch.dict(os.environ, {'PATH': str(bin_dir)}), \
+             patch.object(inst, 'print_debug') as debug:
+            assert inst._find_aikido_doctor() is None
+        assert any('aikido-doctor' in call.args[0] for call in debug.call_args_list)
 
     def test_manual_command_is_shell_quoted(self, tmp_path, capsys):
         # The doctor resolves into "/Applications/Aikido Endpoint
@@ -1033,9 +1073,9 @@ class TestCertFingerprints(FumitmTestCase):
 
 
 class TestAikidoAdoptionState(FumitmTestCase):
-    """Either the adopted-CA record or every built bundle establishes trust."""
+    """Trust needs both signals: every built bundle carries it, and it is recorded."""
 
-    def test_adopted_when_every_fingerprint_present(self, tmp_path):
+    def test_adopted_when_recorded_and_carried(self, tmp_path):
         inst = _adopt_instance(tmp_path)
         with _patch_aikido_paths(tmp_path, adopted=True, bundle_has_root=True):
             assert inst._aikido_has_adopted(inst.cert_path) is True
@@ -1051,12 +1091,29 @@ class TestAikidoAdoptionState(FumitmTestCase):
             assert inst._aikido_has_adopted(inst.cert_path) is True
             assert inst._aikido_trusts_root(inst.cert_path) is False
 
+    def test_bundle_presence_alone_is_not_adoption(self, tmp_path):
+        # Aikido seeds some bundles from the System keychain, which already
+        # holds the provider root, so every bundle can carry a root Aikido was
+        # never told to keep — and the next rebuild from any other source drops
+        # it. Reading the bundles alone would report success and register
+        # nothing, which is the original defect wearing the opposite face.
+        inst = _adopt_instance(tmp_path)
+        with _patch_aikido_paths(tmp_path, adopted=False, bundle_has_root=True), \
+             _doctor_on_path(inst):
+            assert inst._aikido_bundles_missing(inst.cert_path) == []
+            assert inst._aikido_has_adopted(inst.cert_path) is False
+            assert inst._aikido_trusts_root(inst.cert_path) is False
+
     def test_not_adopted_when_store_lacks_fingerprint(self, tmp_path):
         inst = _adopt_instance(tmp_path)
         with _patch_aikido_paths(tmp_path, adopted=False):
             assert inst._aikido_has_adopted(inst.cert_path) is False
 
-    def test_not_adopted_when_store_has_only_one_of_two(self, tmp_path):
+    def test_one_recorded_fingerprint_is_enough(self, tmp_path):
+        # A provider chain can carry an intermediate alongside its root —
+        # Netskope's does — and an intermediate that never earns a record of its
+        # own would otherwise deny adoption forever. Completeness is the
+        # bundles' question.
         inst = _adopt_instance(tmp_path)
         both = tmp_path / 'two-certs.pem'
         both.write_text(
@@ -1069,45 +1126,34 @@ class TestAikidoAdoptionState(FumitmTestCase):
             (tmp_path / 'adopted-cas' / f'{fingerprints[0]}.pem').write_text(
                 mock_data.MOCK_CERTIFICATE
             )
-            assert inst._aikido_has_adopted(inst.cert_path) is False
+            assert inst._aikido_has_adopted(inst.cert_path) is True
 
-    def test_empty_cert_is_not_reported_as_adopted(self, tmp_path):
+    def test_unfingerprintable_cert_leaves_the_record_unanswered(self, tmp_path):
         inst = _adopt_instance(tmp_path)
         empty = tmp_path / 'empty.pem'
         empty.write_text('')
         inst.cert_path = str(empty)
         with _patch_aikido_paths(tmp_path, adopted=False):
             assert inst._aikido_has_adopted(inst.cert_path) is None
-            assert inst._aikido_trusts_root(inst.cert_path) is False
 
-    def test_missing_store_is_not_adopted_when_the_doctor_exists(self, tmp_path):
-        # Aikido creates the record on first adoption, so an agent that ships
-        # the CLI and has no record has simply adopted nothing.
+    def test_missing_store_is_not_adopted(self, tmp_path):
+        # Aikido creates the record on first adoption, so its absence means
+        # nothing has been adopted. Callers reach this only after establishing
+        # the agent ships the CLI, which is what makes that reading safe.
         inst = _adopt_instance(tmp_path)
-        with _patch_aikido_paths(tmp_path, store=False), _doctor_on_path(inst):
+        with _patch_aikido_paths(tmp_path, store=False):
             assert inst._aikido_has_adopted(inst.cert_path) is False
-
-    def test_missing_store_is_unknown_without_the_doctor(self, tmp_path):
-        inst = _adopt_instance(tmp_path)
-        with _patch_aikido_paths(tmp_path, store=False), _no_doctor(inst):
-            assert inst._aikido_has_adopted(inst.cert_path) is None
-
-    def test_every_bundle_carrying_the_root_establishes_trust(self, tmp_path):
-        # What matters downstream is whether the tools Aikido points at these
-        # bundles trust the root, however it got there.
-        inst = _adopt_instance(tmp_path)
-        with _patch_aikido_paths(tmp_path, adopted=False, bundle_has_root=True), \
-             _doctor_on_path(inst):
-            assert inst._aikido_has_adopted(inst.cert_path) is False
-            assert inst._aikido_trusts_root(inst.cert_path) is True
 
     def test_one_lagging_bundle_denies_trust(self, tmp_path):
         # The case that motivated this: pip and node carried the Netskope chain
         # while openssl and ruby did not, and checking pip alone hid it.
         inst = _adopt_instance(tmp_path)
-        with _patch_aikido_paths(tmp_path, adopted=False, bundle_has_root=True,
+        with _patch_aikido_paths(tmp_path, adopted=True, bundle_has_root=True,
                                  one_bundle_lags=True), _doctor_on_path(inst):
-            assert inst._aikido_bundles_contain(inst.cert_path) is False
+            missing = inst._aikido_bundles_missing(inst.cert_path)
+            assert [os.path.basename(b) for b in missing] == [
+                'endpoint-protection-openssl-combined-ca.pem'
+            ]
             assert inst._aikido_trusts_root(inst.cert_path) is False
 
     def test_proxy_ca_file_is_not_treated_as_a_bundle(self, tmp_path):
@@ -1119,24 +1165,46 @@ class TestAikidoAdoptionState(FumitmTestCase):
         assert bundles
         assert not any('proxy-ca-crt' in b for b in bundles)
 
-    def test_no_bundles_at_all_denies_trust(self, tmp_path):
+    def test_legacy_unmaintained_bundle_is_not_treated_as_a_bundle(self, tmp_path):
+        # endpoint-protection-combined-ca.pem sits beside the per-tool bundles
+        # and looks exactly like one, but `certconfig adopt` leaves it alone —
+        # observed six weeks stale at three certificates while every per-tool
+        # bundle was rewritten in the same pass. Requiring the provider root in
+        # a file nothing maintains denies trust permanently and re-runs adoption
+        # on every invocation.
+        inst = _adopt_instance(tmp_path)
+        with _patch_aikido_paths(tmp_path, adopted=True, bundle_has_root=True):
+            (tmp_path / 'run' / 'endpoint-protection-combined-ca.pem').write_text(
+                mock_data.MOCK_AIKIDO_ROOT_CERT
+            )
+            assert not any(b.endswith('/endpoint-protection-combined-ca.pem')
+                           for b in inst._aikido_built_bundles())
+            assert inst._aikido_trusts_root(inst.cert_path) is True
+
+    def test_unreadable_run_dir_is_reported_not_silently_empty(self, tmp_path):
+        # An unreadable directory and an agent that builds no bundles are
+        # different diagnoses, and glob conflates them by swallowing the error.
+        inst = _adopt_instance(tmp_path)
+        with _patch_aikido_paths(tmp_path, adopted=True, bundle_has_root=True), \
+             patch('fumitm.os.listdir', side_effect=PermissionError('denied')), \
+             patch.object(inst, 'print_debug') as debug:
+            assert inst._aikido_built_bundles() == []
+        assert any('bundle directory' in call.args[0] for call in debug.call_args_list)
+
+    def test_no_bundles_at_all_falls_back_to_the_record(self, tmp_path):
         inst = _adopt_instance(tmp_path)
         import fumitm
         empty_run = tmp_path / 'empty-run'
         empty_run.mkdir()
+        store = tmp_path / 'adopted-cas'
+        store.mkdir(exist_ok=True)
         with patch.dict(fumitm.SUPPLEMENTAL_ROOTS['aikido'],
-                        {'run_dir': str(empty_run)}):
-            assert inst._aikido_bundles_contain(inst.cert_path) is False
-
-    def test_falls_back_to_bundles_without_a_store(self, tmp_path):
-        inst = _adopt_instance(tmp_path)
-        with _patch_aikido_paths(tmp_path, store=False, bundle_has_root=True), \
-             _no_doctor(inst):
-            assert inst._aikido_has_adopted(inst.cert_path) is None
-            assert inst._aikido_trusts_root(inst.cert_path) is True
-        with _patch_aikido_paths(tmp_path, store=False, bundle_has_root=False), \
-             _no_doctor(inst):
+                        {'run_dir': str(empty_run), 'adopted_dir': str(store)}):
+            assert inst._aikido_built_bundles() == []
             assert inst._aikido_trusts_root(inst.cert_path) is False
+            for fp in _fingerprints(mock_data.MOCK_CERTIFICATE):
+                (store / f'{fp}.pem').write_text(mock_data.MOCK_CERTIFICATE)
+            assert inst._aikido_trusts_root(inst.cert_path) is True
 
 
 class TestAikidoAdoptRegistry(FumitmTestCase):
@@ -1227,16 +1295,32 @@ class TestAikidoAdoptIdempotency(FumitmTestCase):
         assert result.status == 'configured'
         mock_run.assert_called_once()
 
-    def test_second_run_is_a_no_op_when_only_the_bundles_record_it(self, tmp_path):
-        # An adoption Aikido books somewhere other than the record directory
-        # must not be repeated on every subsequent run: that would re-prompt for
-        # sudo and report a change on every play.
+    def test_runs_adopt_when_the_bundles_carry_an_unregistered_root(self, tmp_path):
+        # Bundles seeded from the System keychain already hold the provider
+        # root, so treating them as proof of adoption would skip the one step
+        # that makes the trust survive Aikido's next rebuild.
         inst = _adopt_instance(tmp_path)
         with _on_macos(), _doctor_on_path(inst), \
-             _patch_aikido_paths(tmp_path, store=False, bundle_has_root=True), \
-             patch('fumitm.subprocess.run') as mock_run:
+             _patch_aikido_paths(tmp_path, adopted=False, bundle_has_root=True), \
+             patch('fumitm.os.getuid', return_value=0), \
+             patch('fumitm.subprocess.run',
+                   side_effect=_adopts_on_run(tmp_path)) as mock_run:
             result = inst.setup_aikido_adopt()
-        assert result.status == 'already_ok'
+        assert result.status == 'configured'
+        mock_run.assert_called_once()
+
+    def test_third_run_is_a_no_op_once_both_signals_agree(self, tmp_path):
+        # Convergence, restated as a test: having adopted, the next run must do
+        # nothing, or every scheduled play re-prompts for sudo and reports a
+        # change.
+        inst = _adopt_instance(tmp_path)
+        with _on_macos(), _doctor_on_path(inst), \
+             _patch_aikido_paths(tmp_path, adopted=False, bundle_has_root=True), \
+             patch('fumitm.os.getuid', return_value=0), \
+             patch('fumitm.subprocess.run', side_effect=_adopts_on_run(tmp_path)):
+            assert inst.setup_aikido_adopt().status == 'configured'
+            with patch('fumitm.subprocess.run') as mock_run:
+                assert inst.setup_aikido_adopt().status == 'already_ok'
         mock_run.assert_not_called()
 
 
@@ -1408,10 +1492,10 @@ class TestAikidoAdoptFailure(FumitmTestCase):
         assert result.status == 'failed'
         assert 'did not adopt' in result.message
 
-    def test_adoption_booked_only_in_the_bundles_succeeds(self, tmp_path):
-        # Where Aikido keeps its bookkeeping is undocumented. An adoption that
-        # reaches every bundle without leaving a record must still count, or it
-        # would be reported as a failure and repeated on every run.
+    def test_adoption_leaving_no_record_is_a_failure(self, tmp_path):
+        # Agent 1.7.28 writes the record in the same pass that rebuilds the
+        # bundles, so bundles repaired without one means the adoption did not
+        # register and nothing will survive the next rebuild.
         inst = _adopt_instance(tmp_path)
         with _on_macos(), _doctor_on_path(inst), \
              _patch_aikido_paths(tmp_path, store=False), \
@@ -1419,7 +1503,33 @@ class TestAikidoAdoptFailure(FumitmTestCase):
              patch('fumitm.subprocess.run',
                    side_effect=_adopts_into_bundles(tmp_path)):
             result = inst.setup_aikido_adopt()
+        assert result.status == 'failed'
+        assert 'did not adopt' in result.message
+
+    def test_recorded_adoption_with_a_lagging_bundle_is_not_a_failure(self, tmp_path):
+        # Bundles are rebuilt by the agent, not by the CLI's return, so a bundle
+        # still behind after a recorded adoption is a state fumitm neither
+        # controls nor can wait out. Failing on it turns every scheduled MDM run
+        # red for a condition the next agent pass clears.
+        inst = _adopt_instance(tmp_path)
+
+        def records_only(argv, **kwargs):
+            store = tmp_path / 'adopted-cas'
+            store.mkdir(exist_ok=True)
+            for fp in _fingerprints(mock_data.MOCK_CERTIFICATE):
+                (store / f'{fp}.pem').write_text(mock_data.MOCK_CERTIFICATE)
+            return MagicMock(returncode=0, stdout='', stderr='')
+
+        with _on_macos(), _doctor_on_path(inst), \
+             _patch_aikido_paths(tmp_path, adopted=False, bundle_has_root=True,
+                                 one_bundle_lags=True), \
+             patch('fumitm.os.getuid', return_value=0), \
+             patch('fumitm.subprocess.run', side_effect=records_only), \
+             patch.object(inst, 'print_warn') as warn:
+            result = inst.setup_aikido_adopt()
         assert result.status == 'configured'
+        assert any('endpoint-protection-openssl-combined-ca.pem' in call.args[0]
+                   for call in warn.call_args_list)
 
     def test_staged_copy_removed_after_failure(self, tmp_path):
         # The staged private copy must not accumulate in the temp directory,
@@ -1488,8 +1598,11 @@ class TestAikidoAdoptStatus(FumitmTestCase):
                                  one_bundle_lags=True):
             assert inst.check_aikido_adopt_status(self._temp_cert(tmp_path)) is True
 
-    def test_false_when_every_bundle_carries_the_root(self, tmp_path):
+    def test_true_when_bundles_carry_an_unregistered_root(self, tmp_path):
+        # Bundles seeded from the System keychain hold the root already; status
+        # must still flag the host, because nothing has been registered and the
+        # trust does not survive Aikido's next rebuild.
         inst = _adopt_instance(tmp_path, mode='status')
         with _on_macos(), _doctor_on_path(inst), \
              _patch_aikido_paths(tmp_path, adopted=False, bundle_has_root=True):
-            assert inst.check_aikido_adopt_status(self._temp_cert(tmp_path)) is False
+            assert inst.check_aikido_adopt_status(self._temp_cert(tmp_path)) is True
