@@ -119,12 +119,19 @@ terminal they print the command to run manually instead. Adoption is macOS-only,
 since the adopted-CA record it is verified against lives under
 `/Library/Application Support`; bundle inclusion still works everywhere.
 
-Whether the root has been adopted is read from Aikido's own record of it,
-`EndpointProtection/run/adopted-cas/<sha256>.pem`, so repeat runs report
-`already_ok` without asking for sudo. Note that finding the root *inside* one of
-Aikido's bundles proves nothing on its own — those are built from the system
-trust store, so any keychain-installed root appears there without having been
-adopted; that weaker check is used only for agents that keep no such record.
+Adoption is considered done only when two things hold, and repeat runs then
+report `already_ok` without asking for sudo. Every per-tool bundle Aikido builds
+must carry the root, since those files are what the tools it configures actually
+read, and they disagree with one another: on an observed host the pip and node
+bundles carried the Netskope chain while the openssl and ruby bundles did not,
+so checking one told you nothing about the rest. Aikido must also have a record
+of it at `EndpointProtection/run/adopted-cas/<sha256>.pem`. The record is
+required because finding the root inside the bundles proves nothing on its own —
+several are seeded from the system trust store, so any keychain-installed root
+appears there without Aikido having been told to keep it, and the next rebuild
+from another source drops it again. The record cannot stand in for the bundles
+either: a root adopted once still vanishes from a bundle Aikido later rebuilds.
+
 The existing workarounds (trust-var reclaim, curlrc override, exports kept last
 in shell startup files) stay in place for hosts whose agent predates
 `certconfig`.

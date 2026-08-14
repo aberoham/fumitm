@@ -37,6 +37,15 @@ command instead, rather than exiting 2. The adoption step is macOS-only —
 Aikido's adopted-CA record lives under `/Library/Application Support`, so on
 other platforms the step is skipped; the bundle inclusion above still applies.
 
+Expect this step to report a change on the first pass across a fleet, including
+on hosts that look configured. Aikido seeds several of its bundles from the
+macOS System keychain, so the provider root is often already present without
+Aikido having been told to keep it — those hosts adopt once and are `already_ok`
+from then on. A zero exit from `aikido-doctor` that leaves no adoption record is
+reported as `failed`; a record with a bundle Aikido has not yet rebuilt is
+reported as `configured` with a warning naming the bundle, since the agent
+rebuilds on its own schedule and the next pass clears it.
+
 ## Exit Codes
 
 | Code | Meaning | Orchestrator guidance |
