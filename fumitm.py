@@ -112,7 +112,7 @@ def get_version_info():
             if result.returncode == 0 and result.stdout.strip():
                 version_info['version'] = result.stdout.strip()
             else:
-                # No tags, use commit count as version
+                # There is no tag. Use the number of commits as the version.
                 result = subprocess.run(
                     ['git', 'rev-list', '--count', 'HEAD'],
                     cwd=script_dir,
@@ -123,12 +123,11 @@ def get_version_info():
                     count = result.stdout.strip()
                     version_info['version'] = f"0.{count}.0"
             
-            # Add dirty flag to version if needed
             if version_info['dirty'] and version_info['version'] != 'unknown':
                 version_info['version'] += '-dirty'
     
     except Exception:
-        # Git not available or not a git repository
+        # git is absent, or this is not a git repository.
         pass
     
     return version_info
@@ -317,7 +316,7 @@ class FumitmPython:
         # during a run.
         self._aikido_adopt_supported = None
 
-        # User targeting for JAMF/Ansible/Puppet (Phase 2)
+        # User targeting for JAMF, Ansible, and Puppet
         self._target_uid = None
         self._target_gid = None
         self._run_as_user = run_as_user
@@ -500,7 +499,6 @@ class FumitmPython:
             },
         }
         
-        # Add platform check
         if platform.system() != 'Darwin':
             self.print_warn("This script is designed for macOS. Most features will not work correctly.")
 
@@ -576,7 +574,6 @@ class FumitmPython:
             if os.path.exists(path):
                 return True
 
-        # Check for encrypted cert variant
         for path in cert_sources:
             if os.path.exists(path + '.enc'):
                 return True
@@ -928,7 +925,6 @@ class FumitmPython:
         if not tool_info:
             return False
         
-        # Check if tool key or any of its tags match the selection
         for selection in self.selected_tools:
             selection_lower = selection.lower()
             if selection_lower == tool_key:
@@ -967,7 +963,6 @@ class FumitmPython:
             selection_lower = selection.lower()
             found = False
             
-            # Check all tools for matching key or tag
             for tool_key, tool_info in self.tools_registry.items():
                 if selection_lower == tool_key:
                     found = True
@@ -1100,13 +1095,11 @@ class FumitmPython:
         """
         output_file = file or sys.stdout
 
-        # Console output: strip ANSI if color is disabled
         if self._use_color:
             print(message, file=output_file)
         else:
             print(self._strip_ansi(message), file=output_file)
 
-        # Text log: always strip ANSI, add timestamp
         if self._log_file_handle:
             ts = datetime.now(timezone.utc).astimezone().strftime('%Y-%m-%dT%H:%M:%S')
             plain = self._strip_ansi(message)
@@ -1115,7 +1108,6 @@ class FumitmPython:
             )
             self._log_file_handle.flush()
 
-        # JSON-lines log
         if self._json_log_file_handle:
             event = {
                 'ts': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
@@ -1188,7 +1180,7 @@ class FumitmPython:
             bool: True if an update is available.
         """
         try:
-            # Use unverified SSL context - WARP might not be configured yet
+            # The context is unverified. Trust of the proxy CA can be absent.
             context = ssl._create_unverified_context()
             url = "https://raw.githubusercontent.com/aberoham/fumitm/main/fumitm.py"
 
@@ -1198,7 +1190,6 @@ class FumitmPython:
             with urllib.request.urlopen(req, context=context, timeout=10) as response:
                 remote_content = response.read().decode('utf-8')
 
-            # Extract remote version using regex
             version_match = re.search(r'^__version__\s*=\s*["\']([0-9.]+)["\']',
                                       remote_content, re.MULTILINE)
 
@@ -1212,7 +1203,6 @@ class FumitmPython:
             self.print_debug(f"Local version:  {local_version}")
             self.print_debug(f"Remote version: {remote_version}")
 
-            # Parse and compare versions
             try:
                 local_tuple = parse_calver(local_version)
                 remote_tuple = parse_calver(remote_version)
@@ -1277,7 +1267,7 @@ class FumitmPython:
         elif os.path.isdir(os.path.dirname(path)):
             return os.access(os.path.dirname(path), os.W_OK)
         else:
-            # Path doesn't exist, check parent directories
+            # The path is absent. Examine the parent directories.
             parent = os.path.dirname(path)
             while not os.path.isdir(parent) and parent != '/':
                 parent = os.path.dirname(parent)
@@ -1445,7 +1435,7 @@ class FumitmPython:
         # Try environment variable first (current session)
         shell_path = os.environ.get('SHELL')
 
-        # Fallback to pwd module — use target user when running as root
+        # Use the pwd module. Under root, use the target user.
         if not shell_path:
             try:
                 lookup_uid = self._target_uid if self._target_uid is not None else os.getuid()
@@ -1457,10 +1447,8 @@ class FumitmPython:
         if not shell_path:
             shell_path = '/bin/zsh'
         
-        # Extract just the shell name
         shell_name = os.path.basename(shell_path)
         
-        # Normalize common shells
         known_shells = {'bash', 'zsh', 'fish', 'sh', 'tcsh', 'csh', 'dash'}
         
         if shell_name in known_shells:
@@ -1661,7 +1649,6 @@ class FumitmPython:
         Returns:
             bool: True if fumitm found a broken variable.
         """
-        # Environment variables to check (simple file path variables)
         ca_env_vars = [
             'CURL_CA_BUNDLE',
             'SSL_CERT_FILE',
@@ -1673,7 +1660,6 @@ class FumitmPython:
 
         broken_vars = []
 
-        # Check simple path variables
         for var_name in ca_env_vars:
             var_value = os.environ.get(var_name, '')
             if var_value and not os.path.exists(var_value):
@@ -1691,7 +1677,6 @@ class FumitmPython:
         if not broken_vars:
             return False
 
-        # Display prominent warning
         print()
         self.print_warn("=" * 60)
         self.print_warn("BROKEN ENVIRONMENT DETECTED")
@@ -1705,7 +1690,6 @@ class FumitmPython:
             self.print_error("    FILE DOES NOT EXIST")
             print()
 
-        # Provide remediation steps
         self.print_info("To fix in your CURRENT shell session:")
         for var_name, _ in broken_vars:
             if var_name.startswith('JAVA_OPTS'):
@@ -1754,7 +1738,7 @@ class FumitmPython:
         home = os.path.expanduser('~')
 
         if self._is_running_as_sudo():
-            # Running as sudo — fix any pre-existing root-owned managed files
+            # Under sudo, correct each managed file that belongs to root.
             uid, gid = self._get_real_user_ids()
             fixed = []
             for path in managed_paths:
@@ -1788,13 +1772,13 @@ class FumitmPython:
                     except OSError:
                         pass
             if fixed:
-                self.print_warn(f"Running as sudo — corrected ownership on {len(fixed)} file(s) in {home}")
+                self.print_warn(f"Running as sudo. Corrected the ownership of {len(fixed)} file(s) in {home}")
                 self.print_info("New files created during this run will also be owned by the real user")
             else:
-                self.print_info("Running as sudo — ownership correction will be applied to new files")
+                self.print_info("Running as sudo. fumitm corrects the ownership of each new file.")
             return bool(fixed)
 
-        # Not root — check for root-owned files and warn
+        # Not root. Look for files that belong to root and give a warning.
         root_owned = []
         for path in managed_paths:
             if not os.path.exists(path):
@@ -1923,7 +1907,6 @@ class FumitmPython:
                     )
                     for line in result.stdout.splitlines():
                         if line and '/' in line and '/Contents/Home' in line:
-                            # Extract path from end of line
                             parts = line.split()
                             for part in reversed(parts):
                                 if '/Contents/Home' in part:
@@ -2242,7 +2225,7 @@ class FumitmPython:
             try:
                 size = os.path.getsize(bundle_path)
             except Exception:
-                # Fallback: approximate by length of content
+                # Use the length of the content as an approximation.
                 try:
                     with open(bundle_path, 'r') as f:
                         size = len(f.read().encode('utf-8'))
@@ -2250,11 +2233,10 @@ class FumitmPython:
                     size = 0
 
             cert_count = self.count_certificates_in_file(bundle_path)
-            # Debug one-liner summary
             if self.is_debug_mode():
                 self.print_debug(f"Bundle stats for {bundle_path}: {cert_count} cert(s), size={size}B")
 
-            # Obvious misconfig: just a single certificate
+            # One certificate only. This is an incorrect configuration.
             if cert_count <= 1:
                 return (True, f"contains {cert_count} certificate(s), size={size}B")
 
@@ -2262,7 +2244,7 @@ class FumitmPython:
             if cert_count <= SMALL_BUNDLE_MAX_CERTS and size <= SMALL_BUNDLE_MAX_SIZE_BYTES:
                 return (True, f"contains {cert_count} certificates and is only {size}B")
 
-            # If we have a reference WARP cert, exact-equality to it is suspicious
+            # A file that is equal to the WARP certificate is suspicious.
             if warp_cert_path and self.files_are_identical(bundle_path, warp_cert_path):
                 return (True, "bundle is identical to the proxy certificate file")
 
@@ -2314,34 +2296,28 @@ class FumitmPython:
             self.print_error(f"Certificate file not found: {cert_file}")
             return False
 
-        # Check if certificate already exists in target
         if self.certificate_exists_in_file(cert_file, target_file):
             self.print_debug(f"Certificate already exists in {target_file}, skipping append")
             return True
 
         try:
-            # Read certificate content
             with open(cert_file, 'r') as cf:
                 cert_content = cf.read()
 
-            # Ensure certificate content ends with newline
             if not cert_content.endswith('\n'):
                 cert_content = cert_content + '\n'
 
-            # Check if target file exists and whether it ends with a newline
             needs_leading_newline = False
             if os.path.exists(target_file):
                 with open(target_file, 'rb') as tf:
-                    # Seek to end and read last byte
                     tf.seek(0, 2)  # Seek to end
                     if tf.tell() > 0:  # File is not empty
                         tf.seek(-1, 2)  # Seek to last byte
                         last_byte = tf.read(1)
-                        # Check for newline (LF) or carriage return (CR for CRLF)
+                        # Look for LF, or CR for a CRLF file.
                         if last_byte not in (b'\n', b'\r'):
                             needs_leading_newline = True
 
-            # Append certificate with proper formatting
             with open(target_file, 'a') as f:
                 if needs_leading_newline:
                     f.write('\n')
@@ -2637,15 +2613,12 @@ class FumitmPython:
 
     def is_devcontainer(self):
         """Check if running inside a VS Code devcontainer."""
-        # Check for devcontainer environment variables
         if os.environ.get('REMOTE_CONTAINERS') or os.environ.get('CODESPACES'):
             return True
         
-        # Check for .dockerenv file (Docker container indicator)
         if os.path.exists('/.dockerenv'):
             return True
         
-        # Check for container environment in cgroup
         try:
             with open('/proc/1/cgroup', 'r') as f:
                 cgroup = f.read()
@@ -2654,7 +2627,6 @@ class FumitmPython:
         except Exception:
             pass
         
-        # Check for WSL
         try:
             with open('/proc/version', 'r') as f:
                 version = f.read().lower()
@@ -2704,7 +2676,6 @@ class FumitmPython:
                 self.print_error("No file path provided")
                 return None
             
-            # Expand user path
             file_path = os.path.expanduser(file_path)
             
             if not os.path.exists(file_path):
@@ -2719,7 +2690,7 @@ class FumitmPython:
                 self.print_error(f"Error reading file: {e}")
                 return None
         else:
-            # Default to paste mode - make it easier
+            # Paste mode is the default, because it is easier.
             print()
             self.print_info("Paste the certificate now (Ctrl+V or right-click paste)")
             self.print_info("Then press Enter twice when done:")
@@ -2737,7 +2708,6 @@ class FumitmPython:
             
             cert_content = '\n'.join(lines[:-1] if lines and lines[-1] == "" else lines)
         
-        # Validate the certificate format
         if not cert_content.strip():
             self.print_error("No certificate provided")
             return None
@@ -2750,7 +2720,6 @@ class FumitmPython:
             self.print_error("Invalid certificate format: missing END CERTIFICATE marker")
             return None
         
-        # Ensure proper formatting
         cert_lines = cert_content.strip().split('\n')
         formatted_cert = '\n'.join(cert_lines) + '\n'
         
@@ -2791,7 +2760,6 @@ class FumitmPython:
         plat = platform.system()
         cert_sources = self.provider.get('cert_sources', {}).get(plat, [])
 
-        # Try reading from known file paths
         for path in cert_sources:
             if os.path.exists(path):
                 try:
@@ -2911,10 +2879,8 @@ class FumitmPython:
         
         # Priority 3: Auto-detect devcontainer/WSL without native CLI
         elif self.is_devcontainer() and not self.command_exists('warp-cli'):
-            # Check if certificate already exists
             if os.path.exists(self.cert_path):
                 self.print_info(f"Found existing certificate at {self.cert_path}")
-                # In install mode, ask if they want to update it
                 if self.is_install_mode():
                     response = self._prompt("Do you want to update it with a new certificate? (y/N) ")
                     if response.lower() == 'y':
@@ -2926,12 +2892,10 @@ class FumitmPython:
                             warp_cert = f.read()
                         self.print_info("Using existing certificate")
                 else:
-                    # In status mode, just use existing
                     with open(self.cert_path, 'r') as f:
                         warp_cert = f.read()
                     self.print_info("Using existing certificate for status check")
             else:
-                # No existing cert - must get from user
                 warp_cert = self.get_certificate_from_user()
                 if not warp_cert:
                     self.print_error("Cannot proceed without a certificate in devcontainer environment")
@@ -2951,12 +2915,10 @@ class FumitmPython:
             self.print_error(f"{provider_name} provider has no certificate retrieval method.")
             return False
         
-        # Create a temp file for the proxy certificate
         with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as temp_cert:
             temp_cert.write(warp_cert)
             temp_cert_path = temp_cert.name
         
-        # Verify it's a valid PEM certificate
         try:
             result = subprocess.run(
                 ['openssl', 'x509', '-noout', '-in', temp_cert_path],
@@ -2973,7 +2935,6 @@ class FumitmPython:
         
         self.print_info(f"{provider_name} certificate retrieved successfully")
 
-        # Check if certificate needs to be saved
         needs_save = False
         if os.path.exists(self.cert_path):
             with open(self.cert_path, 'r') as f:
@@ -2988,20 +2949,16 @@ class FumitmPython:
             self.print_info(f"Certificate will be saved to {self.cert_path}")
             needs_save = True
 
-        # Save certificate if needed
         if needs_save:
             if not self.is_install_mode():
                 self.print_action(f"Would save certificate to {self.cert_path}")
             else:
-                # Save certificate
                 shutil.copy(temp_cert_path, self.cert_path)
                 self._fix_ownership(self.cert_path)
                 self.print_info(f"Certificate saved to {self.cert_path}")
 
-        # Clean up
         os.unlink(temp_cert_path)
         
-        # Cache the fingerprint for later use
         self.get_cert_fingerprint()
 
         return True
@@ -3096,8 +3053,8 @@ class FumitmPython:
         for entry in self.extra_roots:
             if entry.get('path'):
                 self.print_info(
-                    f"{entry['name']} detected — supplemental root CA will be "
-                    f"added to managed bundles alongside {self.provider['short_name']}"
+                    f"{entry['name']} detected. fumitm adds its supplemental root CA "
+                    f"to the managed bundles with the {self.provider['short_name']} root"
                 )
 
     def _all_proxy_root_paths(self):
@@ -3825,7 +3782,8 @@ class FumitmPython:
         if node_extra_ca_certs:
             other_provider = self._path_belongs_to_other_provider(node_extra_ca_certs)
             if other_provider:
-                # Path belongs to a different provider — migrate to current provider's bundle
+                # The path belongs to a different provider. Move to the bundle
+                # of the current provider.
                 needs_setup = True
                 node_bundle = os.path.join(self.bundle_dir, "node/ca-bundle.pem")
                 self.print_info("Configuring Node.js certificate...")
@@ -3842,16 +3800,13 @@ class FumitmPython:
                     self.add_to_shell_config("NODE_EXTRA_CA_CERTS", node_bundle, shell_config)
                     self.print_info(f"Migrated Node.js CA bundle to {node_bundle}")
             elif os.path.exists(node_extra_ca_certs):
-                # Check if the file contains our certificate using normalized comparison
                 if self._all_roots_present_in_file(node_extra_ca_certs):
-                    # Certificate already exists in NODE_EXTRA_CA_CERTS, skip to npm setup
                     pass
                 else:
                     needs_setup = True
                     self.print_info("Configuring Node.js certificate...")
                     self.print_info(f"NODE_EXTRA_CA_CERTS is already set to: {node_extra_ca_certs}")
 
-                    # Check if we can write to the file
                     if not self.is_writable(node_extra_ca_certs):
                         self.print_error(f"Cannot write to {node_extra_ca_certs} (permission denied)")
                         new_path = self.suggest_user_path(node_extra_ca_certs, "node")
@@ -3894,7 +3849,6 @@ class FumitmPython:
         else:
             needs_setup = True
             self.print_info("Configuring Node.js certificate...")
-            # NODE_EXTRA_CA_CERTS not set, create a new bundle
             node_bundle = os.path.join(self.bundle_dir, "node/ca-bundle.pem")
             
             if not self.is_install_mode():
@@ -3914,7 +3868,6 @@ class FumitmPython:
                 self.add_to_shell_config("NODE_EXTRA_CA_CERTS", node_bundle, shell_config)
                 self.print_info("Created Node.js CA bundle with proxy certificate")
         
-        # Setup npm cafile if npm is available
         if self.command_exists('npm'):
             self.setup_npm_cafile()
 
@@ -3930,7 +3883,6 @@ class FumitmPython:
 
     def setup_npm_cafile(self):
         """Setup npm cafile."""
-        # Check current npm cafile setting
         try:
             result = subprocess.run(
                 ['npm', 'config', 'get', 'cafile'],
@@ -3961,7 +3913,6 @@ class FumitmPython:
                 return
 
             if os.path.exists(current_cafile):
-                # First check if the existing cafile looks suspiciously small
                 suspicious, reason = self.is_suspicious_full_bundle(current_cafile, self.cert_path)
                 if suspicious:
                     self.print_info("Configuring npm certificate...")
@@ -3977,12 +3928,10 @@ class FumitmPython:
                         self.print_info(f"Repointed npm cafile to managed bundle: {npm_bundle}")
                     return
 
-                # Check if the file contains our certificate using normalized comparison
                 if not self._all_roots_present_in_file(current_cafile):
                     self.print_info("Configuring npm certificate...")
                     self.print_warn("Current npm cafile doesn't contain proxy certificate")
                     
-                    # Check if we can write to the npm cafile
                     if not self.is_writable(current_cafile):
                         self.print_error(f"Cannot write to npm cafile: {current_cafile} (permission denied)")
                         self.print_warn(f"Will use alternative path: {npm_bundle}")
@@ -3993,14 +3942,11 @@ class FumitmPython:
                             self.print_action(f"Would run: npm config set cafile {npm_bundle}")
                         else:
                             self._safe_makedirs(os.path.dirname(npm_bundle))
-                            # Create a full bundle with system certs
                             if (not self.create_bundle_with_system_certs(npm_bundle)
                                     and os.path.exists(current_cafile)):
-                                # Copy existing bundle if available
                                 shutil.copy(current_cafile, npm_bundle)
                                 self._fix_ownership(npm_bundle)
 
-                            # Append certificate to bundle
                             self._append_all_proxy_roots(npm_bundle)
 
                             subprocess.run(['npm', 'config', 'set', 'cafile', npm_bundle], check=False)
@@ -4045,7 +3991,6 @@ class FumitmPython:
                     subprocess.run(['npm', 'config', 'set', 'cafile', npm_bundle], check=False)
                     self.print_info(f"Configured npm cafile to: {npm_bundle}")
                     
-                    # Verify the setting
                     try:
                         result = subprocess.run(
                             ['npm', 'config', 'get', 'cafile'],
@@ -4077,7 +4022,6 @@ class FumitmPython:
                 return
             is_berry = yarn_version[0] in ('2', '3', '4')
 
-            # Get current cafile setting
             if is_berry:
                 config_key = 'httpsCaFilePath'
                 delete_cmd = ['yarn', 'config', 'unset', 'httpsCaFilePath']
@@ -4089,7 +4033,6 @@ class FumitmPython:
                                    capture_output=True, text=True, check=False)
             current_cafile = result.stdout.strip()
 
-            # Check if set to something problematic
             if not current_cafile or current_cafile in ['undefined', '']:
                 return  # Not set, nothing to do
 
@@ -4098,11 +4041,9 @@ class FumitmPython:
             if current_cafile == npm_bundle:
                 return  # Points to fumitm-managed bundle, that's OK
 
-            # Check if file exists and contains WARP cert
             if os.path.exists(current_cafile) and self._all_roots_present_in_file(current_cafile):
                 return  # Working config, leave it
 
-            # Problematic config - delete it
             self.print_info("Configuring yarn...")
             if not os.path.exists(current_cafile):
                 self.print_warn(f"yarn {config_key} points to non-existent file: {current_cafile}")
@@ -4141,11 +4082,9 @@ class FumitmPython:
             if current_cafile == npm_bundle:
                 return  # Points to fumitm-managed bundle, that's OK
 
-            # Check if file exists and contains WARP cert
             if os.path.exists(current_cafile) and self._all_roots_present_in_file(current_cafile):
                 return  # Working config, leave it
 
-            # Problematic config - delete it
             self.print_info("Configuring pnpm...")
             if not os.path.exists(current_cafile):
                 self.print_warn(f"pnpm cafile points to non-existent file: {current_cafile}")
@@ -4195,7 +4134,6 @@ class FumitmPython:
         shell_type = self.detect_shell()
         shell_config = self.get_shell_config(shell_type)
 
-        # Create combined certificate bundle for Python
         python_bundle = os.path.expanduser("~/.python-ca-bundle.pem")
         needs_setup = False
 
@@ -4215,7 +4153,6 @@ class FumitmPython:
 
         if requests_ca_bundle:
             if os.path.exists(requests_ca_bundle):
-                # Check if we can write to the file
                 if not self.is_writable(requests_ca_bundle):
                     self.print_error(f"Cannot write to {requests_ca_bundle} (permission denied)")
                     new_path = self.suggest_user_path(requests_ca_bundle, "python")
@@ -4239,7 +4176,6 @@ class FumitmPython:
                                     Path(new_path).touch()
                                     self._fix_ownership(new_path)
 
-                            # Append certificate to the new path
                             self._append_all_proxy_roots(new_path)
 
                             needs_setup = True
@@ -4252,7 +4188,6 @@ class FumitmPython:
                         else:
                             return ToolResult('python', 'skipped', 'User declined alternative path')
                 else:
-                    # Check if the existing bundle looks suspicious (likely just WARP CA)
                     suspicious, reason = self.is_suspicious_full_bundle(requests_ca_bundle, self.cert_path)
                     if suspicious:
                         # Point at the managed bundle of fumitm. Continue to
@@ -4332,7 +4267,6 @@ class FumitmPython:
                     if not self.is_install_mode():
                         self.print_action(f"Would repoint SSL_CERT_FILE to {python_bundle}")
                     else:
-                        # Ensure the managed bundle exists
                         if not os.path.exists(python_bundle):
                             self.create_bundle_with_system_certs(python_bundle)
                             self._append_all_proxy_roots(python_bundle)
@@ -4422,7 +4356,7 @@ class FumitmPython:
                         if os.path.exists(current_value) and \
                                 self._all_roots_present_in_file(current_value):
                             return False
-                # Existing value is stale or wrong — replace it
+                # The value is old or incorrect. Replace it.
                 lines = content.splitlines()
                 new_lines = []
                 for line in lines:
@@ -4439,7 +4373,7 @@ class FumitmPython:
                     self.print_info(f"Updated custom_ca_certs_file in {properties_file}")
                 return True
 
-            # File exists but no custom_ca_certs_file — append under [core]
+            # The file has no custom_ca_certs_file. Append it under [core].
             if "[core]" in content:
                 if not self.is_install_mode():
                     self.print_action(f"Would add custom_ca_certs_file to {properties_file}")
@@ -4540,7 +4474,6 @@ class FumitmPython:
         gcloud_bundle = os.path.join(gcloud_cert_dir, "combined-ca-bundle.pem")
         needs_setup = False
 
-        # Check current gcloud custom CA setting
         try:
             result = subprocess.run(
                 ['gcloud', 'config', 'get-value', 'core/custom_ca_certs_file'],
@@ -4550,11 +4483,9 @@ class FumitmPython:
         except Exception:
             current_ca_file = ""
         
-        # Check if gcloud needs configuration
         if not current_ca_file:
             needs_setup = True
         elif os.path.exists(current_ca_file):
-            # First check if the existing CA file looks suspiciously small
             suspicious, reason = self.is_suspicious_full_bundle(current_ca_file, self.cert_path)
             if suspicious:
                 self.print_info("Configuring gcloud certificate...")
@@ -4571,7 +4502,6 @@ class FumitmPython:
                     return ToolResult('gcloud', 'configured', 'Repointed suspicious gcloud CA file')
                 return ToolResult('gcloud', 'skipped', 'Dry run')
 
-            # Check if current CA file contains our certificate using normalized comparison
             if not self._all_roots_present_in_file(current_ca_file):
                 needs_setup = True
         else:
@@ -4584,20 +4514,17 @@ class FumitmPython:
 
         self.print_info("Configuring gcloud certificate...")
         
-        # Create directory if it doesn't exist
         if self.is_install_mode():
             self._safe_makedirs(gcloud_cert_dir)
         
         if current_ca_file and current_ca_file != gcloud_bundle:
             self.print_warn(f"gcloud is already configured with custom CA: {current_ca_file}")
             
-            # Check if the current CA file is writable
             if os.path.exists(current_ca_file) and not self.is_writable(current_ca_file):
                 self.print_error(f"Cannot write to current gcloud CA file: {current_ca_file} (permission denied)")
                 self.print_warn(f"Will use alternative path: {gcloud_bundle}")
                 if not self.is_install_mode():
                     self.print_action(f"Would create new gcloud CA bundle at {gcloud_bundle}")
-                # Continue with the new path
             else:
                 if not self.is_install_mode():
                     self.print_action("Would ask to update gcloud CA configuration")
@@ -4614,12 +4541,10 @@ class FumitmPython:
             self.print_action(f"Would run: gcloud config set core/custom_ca_certs_file {gcloud_bundle}")
             return ToolResult('gcloud', 'skipped', 'Dry run')
         else:
-            # Create combined bundle
             self.print_info(f"Creating gcloud CA bundle at {gcloud_bundle}")
             self.create_bundle_with_system_certs(gcloud_bundle)
             self._append_all_proxy_roots(gcloud_bundle)
 
-            # Configure gcloud
             result = subprocess.run(
                 ['gcloud', 'config', 'set', 'core/custom_ca_certs_file', gcloud_bundle],
                 capture_output=True,
@@ -4645,13 +4570,11 @@ class FumitmPython:
         if not self.command_exists('git'):
             return ToolResult('git', 'skipped', 'git not found in PATH')
         git_bundle = os.path.join(self.bundle_dir, "git/ca-bundle.pem")
-        # Check current setting
         try:
             result = subprocess.run(['git', 'config', '--global', 'http.sslCAInfo'], capture_output=True, text=True, check=False)
             current_ca = result.stdout.strip() if result.returncode == 0 else ""
         except Exception:
             current_ca = ""
-        # Decide whether to repoint
         repoint = False
         if current_ca:
             other_provider = self._path_belongs_to_other_provider(current_ca)
@@ -4694,7 +4617,6 @@ class FumitmPython:
             self.print_action(f"Would create Git CA bundle at {git_bundle}")
             self.print_action(f"Would run: git config --global http.sslCAInfo {git_bundle}")
             return ToolResult('git', 'skipped', 'Dry run')
-        # Build full bundle and configure
         self._safe_makedirs(os.path.dirname(git_bundle))
         self.create_bundle_with_system_certs(git_bundle)
         self._append_all_proxy_roots(git_bundle)
@@ -4876,7 +4798,7 @@ class FumitmPython:
         curl_bundle = os.path.join(self.bundle_dir, "curl/ca-bundle.pem")
         curl_env = os.environ.get('CURL_CA_BUNDLE', '')
 
-        # Case 1: CURL_CA_BUNDLE is set — check for provider mismatch first
+        # Case 1: CURL_CA_BUNDLE is set. Look for a different provider first.
         if curl_env:
             other_provider = self._path_belongs_to_other_provider(curl_env)
             if other_provider:
@@ -4913,14 +4835,13 @@ class FumitmPython:
                     self.print_info("This may require manual investigation")
                     return ToolResult('curl', 'already_ok', 'CURL_CA_BUNDLE looks valid; may need manual investigation')
         else:
-            # Case 2: No CURL_CA_BUNDLE set and curl doesn't work
+            # Case 2: CURL_CA_BUNDLE is not set and curl does not operate.
             self.print_info("Configuring curl certificate bundle...")
             if not self.is_install_mode():
                 self.print_action(f"Would create curl CA bundle at {curl_bundle}")
                 self.print_action(f"Would set CURL_CA_BUNDLE={curl_bundle}")
                 return ToolResult('curl', 'skipped', 'Dry run')
 
-        # Create the bundle and configure
         self._safe_makedirs(os.path.dirname(curl_bundle))
         self.create_bundle_with_system_certs(curl_bundle)
         self._append_all_proxy_roots(curl_bundle)
@@ -4947,7 +4868,7 @@ class FumitmPython:
         aws_env = os.environ.get('AWS_CA_BUNDLE', '')
         verify_result = self.verify_connection("aws")
 
-        # Case 1: AWS_CA_BUNDLE is set — check for provider mismatch first
+        # Case 1: AWS_CA_BUNDLE is set. Look for a different provider first.
         if aws_env:
             other_provider = self._path_belongs_to_other_provider(aws_env)
             if other_provider:
@@ -4974,7 +4895,7 @@ class FumitmPython:
                         self.print_action(f"Would repoint AWS_CA_BUNDLE to {aws_bundle}")
                         return ToolResult('aws', 'skipped', 'Dry run')
                 elif not self._all_roots_present_in_file(aws_env, likely=True):
-                    # Bundle exists and looks OK but doesn't contain our proxy cert
+                    # The bundle is correct but has no proxy certificate.
                     self.print_info("Configuring AWS CLI certificate bundle...")
                     self.print_info(f"AWS_CA_BUNDLE bundle is missing the {self.provider['name']} proxy certificate")
                     if not self.is_install_mode():
@@ -4985,7 +4906,8 @@ class FumitmPython:
                     if verify_result == "WORKING":
                         self.print_debug("AWS CLI already works with configured bundle, skipping configuration")
                     else:
-                        # Bundle exists, looks OK, and contains our cert — unclear why it fails
+                        # The bundle is correct and has the certificate. The
+                        # cause of the failure is unknown.
                         self.print_warn("AWS CLI connection failed but AWS_CA_BUNDLE looks valid")
                         self.print_info("This may require manual investigation")
                     return ToolResult('aws', 'already_ok', 'AWS_CA_BUNDLE looks valid')
@@ -4993,14 +4915,13 @@ class FumitmPython:
             if verify_result == "WORKING":
                 self.print_debug("AWS CLI already works via system trust, skipping configuration")
                 return ToolResult('aws', 'already_ok', 'Works via system trust store')
-            # Case 2: No AWS_CA_BUNDLE set and aws doesn't work
+            # Case 2: AWS_CA_BUNDLE is not set and aws does not operate.
             self.print_info("Configuring AWS CLI certificate bundle...")
             if not self.is_install_mode():
                 self.print_action(f"Would create AWS CA bundle at {aws_bundle}")
                 self.print_action(f"Would set AWS_CA_BUNDLE={aws_bundle}")
                 return ToolResult('aws', 'skipped', 'Dry run')
 
-        # Create the bundle and configure
         self._safe_makedirs(os.path.dirname(aws_bundle))
         self.create_bundle_with_system_certs(aws_bundle)
         self._append_all_proxy_roots(aws_bundle)
@@ -5057,7 +4978,6 @@ class FumitmPython:
         """Check curl configuration status."""
         has_issues = False
         if self.command_exists('curl'):
-            # First, verify if curl can actually connect
             verify_result = self.verify_connection("curl")
 
             if verify_result == "WORKING":
@@ -5077,7 +4997,6 @@ class FumitmPython:
                             self.print_action("    Run with --fix to migrate to the current provider's bundle")
                             has_issues = True
                         elif os.path.exists(curl_bundle):
-                            # Check if the bundle is suspicious
                             suspicious, reason = self.is_suspicious_full_bundle(curl_bundle, temp_warp_cert)
                             if suspicious:
                                 self.print_warn(f"  ⚠ CURL_CA_BUNDLE looks suspiciously small ({reason})")
@@ -5088,7 +5007,6 @@ class FumitmPython:
                 except Exception:
                     pass
             else:
-                # curl doesn't work, check configuration
                 curl_bundle = os.environ.get('CURL_CA_BUNDLE', '')
                 curlrc, rc_cacert, _ = self._effective_curlrc_cacert()
                 rc_covered = (
@@ -5128,7 +5046,6 @@ class FumitmPython:
         """Check AWS CLI configuration status."""
         has_issues = False
         if self.command_exists('aws'):
-            # First, verify if aws can actually connect
             verify_result = self.verify_connection("aws")
 
             if verify_result == "WORKING":
@@ -5152,7 +5069,6 @@ class FumitmPython:
                 else:
                     self.print_info("  - Using system certificate trust (no custom CA needed)")
             else:
-                # aws doesn't work, check configuration
                 aws_bundle = os.environ.get('AWS_CA_BUNDLE', '')
                 if aws_bundle:
                     other_provider = self._path_belongs_to_other_provider(aws_bundle)
@@ -5201,7 +5117,6 @@ class FumitmPython:
             for line in result.stdout.splitlines():
                 # Look for lines with --> which indicate symlink targets
                 if '-->' in line:
-                    # Extract path after -->
                     path = line.split('-->')[1].strip()
                     if not path:
                         continue
@@ -5222,14 +5137,12 @@ class FumitmPython:
         if not self.command_exists('java') and not self.command_exists('keytool'):
             return ToolResult('java', 'skipped', 'Java/keytool not found')
 
-        # Find all Java installations
         java_homes = self.find_all_java_homes()
 
         if not java_homes:
             self.print_warn("No Java installations found")
             return ToolResult('java', 'skipped', 'No Java installations found')
 
-        # Show count if multiple installations found
         if len(java_homes) > 1:
             self.print_info(f"Found {len(java_homes)} Java installation(s)")
 
@@ -5237,7 +5150,6 @@ class FumitmPython:
         already_ok_count = 0
         failed_count = 0
 
-        # Process each Java installation
         for java_home in java_homes:
             version_name = self.java_version_label(java_home)
 
@@ -5359,11 +5271,9 @@ class FumitmPython:
         dbeaver_keytool = "/Applications/DBeaver.app/Contents/Eclipse/jre/Contents/Home/bin/keytool"
         dbeaver_cacerts = "/Applications/DBeaver.app/Contents/Eclipse/jre/Contents/Home/lib/security/cacerts"
 
-        # Check if DBeaver is installed at the default location
         if not os.path.exists(dbeaver_keytool):
             return ToolResult('dbeaver', 'skipped', 'DBeaver not installed')
 
-        # Check if the cacerts file exists
         if not os.path.exists(dbeaver_cacerts):
             self.print_error(f"DBeaver cacerts file not found at: {dbeaver_cacerts}")
             return ToolResult('dbeaver', 'failed', 'DBeaver cacerts file not found')
@@ -5697,7 +5607,6 @@ class FumitmPython:
 
         self.print_info("Checking for Android Emulator setup...")
 
-        # Check if any emulator is running
         try:
             result = subprocess.run(['adb', 'devices'], capture_output=True, text=True, check=False)
             running_devices = sum(1 for line in result.stdout.splitlines() if 'emulator-' in line)
@@ -5922,7 +5831,7 @@ class FumitmPython:
         """
         image = self._find_nsenter_image()
         if not image:
-            # Last resort: try pulling alpine (may fail behind MITM proxy)
+            # Pull alpine. This can fail behind a MITM proxy.
             self.print_debug("No local image found, attempting to pull alpine")
             try:
                 pull = subprocess.run(
@@ -6142,7 +6051,6 @@ class FumitmPython:
 
     def verify_connection(self, tool_name):
         """Verify if a tool can connect through proxy."""
-        # Skip verification if requested or in devcontainer
         if self.skip_verify:
             self.print_debug(f"Skipping {tool_name} verification (--skip-verify flag)")
             return "SKIPPED"
@@ -6162,7 +6070,6 @@ class FumitmPython:
                 self.print_debug(f"Node.js found at: {shutil.which('node')}")
                 self.print_debug(f"NODE_EXTRA_CA_CERTS: {os.environ.get('NODE_EXTRA_CA_CERTS', 'not set')}")
                 
-                # Test SSL connection
                 node_script = f"""
 const https = require('https');
 https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {{
@@ -6210,32 +6117,27 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 result = "NOT_INSTALLED"
         
         elif tool_name == "python":
-            # Check if Python trusts the system proxy certificate
             self.print_info("Checking if Python trusts system proxy certificate...")
             
             try:
-                # Create a simple HTTPS request
                 req = urllib.request.Request(test_url, headers={'User-Agent': 'Mozilla/5.0'})
                 
-                # Try to open the URL
                 with urllib.request.urlopen(req, timeout=5) as response:
                     self.print_debug(f"Success - HTTP {response.code}")
                     result = "WORKING"
                     
-                    # Additional validation - check SSL context
                     self.print_debug(f"Python SSL default verify paths: {ssl.get_default_verify_paths()}")
                     self.print_debug("Python successfully trusts the system proxy certificate")
                     
             except urllib.error.HTTPError as e:
                 self.print_debug(f"HTTP Error {e.code} - but SSL worked")
-                # HTTP errors (like 403) are OK - we're testing SSL
+                # An HTTP error such as 403 is acceptable. This tests SSL.
                 result = "WORKING"
             except urllib.error.URLError as e:
                 self.print_debug(f"URL Error: {e.reason}")
-                # SSL errors mean the cert isn't trusted
+                # An SSL error shows that the certificate is not trusted.
                 result = "FAILED"
                 
-                # Check if REQUESTS_CA_BUNDLE or SSL_CERT_FILE would help
                 if os.environ.get('REQUESTS_CA_BUNDLE') or os.environ.get('SSL_CERT_FILE'):
                     self.print_debug("Python needs environment variables set for certificate trust")
                 else:
@@ -6259,7 +6161,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     )
                     self.print_debug(f"curl version: {version_result.stdout.splitlines()[0]}")
                     
-                    # Test connection
                     if self.is_debug_mode():
                         curl_result = subprocess.run(
                             ['curl', '-v', '-s', '-o', '/dev/null', test_url],
@@ -6279,7 +6180,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                         self.print_debug(f"curl test failed with exit code: {curl_result.returncode}")
                     
                     if self.is_debug_mode() and curl_result.stderr:
-                        # Show relevant SSL info
                         for line in curl_result.stderr.splitlines():
                             if any(keyword in line for keyword in ['SSL', 'certificate', 'TLS']):
                                 self.print_debug(f"curl: {line}")
@@ -6314,7 +6214,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                         self.print_debug(f"wget test failed with exit code: {wget_result.returncode}")
                     
                     if self.is_debug_mode() and wget_result.stderr:
-                        # Show relevant SSL info
                         for line in wget_result.stderr.splitlines():
                             if any(keyword in line for keyword in ['SSL', 'certificate', 'CA']):
                                 self.print_debug(f"wget: {line}")
@@ -6370,7 +6269,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                         capture_output=True, text=True, timeout=15, check=False
                     )
 
-                    # Check for SSL-specific errors in stderr
                     stderr_lower = gcloud_result.stderr.lower()
                     if 'ssl' in stderr_lower or 'certificate' in stderr_lower:
                         result = "FAILED"
@@ -6510,7 +6408,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 self.print_warn("  ✗ NODE_EXTRA_CA_CERTS not configured")
                 has_issues = True
             
-            # Check npm
             if self.command_exists('npm'):
                 try:
                     result = subprocess.run(['npm', 'config', 'get', 'cafile'], capture_output=True, text=True, check=False)
@@ -6542,7 +6439,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 except Exception:
                     pass
 
-            # Check yarn for stale cafile config
             if self.command_exists('yarn'):
                 try:
                     result = subprocess.run(['yarn', '--version'], capture_output=True, text=True, check=False)
@@ -6579,7 +6475,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 except Exception:
                     pass
 
-            # Check pnpm for stale cafile config
             if self.command_exists('pnpm'):
                 try:
                     result = subprocess.run(['pnpm', 'config', 'get', 'cafile'],
@@ -6618,7 +6513,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         """Check Python configuration status."""
         has_issues = False
         if self.command_exists('python3') or self.command_exists('python'):
-            # First check if Python trusts the system certificate
             python_verify_result = self.verify_connection("python")
             
             if python_verify_result == "WORKING":
@@ -6639,7 +6533,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     )
                     has_issues = True
             else:
-                # Python doesn't trust system cert, check environment variables
                 python_configured = False
                 
                 requests_ca_bundle = os.environ.get('REQUESTS_CA_BUNDLE', '')
@@ -6660,7 +6553,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     else:
                         self.print_warn(f"  ✗ REQUESTS_CA_BUNDLE points to non-existent file: {requests_ca_bundle}")
 
-                # Also check SSL_CERT_FILE if set
                 ssl_cert_file = os.environ.get('SSL_CERT_FILE', '')
                 if ssl_cert_file:
                     self.print_info(f"  SSL_CERT_FILE is set to: {ssl_cert_file}")
@@ -6689,7 +6581,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         """Check gcloud configuration status."""
         has_issues = False
         if self.command_exists('gcloud'):
-            # First, verify if gcloud can actually connect
             verify_result = self.verify_connection("gcloud")
 
             if verify_result == "WORKING":
@@ -6721,7 +6612,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     self.print_warn("  ✗ Failed to check gcloud configuration")
                     has_issues = True
             elif verify_result == "SKIPPED":
-                # Can't verify, fall back to config check
+                # Verification is not possible. Examine the configuration.
                 try:
                     result = subprocess.run(
                         ['gcloud', 'config', 'get-value', 'core/custom_ca_certs_file'],
@@ -6746,7 +6637,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     self.print_warn("  ✗ Failed to check gcloud configuration")
                     has_issues = True
             else:
-                # gcloud can't connect - check if custom CA would help
                 self.print_warn("  ✗ gcloud connection test failed")
                 try:
                     result = subprocess.run(
@@ -6781,18 +6671,15 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             self.print_info("  - Java not installed (would configure if present)")
             return has_issues
 
-        # Find all Java installations
         java_homes = self.find_all_java_homes()
 
         if not java_homes:
             self.print_warn("  ✗ No Java installations found")
             return True
 
-        # Show count if multiple installations
         if len(java_homes) > 1:
             self.print_info(f"  Checking {len(java_homes)} Java installation(s):")
 
-        # Check each installation
         for java_home in java_homes:
             version_name = self.java_version_label(java_home)
 
@@ -6802,7 +6689,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 has_issues = True
                 continue
 
-            # Check if cert exists in keystore
             try:
                 result = subprocess.run(
                     ['keytool', '-list', '-alias', self.provider['keytool_alias'],
@@ -6843,7 +6729,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 has_issues = True
                 continue
 
-            # Check if certificate exists
             try:
                 result = subprocess.run(
                     ['keytool', '-list', '-alias', self.provider['keytool_alias'],
@@ -6927,7 +6812,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         """Check wget configuration status."""
         has_issues = False
         if self.command_exists('wget'):
-            # First, verify if wget can actually connect
             verify_result = self.verify_connection("wget")
 
             wgetrc_path = os.path.expanduser("~/.wgetrc")
@@ -6947,7 +6831,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 else:
                     self.print_info("  - Using system certificate trust (no custom CA needed)")
             else:
-                # wget doesn't work, check configuration
                 if has_all_roots:
                     self.print_warn("  ✗ wget configured but connection test failed")
                 else:
@@ -6978,11 +6861,9 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 self.print_warn("  ✗ Certificate not installed in ~/.docker/certs.d/")
                 has_issues = True
 
-            # Check VM status if running
             try:
                 result = subprocess.run(['podman', 'machine', 'list'], capture_output=True, text=True, check=False)
                 if 'Currently running' in result.stdout:
-                    # VM is running - also check certificate in VM
                     result = subprocess.run(
                         ['podman', 'machine', 'ssh', f'test -f /etc/pki/ca-trust/source/anchors/{self.provider["container_cert_name"]}.pem'],
                         capture_output=True, check=False
@@ -7020,7 +6901,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 self.print_warn("  ✗ Certificate not installed in ~/.docker/certs.d/")
                 has_issues = True
 
-            # Check VM status if running
             try:
                 version_result = subprocess.run(['rdctl', 'version'], capture_output=True, text=True, check=False)
                 if version_result.returncode == 0:
@@ -7110,7 +6990,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 self.print_warn("  ✗ Certificate not installed in ~/.docker/certs.d/")
                 has_issues = True
 
-            # Check VM status if running
             try:
                 status_result = subprocess.run(['colima', 'status'], capture_output=True, check=False)
                 if status_result.returncode == 0:
@@ -7241,7 +7120,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         self.print_info("=" * (len(f"Checking {provider_name} Certificate Status")))
         print()
 
-        # Retrieve the current certificate for comparison
         temp_warp_cert = self._get_status_cert()
         if not temp_warp_cert:
             return False
@@ -7255,15 +7133,12 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         self._prepare_extra_roots()
         self._announce_extra_roots()
 
-        # Check provider connection
         if self._check_provider_connection():
             has_issues = True
         print()
         
-        # Check certificate status
         self.print_status("Certificate Status:")
         
-        # Check if proxy certificate is valid
         try:
             result = subprocess.run(
                 ['openssl', 'x509', '-noout', '-checkend', '86400', '-in', temp_warp_cert],
@@ -7272,11 +7147,9 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             if result.returncode == 0:
                 self.print_info(f"  ✓ {short} certificate is valid")
                 
-                # Check where the certificate is currently stored
                 cert_locations = []
                 cert_found = False
                 
-                # Check common locations
                 if os.path.exists(self.cert_path):
                     with open(self.cert_path, 'r') as f:
                         existing_cert = f.read()
@@ -7286,21 +7159,18 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                         cert_locations.append(f"    - {self.cert_path}")
                         cert_found = True
                 
-                # Check NODE_EXTRA_CA_CERTS
                 node_extra_ca_certs = os.environ.get('NODE_EXTRA_CA_CERTS', '')
                 if (node_extra_ca_certs and os.path.exists(node_extra_ca_certs)
                         and self.certificate_exists_in_file(temp_warp_cert, node_extra_ca_certs)):
                     cert_locations.append(f"    - {node_extra_ca_certs} (NODE_EXTRA_CA_CERTS)")
                     cert_found = True
                 
-                # Check REQUESTS_CA_BUNDLE
                 requests_ca_bundle = os.environ.get('REQUESTS_CA_BUNDLE', '')
                 if (requests_ca_bundle and os.path.exists(requests_ca_bundle)
                         and self.certificate_exists_in_file(temp_warp_cert, requests_ca_bundle)):
                     cert_locations.append(f"    - {requests_ca_bundle} (REQUESTS_CA_BUNDLE)")
                     cert_found = True
                 
-                # Check SSL_CERT_FILE
                 ssl_cert_file = os.environ.get('SSL_CERT_FILE', '')
                 if (ssl_cert_file and os.path.exists(ssl_cert_file)
                         and self.certificate_exists_in_file(temp_warp_cert, ssl_cert_file)):
@@ -7323,13 +7193,11 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             has_issues = True
         print()
         
-        # Display selected tools info if filtering
         if self.selected_tools:
             selected_tools_info = self.get_selected_tools_info()
             self.print_info(f"Selected tools: {', '.join(selected_tools_info)}")
             print()
         
-        # Check each tool
         for tool_key, tool_info in self.tools_registry.items():
             if not self.should_process_tool(tool_key):
                 continue
@@ -7365,7 +7233,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 else:
                     self.print_info("  - No container runtimes detected")
             print()
-        # Show information about additional tools if not filtering
         if not self.selected_tools:
             self.print_status("Additional Tools (not yet automated):")
             self.print_info("  - RubyGems/Bundler: May work with SSL_CERT_FILE environment variable")
@@ -7384,7 +7251,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             self.print_info(f"✓ All configured tools are properly set up for {provider_name}")
         print()
         
-        # Cleanup
         if temp_warp_cert:
             os.unlink(temp_warp_cert)
     
@@ -7632,7 +7498,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             if not self.skip_update_check:
                 self.check_for_updates()
 
-            # Auto-detect devcontainer and adjust behavior
             if self.is_devcontainer():
                 if not self.skip_verify:
                     self.skip_verify = True
@@ -7644,13 +7509,11 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 self.print_info("   Network verification tests will be skipped")
                 print()
 
-            # Check for broken CA environment variables early
             self.check_environment_sanity()
 
             # Check for root-owned files that would cause PermissionError
             self.check_ownership_sanity()
 
-            # Validate selected tools
             if self.selected_tools:
                 invalid_tools = self.validate_selected_tools()
                 if invalid_tools:
@@ -7804,7 +7667,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Handle --version first
     if args.version:
         print(f"fumitm {__version__}")
         version_info = VERSION_INFO
@@ -7815,7 +7677,6 @@ def main():
                 print("  (with local modifications)")
         sys.exit(0)
 
-    # Resolve headless from flag or environment variable
     headless = args.headless or os.environ.get('FUMITM_HEADLESS') == '1'
     if headless:
         args.no_color = True
@@ -7824,11 +7685,9 @@ def main():
     # Respect NO_COLOR environment variable (https://no-color.org/)
     no_color = args.no_color or os.environ.get('NO_COLOR') is not None
 
-    # Validate --run-as-user requires root
     if args.run_as_user and os.getuid() != 0:
         parser.error('--run-as-user requires root privileges')
 
-    # Handle --list-tools
     if args.list_tools:
         temp_fumitm = FumitmPython(no_color=no_color)
         print("Available tools:")
@@ -7838,7 +7697,6 @@ def main():
         print("\nExamples: ./fumitm.py --fix --tools node,python  or  ./fumitm.py --fix --tools node-npm --tools gcp")
         sys.exit(0)
 
-    # Process --tools argument
     selected_tools = []
     if args.tools:
         for tool_arg in args.tools:
