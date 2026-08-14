@@ -7,6 +7,7 @@ These tests cover detection, root extraction (root kept, ephemeral intermediate
 rejected), additive bundle assembly, idempotency, and the absent-Aikido no-op.
 """
 
+import contextlib
 import os
 import stat
 from pathlib import Path
@@ -825,8 +826,18 @@ def _patch_aikido_paths(tmp_path, adopted=False, store=True, bundle_has_root=Fal
 DOCTOR = '/usr/local/bin/aikido-doctor'
 
 
-def _doctor_on_path(inst):
-    return patch.object(inst, '_find_aikido_doctor', return_value=DOCTOR)
+@contextlib.contextmanager
+def _doctor_on_path(inst, supports_adopt=True):
+    """Model a discoverable aikido-doctor, current enough to adopt by default.
+
+    The capability probe is patched alongside discovery rather than left to the
+    real `certconfig --help` call, which would otherwise consume the
+    subprocess.run mock every adoption test installs for the doctor itself.
+    """
+    with patch.object(inst, '_find_aikido_doctor', return_value=DOCTOR), \
+         patch.object(inst, '_aikido_doctor_supports_adopt',
+                      return_value=supports_adopt):
+        yield
 
 
 def _no_doctor(inst):
@@ -958,6 +969,7 @@ class TestAikidoDoctorPathSafety(FumitmTestCase):
         inst = _adopt_instance(tmp_path)
         spaced = '/Applications/Aikido Endpoint Protection.app/bin/aikido-doctor'
         with _on_macos(), patch.object(inst, '_find_aikido_doctor', return_value=spaced), \
+             patch.object(inst, '_aikido_doctor_supports_adopt', return_value=True), \
              _patch_aikido_paths(tmp_path, store=False), \
              patch('fumitm.os.getuid', return_value=501), \
              patch('fumitm.sys.stdin') as fake_stdin:
@@ -1228,6 +1240,94 @@ class TestAikidoAdoptionState(FumitmTestCase):
             for fp in _fingerprints(mock_data.MOCK_CERTIFICATE):
                 (store / f'{fp}.pem').write_text(mock_data.MOCK_CERTIFICATE)
             assert inst._aikido_trusts_root(inst.cert_path) is True
+
+
+CERTCONFIG_HELP = """NAME:
+   aikido-doctor certconfig - Manage per-tool certificate trust configuration
+
+COMMANDS:
+   list             List certconfig rules
+   repair           Check a certconfig rule for drift
+   adopt            Adopt an extra CA from a PEM file into the CA bundles we build
+   help, h          Shows a list of commands
+"""
+
+CERTCONFIG_HELP_WITHOUT_ADOPT = """NAME:
+   aikido-doctor certconfig - Manage per-tool certificate trust configuration
+
+COMMANDS:
+   list             List certconfig rules
+   repair           Check a certconfig rule for drift
+   help, h          Shows a list of commands
+"""
+
+UNKNOWN_COMMAND = 'Unknown command: "certconfig"\nRun \'aikido-doctor --help\'.\n'
+
+
+class TestAikidoDoctorCapability(FumitmTestCase):
+    """Whether this agent can adopt is asked of the CLI, never assumed."""
+
+    def _probe(self, tmp_path, stdout, returncode=0):
+        inst = _adopt_instance(tmp_path)
+        with patch('fumitm.subprocess.run',
+                   return_value=MagicMock(returncode=returncode, stdout=stdout,
+                                          stderr='')) as mock_run:
+            return inst, inst._aikido_doctor_supports_adopt(DOCTOR), mock_run
+
+    def test_adopt_listed_is_supported(self, tmp_path):
+        _, supported, mock_run = self._probe(tmp_path, CERTCONFIG_HELP)
+        assert supported is True
+        assert mock_run.call_args.args[0] == [DOCTOR, 'certconfig', '--help']
+
+    def test_adopt_absent_from_the_listing_is_unsupported(self, tmp_path):
+        _, supported, _ = self._probe(tmp_path, CERTCONFIG_HELP_WITHOUT_ADOPT)
+        assert supported is False
+
+    def test_unknown_subcommand_is_unsupported_despite_exiting_zero(self, tmp_path):
+        # The CLI answers an unknown subcommand on stdout and exits zero, so a
+        # return-code check alone would call an agent predating certconfig
+        # current and then report a hard failure for the rest of time.
+        _, supported, _ = self._probe(tmp_path, UNKNOWN_COMMAND)
+        assert supported is False
+
+    def test_prose_mentioning_adopt_does_not_count(self, tmp_path):
+        # The subcommand is matched where a listing puts it, not wherever the
+        # word appears — the real help text describes adoption in prose.
+        _, supported, _ = self._probe(
+            tmp_path, 'COMMANDS:\n   list  Lists rules you can adopt later\n')
+        assert supported is False
+
+    def test_probe_failure_is_unsupported(self, tmp_path):
+        inst = _adopt_instance(tmp_path)
+        with patch('fumitm.subprocess.run', side_effect=OSError('boom')):
+            assert inst._aikido_doctor_supports_adopt(DOCTOR) is False
+
+    def test_answer_is_cached_across_callers(self, tmp_path):
+        inst, _, mock_run = self._probe(tmp_path, CERTCONFIG_HELP)
+        with patch('fumitm.subprocess.run') as second:
+            assert inst._aikido_doctor_supports_adopt(DOCTOR) is True
+        second.assert_not_called()
+        assert mock_run.call_count == 1
+
+    def test_old_agent_skips_instead_of_failing_forever(self, tmp_path):
+        # The whole point: this host used to report already_ok. It must not
+        # start reporting a hard failure on every scheduled run instead.
+        inst = _adopt_instance(tmp_path)
+        with _on_macos(), _doctor_on_path(inst, supports_adopt=False), \
+             _patch_aikido_paths(tmp_path, adopted=False, bundle_has_root=True), \
+             patch('fumitm.subprocess.run') as mock_run:
+            result = inst.setup_aikido_adopt()
+        assert result.status == 'skipped'
+        assert 'predates' in result.message
+        mock_run.assert_not_called()
+
+    def test_status_does_not_flag_an_old_agent(self, tmp_path):
+        inst = _adopt_instance(tmp_path, mode='status')
+        cert = tmp_path / 'temp_cert.pem'
+        cert.write_text(mock_data.MOCK_CERTIFICATE)
+        with _on_macos(), _doctor_on_path(inst, supports_adopt=False), \
+             _patch_aikido_paths(tmp_path, adopted=False, bundle_has_root=True):
+            assert inst.check_aikido_adopt_status(str(cert)) is False
 
 
 class TestAikidoAdoptRegistry(FumitmTestCase):
@@ -1529,18 +1629,39 @@ class TestAikidoAdoptFailure(FumitmTestCase):
         assert result.status == 'failed'
         assert 'did not adopt' in result.message
 
-    def test_unreadable_run_dir_fails_without_running_the_doctor(self, tmp_path):
+    def test_unreadable_run_dir_skips_without_running_the_doctor(self, tmp_path):
         # Adopting without being able to read the bundles is a privileged
         # command run blind, with no way to tell afterwards whether it took.
+        # Skipped rather than failed: fumitm never gains the privilege that
+        # would fix it, so a hard failure would go red on every scheduled run
+        # with nothing able to clear it.
         inst = _adopt_instance(tmp_path)
         with _on_macos(), _doctor_on_path(inst), \
              _patch_aikido_paths(tmp_path, adopted=True, bundle_has_root=True), \
              patch('fumitm.os.listdir', side_effect=PermissionError('denied')), \
              patch('fumitm.subprocess.run') as mock_run:
             result = inst.setup_aikido_adopt()
-        assert result.status == 'failed'
+        assert result.status == 'skipped'
         assert 'bundle directory' in result.message
         mock_run.assert_not_called()
+
+    def test_staged_copy_removed_when_the_run_dir_is_unreadable(self, tmp_path):
+        # The early return sits inside the try, so its staged copy is cleaned up
+        # like every other exit from this function.
+        inst = _adopt_instance(tmp_path)
+        staged = {}
+        real_stage = inst._stage_adoption_cert
+
+        def record():
+            staged['path'] = real_stage()
+            return staged['path']
+
+        with _on_macos(), _doctor_on_path(inst), \
+             _patch_aikido_paths(tmp_path, adopted=True, bundle_has_root=True), \
+             patch.object(inst, '_stage_adoption_cert', side_effect=record), \
+             patch('fumitm.os.listdir', side_effect=PermissionError('denied')):
+            inst.setup_aikido_adopt()
+        assert not Path(staged['path']).exists()
 
     def test_recorded_adoption_with_a_lagging_bundle_is_not_a_failure(self, tmp_path):
         # Bundles are rebuilt by the agent, not by the CLI's return, so a bundle

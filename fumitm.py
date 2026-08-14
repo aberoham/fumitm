@@ -333,6 +333,9 @@ class FumitmPython:
         self._in_setup_context = False
         self._setup_error_count = 0
         self._current_tool_key = None
+        # Cached because status and install both ask, and the answer cannot
+        # change within a run.
+        self._aikido_adopt_supported = None
 
         # User targeting for JAMF/Ansible/Puppet (Phase 2)
         self._target_uid = None
@@ -3616,6 +3619,33 @@ class FumitmPython:
                 self.print_debug(f"Ignoring {candidate}: {reason}")
         return None
 
+    def _aikido_doctor_supports_adopt(self, doctor):
+        """Return True when this aikido-doctor has the `certconfig adopt` subcommand.
+
+        Asked rather than assumed, because the failure is otherwise silent and
+        permanent: the CLI answers an unknown subcommand with "Unknown command"
+        on stdout and exits *zero*, so an agent predating `certconfig` would
+        sail past the return-code check and be caught only by the post-adopt
+        verification, which reports a hard failure. A host in that state would
+        go red on every scheduled run with no path back to green.
+
+        `certconfig --help` needs no privilege, costs a few milliseconds, and
+        names its subcommands, so the answer comes from the CLI itself rather
+        than from pattern-matching an error message.
+        """
+        if self._aikido_adopt_supported is None:
+            try:
+                result = subprocess.run([doctor, 'certconfig', '--help'],
+                                        capture_output=True, text=True,
+                                        check=False, timeout=30)
+                listing = f'{result.stdout}\n{result.stderr}'
+            except (subprocess.SubprocessError, OSError) as e:
+                self.print_debug(f"Could not ask {doctor} for its certconfig commands: {e}")
+                return False
+            self._aikido_adopt_supported = bool(
+                re.search(r'^\s+adopt\b', listing, re.MULTILINE))
+        return self._aikido_adopt_supported
+
     def setup_aikido_adopt(self):
         """Adopt the primary provider root into Aikido's own CA bundles.
 
@@ -3642,22 +3672,29 @@ class FumitmPython:
                 'aikido-adopt', 'skipped',
                 'aikido-doctor not found in trusted system PATH'
             )
+        if not self._aikido_doctor_supports_adopt(doctor):
+            return ToolResult(
+                'aikido-adopt', 'skipped',
+                'aikido-doctor predates certconfig adopt'
+            )
         staged = self._stage_adoption_cert()
         if staged is None:
             return ToolResult('aikido-adopt', 'skipped', 'Provider root certificate not materialized')
-        if self._aikido_built_bundles() is None:
-            # Adopting without being able to read the bundles would be a
-            # privileged command run blind, with no way to tell afterwards
-            # whether it took. Report the directory instead; that is the fault
-            # to fix. Checked after staging so a host with no root to adopt is
-            # reported as having nothing to do rather than as broken.
-            os.unlink(staged)
-            run_dir = SUPPLEMENTAL_ROOTS['aikido']['run_dir']
-            message = f"Could not read Aikido's bundle directory {run_dir}"
-            self.print_error(message)
-            return ToolResult('aikido-adopt', 'failed', message)
 
         try:
+            if self._aikido_built_bundles() is None:
+                # Adopting without being able to read the bundles would be a
+                # privileged command run blind, with no way to tell afterwards
+                # whether it took. Report the directory instead; that is the
+                # fault to fix. Skipped rather than failed because fumitm never
+                # gains the privilege that would fix it — the escalation covers
+                # the doctor invocation alone — so a hard failure would go red
+                # on every scheduled run with nothing able to clear it.
+                run_dir = SUPPLEMENTAL_ROOTS['aikido']['run_dir']
+                message = f"Could not read Aikido's bundle directory {run_dir}"
+                self.print_warn(message)
+                return ToolResult('aikido-adopt', 'skipped', message)
+
             short = self.provider['short_name']
             if self._aikido_trusts_root(staged):
                 self.print_info(f"  ✓ {short} root already adopted by Aikido")
@@ -3718,10 +3755,15 @@ class FumitmPython:
                     message = f'aikido-doctor exited 0 but did not adopt the {short} root'
                     self.print_error(message)
                     return ToolResult('aikido-adopt', 'failed', message)
-                missing = self._aikido_bundles_missing(staged) or []
-                lagging = ', '.join(os.path.basename(b) for b in missing)
-                self.print_warn(
-                    f"Aikido recorded the {short} root but has not yet rebuilt: {lagging}")
+                missing = self._aikido_bundles_missing(staged)
+                if missing is None:
+                    self.print_warn(
+                        f"Aikido recorded the {short} root, but its bundle directory "
+                        "became unreadable before the result could be confirmed")
+                else:
+                    lagging = ', '.join(os.path.basename(b) for b in missing)
+                    self.print_warn(
+                        f"Aikido recorded the {short} root but has not yet rebuilt: {lagging}")
             self.print_info(f"  ✓ Adopted {short} root into Aikido's CA bundles")
             return ToolResult('aikido-adopt', 'configured',
                               'Adopted provider root into Aikido CA bundles')
@@ -6442,11 +6484,15 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         if platform.system() != 'Darwin':
             self.print_info("  - Aikido adoption is macOS-only")
             return has_issues
-        if not self._find_aikido_doctor():
+        doctor = self._find_aikido_doctor()
+        if not doctor:
             self.print_info(
                 "  - aikido-doctor not found in trusted system PATH "
                 "(run with --debug to see whether a candidate was rejected)"
             )
+            return has_issues
+        if not self._aikido_doctor_supports_adopt(doctor):
+            self.print_info("  - aikido-doctor predates certconfig adopt")
             return has_issues
         if self._aikido_built_bundles() is None:
             run_dir = SUPPLEMENTAL_ROOTS['aikido']['run_dir']
