@@ -829,16 +829,24 @@ class FumitmPython:
     def _aikido_built_bundles(self):
         """Return every CA bundle `certconfig adopt` builds and keeps current.
 
-        The directory is listed rather than globbed, and an unreadable run_dir
-        answers None rather than an empty list. glob swallows the error, and the
-        empty result it leaves behind is indistinguishable from an agent that
-        builds no bundles — which would send the caller to the adoption record
-        and let a filesystem fault read as a healthy adoption.
+        The directory is listed rather than globbed, and a run_dir that exists
+        but cannot be read answers None rather than an empty list. glob swallows
+        the error, and the empty result it leaves behind is indistinguishable
+        from an agent that builds no bundles — which would send the caller to
+        the adoption record and let a filesystem fault read as a healthy
+        adoption.
+
+        A run_dir that is simply absent is a different fact and answers the
+        empty list, since an agent exposing no bundle directory at all is
+        exactly the legacy shape the record exists to cover. Treating it as a
+        fault would fail every host without Aikido installed.
         """
         descriptor = SUPPLEMENTAL_ROOTS['aikido']
         run_dir = descriptor['run_dir']
         try:
             entries = os.listdir(run_dir)
+        except FileNotFoundError:
+            return []
         except OSError as e:
             self.print_debug(f"Could not list Aikido's bundle directory {run_dir}: {e}")
             return None
@@ -3634,18 +3642,20 @@ class FumitmPython:
                 'aikido-adopt', 'skipped',
                 'aikido-doctor not found in trusted system PATH'
             )
+        staged = self._stage_adoption_cert()
+        if staged is None:
+            return ToolResult('aikido-adopt', 'skipped', 'Provider root certificate not materialized')
         if self._aikido_built_bundles() is None:
             # Adopting without being able to read the bundles would be a
             # privileged command run blind, with no way to tell afterwards
             # whether it took. Report the directory instead; that is the fault
-            # to fix.
+            # to fix. Checked after staging so a host with no root to adopt is
+            # reported as having nothing to do rather than as broken.
+            os.unlink(staged)
             run_dir = SUPPLEMENTAL_ROOTS['aikido']['run_dir']
             message = f"Could not read Aikido's bundle directory {run_dir}"
             self.print_error(message)
             return ToolResult('aikido-adopt', 'failed', message)
-        staged = self._stage_adoption_cert()
-        if staged is None:
-            return ToolResult('aikido-adopt', 'skipped', 'Provider root certificate not materialized')
 
         try:
             short = self.provider['short_name']

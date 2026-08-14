@@ -1192,6 +1192,16 @@ class TestAikidoAdoptionState(FumitmTestCase):
             assert inst._aikido_bundles_missing(inst.cert_path) is None
         assert any('bundle directory' in call.args[0] for call in debug.call_args_list)
 
+    def test_absent_run_dir_is_not_an_error(self, tmp_path):
+        # A directory that is simply not there is the legacy shape the record
+        # exists to cover, not a fault. Conflating the two failed the tool on
+        # every host without Aikido installed, including CI.
+        inst = _adopt_instance(tmp_path)
+        import fumitm
+        with patch.dict(fumitm.SUPPLEMENTAL_ROOTS['aikido'],
+                        {'run_dir': str(tmp_path / 'never-installed')}):
+            assert inst._aikido_built_bundles() == []
+
     def test_unreadable_run_dir_does_not_defer_to_the_record(self, tmp_path):
         # The record exists and every bundle carries the root, but the directory
         # cannot be read — so none of that is knowable. Deferring to the record
