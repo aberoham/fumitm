@@ -2101,13 +2101,12 @@ class FumitmPython:
             self.print_info(f"Updated {desc} at {path}")
         return True
 
-    @staticmethod
-    def _property_lines_with_vendor_scope(path):
+    def _property_lines_with_vendor_scope(self, path):
         """Return property-file lines with parsed assignments and vendor scope."""
-        if not os.path.exists(path):
+        text = self._read_text_or_none(path)
+        if text is None:
             return []
-        with open(path, 'r') as f:
-            raw_lines = f.readlines()
+        raw_lines = text.splitlines(keepends=True)
 
         parsed = []
         in_vendor_block = False
@@ -2127,16 +2126,19 @@ class FumitmPython:
             parsed.append((raw_line, in_vendor_block, key, value))
         return parsed
 
-    def _properties_have_values_outside_vendor_blocks(self, path, expected):
+    @staticmethod
+    def _properties_have_values_outside_vendor_blocks(parsed, expected):
         """Return True when a non-vendor property has one of the expected values."""
         return any(
             not in_vendor and key in expected and expected[key] == value
-            for _, in_vendor, key, value in self._property_lines_with_vendor_scope(path)
+            for _, in_vendor, key, value in parsed
         )
 
-    def _remove_property_values_outside_vendor_blocks(self, path, expected, desc):
+    def _remove_property_values_outside_vendor_blocks(
+            self, path, expected, desc, parsed=None):
         """Remove matching non-vendor properties and preserve vendor blocks."""
-        parsed = self._property_lines_with_vendor_scope(path)
+        if parsed is None:
+            parsed = self._property_lines_with_vendor_scope(path)
         kept = []
         changed = False
         for raw_line, in_vendor, key, value in parsed:
@@ -2164,7 +2166,24 @@ class FumitmPython:
             'systemProp.javax.net.ssl.trustStore': self.get_gradle_custom_cacerts_path(),
             'systemProp.javax.net.ssl.trustStorePassword': 'changeit',
             'systemProp.javax.net.ssl.trustStoreType': 'PKCS12',
+            'systemProp.https.protocols': 'TLSv1.2',
         }
+
+    def _gradle_java_cacerts(self, gradle_props, parsed=None):
+        """Return cacerts for Gradle's pinned JDK, or the active JDK."""
+        if parsed is None:
+            parsed = self._property_lines_with_vendor_scope(gradle_props)
+        gradle_java_home = None
+        for _, _, key, value in parsed:
+            if key == 'org.gradle.java.home':
+                gradle_java_home = value
+        if gradle_java_home:
+            gradle_java_home = os.path.expanduser(gradle_java_home)
+            self.print_debug(
+                f"Gradle selects Java home from org.gradle.java.home: {gradle_java_home}"
+            )
+            return self.find_java_cacerts(gradle_java_home)
+        return self.find_java_cacerts()
     
     def certificate_likely_exists_in_file(self, cert_file, target_file):
         """Look for certificates with pure-Python string matching.
@@ -3329,6 +3348,28 @@ class FumitmPython:
         """
         desired = self._cert_fingerprints(cert_path)
         return bool(desired and desired[0] in fingerprints)
+
+    def _keystore_has_expected_roots(
+            self, keytool_bin, keystore, storetype=None,
+            primary_cert_path=None):
+        """Return True only when every available proxy root is in a keystore.
+
+        This predicate deliberately has no alias fallback. Callers use it as a
+        safety gate before removing another trust path, so an unparseable keytool
+        listing is uncertainty rather than proof that the keystore is ready.
+        """
+        fingerprints = self._keytool_keystore_fingerprints(
+            keytool_bin, keystore, storetype=storetype
+        )
+        if fingerprints is None:
+            return False
+        alias_pairs = self._all_root_aliases()
+        if primary_cert_path:
+            alias_pairs[0] = (alias_pairs[0][0], primary_cert_path)
+        return all(
+            self._keystore_has_cert_path(fingerprints, cert_path)
+            for _, cert_path in alias_pairs
+        )
 
     def _ensure_roots_in_keystore(self, keytool_bin, keystore, label, storetype=None,
                                   alias_pairs=None, split_chains=False):
@@ -5442,8 +5483,9 @@ class FumitmPython:
         if not self.command_exists('gradle') and not os.path.exists(gradle_props):
             return ToolResult('gradle', 'skipped', 'gradle not found in PATH')
 
+        parsed = self._property_lines_with_vendor_scope(gradle_props)
         if self._aikido_active:
-            cacerts = self.find_java_cacerts()
+            cacerts = self._gradle_java_cacerts(gradle_props, parsed=parsed)
             if not cacerts:
                 self.print_error("Could not find Java cacerts file for Gradle")
                 return ToolResult('gradle', 'skipped', 'Java cacerts file not found')
@@ -5455,6 +5497,17 @@ class FumitmPython:
                     'gradle', 'failed',
                     'Could not prepare Java trust before removing Gradle override'
                 )
+            if (
+                self.is_install_mode()
+                and not self._keystore_has_expected_roots('keytool', cacerts)
+            ):
+                self.print_error(
+                    "Could not verify all proxy roots in Gradle's Java truststore"
+                )
+                return ToolResult(
+                    'gradle', 'failed',
+                    'Java trust verification failed; Gradle override preserved'
+                )
 
             managed = self._gradle_fumitm_truststore_properties()
             truststore_override = {
@@ -5462,10 +5515,12 @@ class FumitmPython:
                     managed['systemProp.javax.net.ssl.trustStore']
             }
             changed = False
+            # The password, type, and TLS values are not unique to fumitm. The
+            # exact custom-cacerts path proves ownership before removing them.
             if self._properties_have_values_outside_vendor_blocks(
-                    gradle_props, truststore_override):
+                    parsed, truststore_override):
                 changed = self._remove_property_values_outside_vendor_blocks(
-                    gradle_props, managed, 'Gradle properties'
+                    gradle_props, managed, 'Gradle properties', parsed=parsed
                 )
             if (changed or java_status == 'configured') and self.is_install_mode():
                 if changed and java_status == 'configured':
@@ -5483,7 +5538,7 @@ class FumitmPython:
                 'gradle', 'already_ok', 'Gradle uses Aikido/JDK trust configuration'
             )
 
-        cacerts = self.find_java_cacerts()
+        cacerts = self._gradle_java_cacerts(gradle_props, parsed=parsed)
         if not cacerts:
             self.print_error("Could not find Java cacerts file for Gradle")
             return ToolResult('gradle', 'skipped', 'Java cacerts file not found')
@@ -7169,27 +7224,30 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         gradle_props = self.get_gradle_properties_path()
         if self.command_exists('gradle') or os.path.exists(gradle_props):
             if self._aikido_active:
+                parsed = self._property_lines_with_vendor_scope(gradle_props)
                 managed = self._gradle_fumitm_truststore_properties()
                 truststore_override = {
                     'systemProp.javax.net.ssl.trustStore':
                         managed['systemProp.javax.net.ssl.trustStore']
                 }
                 if self._properties_have_values_outside_vendor_blocks(
-                    gradle_props, truststore_override
+                    parsed, truststore_override
                 ):
                     self.print_warn(
                         "  ✗ fumitm Gradle truststore override hides Aikido/JDK trust"
                     )
                     self.print_action("    Run with --fix to remove the override")
                     return True
-                cacerts = self.find_java_cacerts()
+                cacerts = self._gradle_java_cacerts(gradle_props, parsed=parsed)
                 if not cacerts:
                     self.print_warn("  ✗ Could not find Java cacerts for Gradle")
                     return True
-                if not self._keytool_alias_present(
-                    'keytool', cacerts, self.provider['keytool_alias']
+                if not self._keystore_has_expected_roots(
+                    'keytool', cacerts, primary_cert_path=temp_warp_cert
                 ):
-                    self.print_warn("  ✗ Active JDK is missing the provider root")
+                    self.print_warn(
+                        "  ✗ Gradle's JDK is missing one or more proxy roots"
+                    )
                     self.print_action("    Run with --fix to prepare Java trust")
                     return True
                 self.print_info("  ✓ Gradle uses Aikido/JDK trust configuration")
