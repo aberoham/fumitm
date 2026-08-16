@@ -29,13 +29,13 @@ __version__ = "2026.8.14"  # CalVer: YYYY.MM.DD (auto-updated on release)
 
 
 def parse_calver(version_str):
-    """Parse CalVer version string into comparable tuple.
+    """Make a comparable tuple from a CalVer version string.
 
     Args:
-        version_str: Version like "2025.12.18" or "2025.12.18.1"
+        version_str: A version such as "2025.12.18" or "2025.12.18.1".
 
     Returns:
-        tuple: (year, month, day, patch) where patch is 0 for base versions
+        tuple: (year, month, day, patch). The patch is 0 for a base version.
     """
     parts = version_str.split('.')
     if len(parts) == 3:
@@ -56,10 +56,8 @@ def get_version_info():
     }
     
     try:
-        # Get the directory where this script is located
         script_dir = os.path.dirname(os.path.abspath(__file__))
         
-        # Check if we're in a git repository
         result = subprocess.run(
             ['git', 'rev-parse', '--git-dir'],
             cwd=script_dir,
@@ -68,7 +66,6 @@ def get_version_info():
         )
         
         if result.returncode == 0:
-            # Get commit hash (short)
             result = subprocess.run(
                 ['git', 'rev-parse', '--short', 'HEAD'],
                 cwd=script_dir,
@@ -78,7 +75,6 @@ def get_version_info():
             if result.returncode == 0:
                 version_info['commit'] = result.stdout.strip()
             
-            # Get commit date
             result = subprocess.run(
                 ['git', 'log', '-1', '--format=%cd', '--date=short'],
                 cwd=script_dir,
@@ -88,7 +84,6 @@ def get_version_info():
             if result.returncode == 0:
                 version_info['date'] = result.stdout.strip()
             
-            # Get branch name
             result = subprocess.run(
                 ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
                 cwd=script_dir,
@@ -98,7 +93,6 @@ def get_version_info():
             if result.returncode == 0:
                 version_info['branch'] = result.stdout.strip()
             
-            # Check if working directory is dirty
             result = subprocess.run(
                 ['git', 'status', '--porcelain'],
                 cwd=script_dir,
@@ -108,7 +102,6 @@ def get_version_info():
             if result.returncode == 0 and result.stdout.strip():
                 version_info['dirty'] = True
             
-            # Get tag if available
             result = subprocess.run(
                 ['git', 'describe', '--tags', '--abbrev=0'],
                 cwd=script_dir,
@@ -119,7 +112,7 @@ def get_version_info():
             if result.returncode == 0 and result.stdout.strip():
                 version_info['version'] = result.stdout.strip()
             else:
-                # No tags, use commit count as version
+                # There is no tag. Use the number of commits as the version.
                 result = subprocess.run(
                     ['git', 'rev-list', '--count', 'HEAD'],
                     cwd=script_dir,
@@ -130,12 +123,11 @@ def get_version_info():
                     count = result.stdout.strip()
                     version_info['version'] = f"0.{count}.0"
             
-            # Add dirty flag to version if needed
             if version_info['dirty'] and version_info['version'] != 'unknown':
                 version_info['version'] += '-dirty'
     
     except Exception:
-        # Git not available or not a git repository
+        # git is absent, or this is not a git repository.
         pass
     
     return version_info
@@ -157,9 +149,8 @@ CERT_PATH = os.path.expanduser("~/.cloudflare-ca.pem")
 SMALL_BUNDLE_MAX_CERTS = 2
 SMALL_BUNDLE_MAX_SIZE_BYTES = 50 * 1024  # 50KB
 
-# Provider configurations: each MITM proxy that fumitm supports. The tool setup
-# logic is identical across providers — only certificate sources, paths, and
-# display names differ.
+# The MITM proxies that fumitm supports. Only the certificate sources, the
+# paths, and the display names change between providers.
 PROVIDERS = {
     'warp': {
         'name': 'Cloudflare WARP',
@@ -186,27 +177,23 @@ PROVIDERS = {
     },
 }
 
-# Groups whose write access to a root-owned *directory* grants nothing its
-# members do not already hold. macOS ships /Applications as root:admin
-# drwxrwxr-x, so treating group-writability as disqualifying would reject every
-# binary living in an application bundle — which is where vendor agents install.
-# Membership of admin already confers sudo, so honoring it costs no privilege
-# boundary, while the far more dangerous root:staff case (staff contains every
-# local user) stays rejected. The exemption is for directories only; an
-# executable that is itself group-writable is rejected whatever the group.
+# Groups whose write access to a root-owned directory gives no new privilege.
+# macOS gives /Applications the mode root:admin drwxrwxr-x, and vendor agents
+# install there. Members of admin can already use sudo. Members of staff are
+# all local users, thus staff is not in this set. This applies to directories
+# only. A group-writable executable is always rejected.
 PRIVILEGED_GROUPS = frozenset({0, 80})  # wheel, admin
 
-# Supplemental root CAs: vendors that perform *selective* TLS interception on
-# top of a primary provider. Unlike PROVIDERS, these are never selected to the
-# exclusion of others — when detected, their root is added to every bundle
-# fumitm builds *alongside* the primary provider's root. They are deliberately
-# kept out of PROVIDERS so _resolve_provider can never return one.
+# Vendors that intercept some TLS connections above a primary provider. fumitm
+# adds these roots to each managed bundle with the primary root. It does not
+# replace the primary root. They stay out of PROVIDERS, thus _resolve_provider
+# cannot return one.
 SUPPLEMENTAL_ROOTS = {
     'aikido': {
         'name': 'Aikido Endpoint Protection',
         'short_name': 'Aikido',
-        # Keychain label and subject CN both start with this; the org-specific
-        # "- org-NNNNNN" suffix varies, so we always match on the prefix.
+        # The keychain label and the subject CN start with this text. The
+        # suffix "- org-NNNNNN" changes, thus fumitm matches the prefix.
         'keychain_label_prefix': 'Aikido Endpoint Protection Root CA',
         'support_dir': '/Library/Application Support/AikidoSecurity/',
         'run_dir': (
@@ -216,29 +203,22 @@ SUPPLEMENTAL_ROOTS = {
             '/Library/Application Support/AikidoSecurity/'
             'EndpointProtection/run/endpoint-protection-pip-combined-ca.pem'
         ),
-        # Aikido builds one CA bundle per tool family and they do not agree with
-        # one another: on an observed host the pip and node bundles carried the
-        # Netskope chain while the openssl and ruby bundles did not. Whether
-        # Aikido trusts a root therefore cannot be answered from a single file.
+        # Aikido makes one bundle for each tool group, and the bundles are not
+        # the same. Check all of them.
         #
-        # Only the per-tool bundles qualify, and the tool segment in the pattern
-        # is what selects them. Two files in the same directory look like
-        # bundles but are not maintained by `certconfig adopt`: the proxy CA,
-        # which holds Aikido's own root alone, and the legacy
-        # endpoint-protection-combined-ca.pem, which an adoption run leaves
-        # untouched — observed six weeks stale at three certificates while every
-        # per-tool bundle was rewritten in the same pass. Requiring the provider
-        # root in a file nothing maintains would deny trust permanently and
-        # re-run adoption on every invocation.
+        # The tool segment in the pattern selects the maintained bundles. Two
+        # other files look like bundles, but `certconfig adopt` does not write
+        # them: the proxy CA, and the legacy
+        # endpoint-protection-combined-ca.pem. A check against an unmaintained
+        # file can never succeed.
         'bundle_globs': (
             'endpoint-protection-*-combined-ca.pem',
             'endpoint-protection-*-cafile.pem',
         ),
-        # Aikido records each CA adopted via `certconfig adopt` as a
-        # <sha256>.pem here, keyed by the same fingerprint `adopt --forget`
-        # takes. The directory is created on first adoption, so its absence
-        # means nothing has been adopted rather than that adoption is
-        # unavailable.
+        # Aikido writes one <sha256>.pem here for each CA that it adopts. The
+        # name is the fingerprint that `adopt --forget` takes. Aikido makes
+        # this directory at the first adoption, thus an absent directory shows
+        # that Aikido adopted no CA.
         'adopted_dir': (
             '/Library/Application Support/AikidoSecurity/'
             'EndpointProtection/run/adopted-cas'
@@ -266,15 +246,15 @@ ToolResult = namedtuple(
 
 
 class FumitmPython:
-    # Markers delimiting fumitm's managed block in a shell startup file. The
-    # block is always re-emitted at the end of the file so its TLS-trust settings
-    # win over any earlier vendor block (e.g. Aikido) via last-export-wins.
+    # These markers enclose the block that fumitm manages in a shell startup
+    # file. fumitm always writes the block at the end of the file. Thus its
+    # settings replace the settings of an earlier vendor block.
     _FUMITM_BLOCK_BEGIN = "# >>> fumitm managed (keep last) >>>"
     _FUMITM_BLOCK_END = "# <<< fumitm managed <<<"
 
-    # For POSIX-sh-compatible shells the exports live in one file that every
-    # startup file sources, rather than being duplicated into each of them.
-    # $HOME (not an expanded path) keeps the stub valid if the home dir moves.
+    # Shells that read POSIX sh syntax get one file with the exports. Each
+    # startup file sources that file. The stub uses $HOME and not an expanded
+    # path, thus it stays correct if the home directory moves.
     _FUMITM_ENV_FILE_REL = ".config/fumitm/env.sh"
     _FUMITM_ENV_FILE_SHELL = '"$HOME/.config/fumitm/env.sh"'
 
@@ -289,23 +269,22 @@ class FumitmPython:
         self.mode = mode
         self.debug = debug
         self.shell_modified = False
-        # Shell config paths whose pre-run original has already been backed up
-        # this run, so repeated writes in one run never overwrite the .bak with an
-        # intermediate generated file.
+        # Shell config paths with a backup of the original file. A second
+        # write in the same run must not replace that backup.
         self._backed_up_shell_configs = set()
-        # Paths already announced in dry-run mode. Nothing persists in a dry
-        # run, so every var re-detects the same pending file changes; report
-        # each file once instead of once per variable.
+        # Paths already reported in dry-run mode. A dry run writes nothing,
+        # thus each variable finds the same pending changes. Report each file
+        # one time.
         self._dry_run_reported = set()
-        # Cached result of asking zsh where shell-local startup configuration
-        # redirected ZDOTDIR. Exported values are read directly on every call.
+        # The ZDOTDIR value that the zsh startup configuration sets. fumitm
+        # reads an exported value at each call.
         self._queried_zsh_dotdir = None
         self.cert_fingerprint = ""
         self.selected_tools = selected_tools or []
         self.cert_file = cert_file
-        # Stored raw and expanded at read time: --run-as-user/sudo targeting
-        # rewrites HOME later in __init__, so a tilde path must not be expanded
-        # against root's home here.
+        # Kept raw and expanded at read time. --run-as-user and sudo change
+        # HOME later in __init__. Thus a tilde path must not expand against
+        # the home directory of root.
         self.aikido_cert_file = aikido_cert_file
         self.manual_cert = manual_cert
         self.skip_verify = skip_verify
@@ -319,9 +298,9 @@ class FumitmPython:
         else:
             self._use_color = sys.stdout.isatty()
 
-        # Log file handles (opened lazily in _open_log_files, closed in
-        # _close_log_files). Directory mode generates timestamped filenames
-        # and maintains a "latest" symlink.
+        # Log file handles. _open_log_files opens them and _close_log_files
+        # closes them. Directory mode makes a name with a timestamp and keeps
+        # a "latest" symlink.
         self._log_file_handle = None
         self._json_log_file_handle = None
         self._log_file_path = log_file
@@ -333,11 +312,11 @@ class FumitmPython:
         self._in_setup_context = False
         self._setup_error_count = 0
         self._current_tool_key = None
-        # Cached because status and install both ask, and the answer cannot
-        # change within a run.
+        # Cached. Status and install both ask, and the answer cannot change
+        # during a run.
         self._aikido_adopt_supported = None
 
-        # User targeting for JAMF/Ansible/Puppet (Phase 2)
+        # User targeting for JAMF, Ansible, and Puppet
         self._target_uid = None
         self._target_gid = None
         self._run_as_user = run_as_user
@@ -346,9 +325,8 @@ class FumitmPython:
         if run_as_user:
             self._apply_target_user(run_as_user)
         elif os.getuid() == 0:
-            # When running under sudo on Linux, $HOME may resolve to /root
-            # instead of the real user's home directory. Correct it before any
-            # expanduser calls so paths land in the right place.
+            # Under sudo on Linux, HOME can be /root and not the home
+            # directory of the user. Correct it before any call to expanduser.
             sudo_user = os.environ.get('SUDO_USER')
             if sudo_user:
                 self._apply_target_user(sudo_user)
@@ -359,23 +337,21 @@ class FumitmPython:
                     "User-scoped tool configs will be skipped."
                 )
 
-        # Resolve which MITM proxy provider to use. When provider is None,
-        # auto-detection checks WARP first, then Netskope.
+        # When provider is None, auto-detection examines WARP first, then
+        # Netskope.
         self.provider = self._resolve_provider(provider)
         self.cert_path = os.path.expanduser(self.provider['cert_path'])
         self.bundle_dir = os.path.expanduser(self.provider['bundle_dir'])
 
-        # Resolve supplemental root CAs (e.g. Aikido) that ride alongside the
-        # primary provider. Each entry is a descriptor copy that gains a 'path'
-        # key once its root certificate is materialized by _prepare_extra_roots.
-        # Empty when none are detected, which keeps behavior byte-for-byte
-        # identical to the no-supplemental-root case.
+        # Supplemental roots that go with the primary provider. Each entry is
+        # a copy of a descriptor. _prepare_extra_roots adds a 'path' key when
+        # it materializes the root certificate. The list is empty when fumitm
+        # detects no supplemental root.
         self._extra_root_temp_files = []
         self.extra_roots = self._resolve_extra_roots(with_aikido, no_aikido)
 
-        # Define tool registry with tags, descriptions, and scope. Scope
-        # determines what runs without user context when root runs without
-        # --run-as-user: 'system' tools run always, 'user' tools need $HOME.
+        # Scope controls what runs when root runs without --run-as-user.
+        # A 'system' tool always runs. A 'user' tool needs HOME.
         self.tools_registry = {
             'aikido-adopt': {
                 'name': 'Aikido CA Bundles',
@@ -523,17 +499,15 @@ class FumitmPython:
             },
         }
         
-        # Add platform check
         if platform.system() != 'Darwin':
             self.print_warn("This script is designed for macOS. Most features will not work correctly.")
 
     def _resolve_provider(self, requested):
-        """Determine which MITM proxy provider to use.
+        """Select the MITM proxy provider.
 
-        When no provider is explicitly requested, auto-detection checks WARP
-        first (via warp-cli), then Netskope (via known cert file paths or
-        STAgent process). If both are detected, WARP is preferred and an info
-        message about Netskope availability is printed.
+        With no given provider, auto-detection examines WARP first, then Netskope.
+        If both are present, fumitm uses WARP and reports that Netskope is also
+        available.
         """
         if requested:
             if requested not in PROVIDERS:
@@ -553,16 +527,14 @@ class FumitmPython:
         if netskope_detected:
             return PROVIDERS['netskope']
 
-        # Neither detected — fall back to WARP so existing error messages about
-        # missing warp-cli still make sense.
+        # fumitm found no provider. Use WARP, thus the messages about a
+        # missing warp-cli stay correct.
         return PROVIDERS['warp']
 
     def _path_belongs_to_other_provider(self, path):
-        """Check whether a path lives under a different provider's bundle directory.
+        """Find if a path is in the bundle directory of a different provider.
 
-        Returns the other provider's display name if the path is under a
-        different provider's bundle_dir, or None if it belongs to the current
-        provider or is unrelated to any known provider.
+        Returns the display name of the other provider, or None.
         """
         for config in PROVIDERS.values():
             other_dir = os.path.expanduser(config['bundle_dir'])
@@ -573,12 +545,12 @@ class FumitmPython:
         return None
 
     def _is_vendor_injected_bundle(self, path):
-        """Return True if path lives under a supplemental-root vendor's own directory.
+        """Return True if the path is in the directory of a supplemental-root vendor.
 
-        Such a bundle (e.g. Aikido's combined PEM) is maintained and env-injected
-        by the vendor at runtime. fumitm must not adopt, append to, or relocate
-        it; it manages its own bundle instead, and adds roots to the vendor's
-        bundle only through the vendor's own tooling (see setup_aikido_adopt).
+        The vendor keeps this bundle current and sets it in the environment. fumitm
+        must not use, change, or move it. fumitm keeps its own bundle. To add a root
+        to the bundle of the vendor, use the tooling of the vendor. See
+        setup_aikido_adopt.
         """
         for descriptor in SUPPLEMENTAL_ROOTS.values():
             support_dir = descriptor.get('support_dir')
@@ -591,11 +563,10 @@ class FumitmPython:
         return shutil.which('warp-cli') is not None
 
     def _detect_netskope(self):
-        """Return True if Netskope appears to be installed.
+        """Return True if Netskope is installed.
 
-        Checks known certificate file paths first (fast), then falls back to
-        looking for a running Netskope process. On macOS, the client runs as
-        "Netskope Client"; on Linux, it runs as STAgent.
+        Examines the known certificate paths first, then looks for the process. The
+        client is "Netskope Client" on macOS and STAgent on Linux.
         """
         plat = platform.system()
         cert_sources = PROVIDERS['netskope'].get('cert_sources', {}).get(plat, [])
@@ -603,7 +574,6 @@ class FumitmPython:
             if os.path.exists(path):
                 return True
 
-        # Check for encrypted cert variant
         for path in cert_sources:
             if os.path.exists(path + '.enc'):
                 return True
@@ -623,16 +593,15 @@ class FumitmPython:
         return False
 
     def _resolve_extra_roots(self, with_aikido, no_aikido):
-        """Determine which supplemental root CAs are active for this run.
+        """Select the supplemental root CAs for this run.
 
-        A supplemental root is included when explicitly forced on, or when it is
-        auto-detected and not explicitly forced off. Returns a list of descriptor
-        copies (each tagged with its registry key); empty when none apply.
+        A supplemental root applies when the operator forces it on, or when fumitm
+        detects it and the operator does not force it off. Returns a list of
+        descriptor copies. Each copy has its registry key.
         """
         active = []
-        # Aikido is the only supplemental root today; the structure generalizes
-        # so future vendors slot in the same way. Supplying an explicit cert file
-        # implies the operator wants Aikido active, mirroring --with-aikido.
+        # Aikido is the only supplemental root now. A given certificate file
+        # makes Aikido active, as --with-aikido does.
         aikido_forced_off = no_aikido
         aikido_forced_on = with_aikido or bool(self.aikido_cert_file)
         aikido_active = aikido_forced_on or (not aikido_forced_off and self._detect_aikido())
@@ -643,12 +612,11 @@ class FumitmPython:
         return active
 
     def _detect_aikido(self):
-        """Return True if Aikido Endpoint Protection appears to be present.
+        """Return True if Aikido Endpoint Protection is present.
 
-        Any of the following is sufficient: the AikidoSecurity support directory
-        exists, the maintained combined PEM exists, or (macOS) the System
-        Keychain holds a certificate whose label starts with the Aikido root CA
-        prefix. The org-specific suffix on the label is ignored.
+        One of these is sufficient: the AikidoSecurity directory is present, the
+        combined PEM is present, or the System Keychain holds a certificate with the
+        Aikido root CA prefix in its label. fumitm ignores the suffix of the label.
         """
         descriptor = SUPPLEMENTAL_ROOTS['aikido']
         if os.path.isdir(descriptor['support_dir']):
@@ -672,25 +640,25 @@ class FumitmPython:
         return False
 
     def _get_aikido_root_cert(self):
-        """Retrieve the Aikido root CA certificate(s) as PEM text.
+        """Get the Aikido root CA certificates as PEM text.
 
-        Sources are tried in order: an operator-supplied file (``--aikido-cert``),
-        the macOS System Keychain (by label prefix), the maintained combined PEM,
-        and finally a root persisted by an earlier run. The explicit and persisted
-        sources are what let ``--with-aikido`` succeed on hosts where the live
-        Aikido agent is absent, such as CI or no-agent images. Only certificates
-        whose subject CN starts with the Aikido root prefix are kept; the ephemeral
-        hex-CN interception intermediate is deliberately excluded.
+        fumitm tries these sources in this sequence: a file that the operator gives
+        with ``--aikido-cert``, the macOS System Keychain, the combined PEM, and a
+        root that an earlier run kept. The first source and the last source let
+        ``--with-aikido`` succeed on a host with no Aikido agent, such as a CI
+        image. fumitm keeps only the certificates whose subject CN starts with the
+        Aikido root prefix. This removes the interception intermediate, which has a
+        hexadecimal CN and a short life.
 
         Returns:
-            str or None: PEM text containing the Aikido root(s), or None.
+            str or None: PEM text with the Aikido roots, or None.
         """
         descriptor = SUPPLEMENTAL_ROOTS['aikido']
         prefix = descriptor['keychain_label_prefix']
 
-        # Source 1: explicit operator-supplied file. This is the supported path
-        # for forcing Aikido on hosts where no live agent or keychain entry
-        # exists; failure here is surfaced rather than silently falling through.
+        # Source 1: a file that the operator gives. Use this to force Aikido
+        # on a host with no agent and no keychain entry. A failure here is
+        # reported and does not fall through.
         if self.aikido_cert_file:
             cert_path = os.path.expanduser(self.aikido_cert_file)
             pem = self._read_aikido_root_from_file(cert_path, prefix)
@@ -721,8 +689,8 @@ class FumitmPython:
             self.print_info(f"Using Aikido root CA from {descriptor['combined_pem']}")
             return pem
 
-        # Source 4: a root persisted by an earlier fumitm run. This keeps
-        # --with-aikido working after the live agent is removed or unavailable.
+        # Source 4: a root that an earlier fumitm run kept. This keeps
+        # --with-aikido usable after the agent is removed.
         persisted = os.path.expanduser(descriptor['cert_path'])
         pem = self._read_aikido_root_from_file(persisted, prefix)
         if pem:
@@ -733,12 +701,11 @@ class FumitmPython:
         return None
 
     def _read_aikido_root_from_file(self, path, cn_prefix):
-        """Return CN-prefix-filtered Aikido root PEM text from a file, or None.
+        """Read Aikido root PEM text from a file, or return None.
 
-        Reads the file at ``path`` (if it exists), keeps only the certificate
-        blocks whose subject CN starts with ``cn_prefix``, and returns them
-        joined as PEM text. Returns None when the file is absent, unreadable, or
-        contains no matching root.
+        Keeps only the certificate blocks whose subject CN starts with ``cn_prefix``
+        and returns them as PEM text. Returns None if the file is absent or
+        unreadable, or if it has no matching root.
         """
         if not path or not os.path.exists(path):
             return None
@@ -754,10 +721,8 @@ class FumitmPython:
     def _filter_certs_by_cn_prefix(self, pem_text, cn_prefix):
         """Return the PEM blocks whose subject CN starts with cn_prefix.
 
-        Splits a PEM bundle into individual certificates and keeps only those
-        whose subject common name begins with the given prefix, validating each
-        with openssl. This is what rejects Aikido's ephemeral hex-CN
-        interception intermediate while keeping the long-lived root.
+        openssl validates each certificate. This removes the Aikido interception
+        intermediate, which has a hexadecimal CN, and keeps the root.
         """
         matching = []
         for block in self._pem_blocks(pem_text):
@@ -781,12 +746,12 @@ class FumitmPython:
         return blocks
 
     def _cert_fingerprints(self, path):
-        """Return the SHA-256 fingerprint of every certificate in a PEM file.
+        """Return the SHA-256 fingerprint of each certificate in a PEM file.
 
-        Same value as `openssl x509 -fingerprint -sha256` (a digest over the
-        DER body), lowercased and unseparated — the form Aikido names its
-        adopted-CA files with. Computed in-process rather than by shelling out
-        per certificate, which the subprocess budget would notice.
+        This is the value that `openssl x509 -fingerprint -sha256` gives: a digest
+        of the DER body. The form is lowercase with no separators, which is how
+        Aikido names its adopted-CA files. fumitm computes it in-process to keep the
+        number of subprocess calls low.
         """
         text = self._read_text_or_none(path)
         if text is None:
@@ -802,23 +767,20 @@ class FumitmPython:
         return fingerprints
 
     def _aikido_has_adopted(self, cert_path):
-        """Return True when Aikido's adopted-CA record covers cert_path.
+        """Return True when the adopted-CA record of Aikido covers cert_path.
 
-        Aikido creates the record directory on first adoption, so its absence
-        means nothing has been adopted. Callers reach this only after
-        establishing that the agent ships the `aikido-doctor` CLI, which is what
-        makes that reading safe.
+        Aikido makes the record directory at the first adoption, thus an absent
+        directory shows that Aikido adopted no CA. Callers get here only after they
+        find the `aikido-doctor` CLI, which makes that reading safe.
 
-        One recorded fingerprint suffices rather than all of them, because the
-        record answers a narrower question than the bundles do: whether Aikido
-        was ever told about this certificate file. A provider chain can carry an
-        intermediate alongside its root — Netskope's does — and an intermediate
-        that never earns a record of its own would otherwise deny adoption
-        forever. Completeness of trust is the bundles' question, and they are
-        checked for every certificate.
+        One recorded fingerprint is sufficient. The record answers only this
+        question: did the operator give this certificate file to Aikido? A provider
+        chain can contain an intermediate with its root, as the Netskope chain does.
+        An intermediate with no record of its own must not prevent adoption. The
+        bundles answer the question about complete trust, and fumitm examines them
+        for each certificate.
 
-        Returns None when the certificates cannot be fingerprinted, since that
-        leaves the question genuinely unanswered.
+        Returns None when fumitm cannot make a fingerprint of the certificates.
         """
         adopted_dir = SUPPLEMENTAL_ROOTS['aikido']['adopted_dir']
         if not os.path.isdir(adopted_dir):
@@ -830,19 +792,17 @@ class FumitmPython:
                    for fp in fingerprints)
 
     def _aikido_built_bundles(self):
-        """Return every CA bundle `certconfig adopt` builds and keeps current.
+        """Return each CA bundle that `certconfig adopt` builds and keeps current.
 
-        The directory is listed rather than globbed, and a run_dir that exists
-        but cannot be read answers None rather than an empty list. glob swallows
-        the error, and the empty result it leaves behind is indistinguishable
-        from an agent that builds no bundles — which would send the caller to
-        the adoption record and let a filesystem fault read as a healthy
-        adoption.
+        fumitm lists the directory and does not use glob. A run_dir that is present
+        but unreadable gives None and not an empty list. glob hides the error, and
+        an empty list looks the same as an agent that builds no bundles. The caller
+        would then use the adoption record, and a filesystem fault would look like a
+        correct adoption.
 
-        A run_dir that is simply absent is a different fact and answers the
-        empty list, since an agent exposing no bundle directory at all is
-        exactly the legacy shape the record exists to cover. Treating it as a
-        fault would fail every host without Aikido installed.
+        A run_dir that is absent is a different condition and gives the empty list.
+        An agent with no bundle directory is the old shape that the record covers. A
+        fault report would fail each host that has no Aikido agent.
         """
         descriptor = SUPPLEMENTAL_ROOTS['aikido']
         run_dir = descriptor['run_dir']
@@ -860,11 +820,11 @@ class FumitmPython:
         )
 
     def _aikido_bundles_missing(self, cert_path):
-        """Return the bundles Aikido builds that are missing cert_path's roots.
+        """Return the bundles of Aikido that do not contain the roots of cert_path.
 
-        Every bundle must carry them, not merely one: Aikido's bundles disagree,
-        so a root present in the pip bundle says nothing about the openssl one.
-        Returns None when the bundle directory could not be read at all.
+        Each bundle must contain them. The bundles of Aikido are not the same, thus
+        a root in the pip bundle tells you nothing about the openssl bundle. Returns
+        None when fumitm cannot read the bundle directory.
         """
         bundles = self._aikido_built_bundles()
         if bundles is None:
@@ -873,31 +833,29 @@ class FumitmPython:
                 if not self.certificate_exists_in_file(cert_path, bundle)]
 
     def _aikido_trusts_root(self, cert_path):
-        """Return True when Aikido both carries cert_path's roots and recorded them.
+        """Return True when Aikido contains the roots of cert_path and recorded them.
 
-        The bundles are the ground truth for whether trust exists right now,
-        because they are what the tools Aikido configures actually read, so a
-        single lagging bundle denies trust outright and no adoption record
-        excuses it — a root adopted once still vanishes from any bundle Aikido
-        later rebuilds from a source that lacks it.
+        The bundles show the trust that exists now, because the tools that Aikido
+        configures read them. Thus one bundle that is behind denies trust, and no
+        record can change that. A root that Aikido adopted one time is not in a
+        bundle that Aikido rebuilds from a source without it.
 
-        The record is nonetheless required whenever it can be read, because
-        bundles alone cannot distinguish trust Aikido was told to keep from
-        trust it happened to inherit. Aikido seeds some bundles from the macOS
-        System keychain, which already holds the provider root, so those bundles
-        can carry it while Aikido has never been told about it — and the next
-        rebuild from any other source drops it. Adopting registers it durably.
+        But the record is also necessary when fumitm can read it. The bundles alone
+        cannot show the difference between trust that Aikido keeps and trust that
+        Aikido received. Aikido builds some bundles from the macOS System keychain,
+        which already contains the primary root. Those bundles can contain the root
+        while Aikido knows nothing about it, and the next rebuild from a different
+        source removes it. Adoption records it permanently.
 
-        Re-adopting converges rather than repeating: `certconfig adopt`
-        reinstalls every rule, which on agent 1.7.28 took the openssl and ruby
-        bundles from 128 to 130 certificates and created the record in the same
-        pass. When the certificates cannot be fingerprinted the record is
-        unanswerable and the bundles decide alone.
+        Adoption again converges and does not repeat. `certconfig adopt` installs
+        each rule again. On agent 1.7.28 it moved the openssl bundle and the ruby
+        bundle from 128 to 130 certificates and made the record in the same pass.
+        When fumitm cannot make a fingerprint of the certificates, the record gives
+        no answer and the bundles decide.
 
-        A bundle directory that cannot be read fails closed. Deferring to the
-        record there would let a filesystem fault read as a healthy adoption,
-        which is the one answer that leaves Aikido-backed tools broken while
-        reporting success.
+        A bundle directory that fumitm cannot read gives False. Use of the record
+        here would let a filesystem fault look like a correct adoption. That answer
+        reports success while the tools of Aikido stay broken.
         """
         missing = self._aikido_bundles_missing(cert_path)
         if missing is None:
@@ -935,11 +893,11 @@ class FumitmPython:
 
     @staticmethod
     def _subject_common_name(subject_line):
-        """Extract the CN value from an openssl subject line, or None.
+        """Return the CN value from an openssl subject line, or None.
 
-        Handles the RFC 2253 form ("subject=CN=foo,O=bar"), the spaced OpenSSL 3
-        form ("subject=CN = foo, O = bar"), and the legacy slash form
-        ("subject= /CN=foo/O=bar") that LibreSSL and older builds emit.
+        Accepts the RFC 2253 form ("subject=CN=foo,O=bar"), the OpenSSL 3 form with
+        spaces ("subject=CN = foo, O = bar"), and the slash form
+        ("subject= /CN=foo/O=bar") that LibreSSL and old builds give.
         """
         if not subject_line:
             return None
@@ -967,7 +925,6 @@ class FumitmPython:
         if not tool_info:
             return False
         
-        # Check if tool key or any of its tags match the selection
         for selection in self.selected_tools:
             selection_lower = selection.lower()
             if selection_lower == tool_key:
@@ -1006,7 +963,6 @@ class FumitmPython:
             selection_lower = selection.lower()
             found = False
             
-            # Check all tools for matching key or tag
             for tool_key, tool_info in self.tools_registry.items():
                 if selection_lower == tool_key:
                     found = True
@@ -1028,13 +984,13 @@ class FumitmPython:
         return re.sub(r'\033\[[0-9;]*m', '', text)
 
     def _open_log_files(self):
-        """Open log file handles for text and JSON logging.
+        """Open the file handles for text logging and JSON logging.
 
-        File mode (--log-file / --json-log-file): writes to the exact path,
-        overwriting each run.
+        File mode (--log-file, --json-log-file) writes to the given path and
+        replaces the file at each run.
 
-        Directory mode (--log-dir / --json-log-dir): generates timestamped
-        filenames and maintains a 'fumitm-latest' symlink to the most recent.
+        Directory mode (--log-dir, --json-log-dir) makes a name with a timestamp and
+        keeps a 'fumitm-latest' symlink to the most recent file.
         """
         ts = datetime.now(timezone.utc).astimezone().strftime('%Y%m%d-%H%M%S')
         pid = os.getpid()
@@ -1122,30 +1078,28 @@ class FumitmPython:
 
     def _emit(self, message, level='info', file=None, phase=None,
               tool=None, action=None, result=None, error_code=None):
-        """Central output method. All print_* methods route through here.
+        """Write output. Each print_* method calls this method.
 
-        Handles color stripping for non-TTY/--no-color, text log writing,
-        and JSON-lines event emission.
+        Removes color for a non-TTY or for --no-color, writes the text log, and
+        writes the JSON-lines events.
 
         Args:
-            message: The formatted message (may contain ANSI codes).
-            level: Log level (info, warn, error, debug).
-            file: Output file object (default: stdout, debug uses stderr).
-            phase: JSON log phase (init, detect, cert, tool, verify, summary).
-            tool: Tool key from tools_registry for JSON log.
-            action: What was attempted for JSON log.
-            result: Result status for JSON log (ok, changed, skipped, failed).
-            error_code: Optional error identifier for JSON log.
+            message: The formatted message. It can contain ANSI codes.
+            level: The log level (info, warn, error, debug).
+            file: The output file object. The default is stdout. Debug uses stderr.
+            phase: The JSON log phase (init, detect, cert, tool, verify, summary).
+            tool: The tool key from tools_registry, for the JSON log.
+            action: The operation, for the JSON log.
+            result: The result status for the JSON log (ok, changed, skipped, failed).
+            error_code: An optional error identifier for the JSON log.
         """
         output_file = file or sys.stdout
 
-        # Console output: strip ANSI if color is disabled
         if self._use_color:
             print(message, file=output_file)
         else:
             print(self._strip_ansi(message), file=output_file)
 
-        # Text log: always strip ANSI, add timestamp
         if self._log_file_handle:
             ts = datetime.now(timezone.utc).astimezone().strftime('%Y-%m-%dT%H:%M:%S')
             plain = self._strip_ansi(message)
@@ -1154,7 +1108,6 @@ class FumitmPython:
             )
             self._log_file_handle.flush()
 
-        # JSON-lines log
         if self._json_log_file_handle:
             event = {
                 'ts': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
@@ -1197,10 +1150,10 @@ class FumitmPython:
             )
 
     def _prompt(self, message):
-        """Prompt the user for input, or return 'y' when --yes is active.
+        """Ask the user for input, or return 'y' when --yes is active.
 
-        Raises NonInteractiveError when stdin is not a terminal and --yes
-        was not provided, preventing indefinite hangs under JAMF/Ansible.
+        Raises NonInteractiveError when stdin is not a terminal and the operator did
+        not give --yes. This prevents a stop with no end under JAMF or Ansible.
         """
         if self.auto_yes:
             self._emit(f"{message}y (--yes)", level='info')
@@ -1214,21 +1167,20 @@ class FumitmPython:
         return input(message)
 
     def check_for_updates(self):
-        """Check if a newer version of fumitm is available on GitHub.
+        """Find if a newer version of fumitm is available on GitHub.
 
-        Uses CalVer version comparison instead of file hashes to avoid
-        false positives from local modifications or formatting differences.
-        Skips the update warning when running from a local git working copy
-        (non-main branch or dirty tree), since the user is likely developing.
+        Compares CalVer versions and not file hashes. A hash gives a false result
+        for a local change or a difference in format. fumitm does not give the
+        warning for a local git working copy, because the user is a developer.
 
-        Uses an unverified SSL context since proxy certificate trust might not
-        be configured yet (which is why the user is running this script).
+        The SSL context is unverified, because trust of the proxy certificate can be
+        absent. That is why the user runs this script.
 
         Returns:
-            bool: True if an update is available, False otherwise
+            bool: True if an update is available.
         """
         try:
-            # Use unverified SSL context - WARP might not be configured yet
+            # The context is unverified. Trust of the proxy CA can be absent.
             context = ssl._create_unverified_context()
             url = "https://raw.githubusercontent.com/aberoham/fumitm/main/fumitm.py"
 
@@ -1238,7 +1190,6 @@ class FumitmPython:
             with urllib.request.urlopen(req, context=context, timeout=10) as response:
                 remote_content = response.read().decode('utf-8')
 
-            # Extract remote version using regex
             version_match = re.search(r'^__version__\s*=\s*["\']([0-9.]+)["\']',
                                       remote_content, re.MULTILINE)
 
@@ -1252,7 +1203,6 @@ class FumitmPython:
             self.print_debug(f"Local version:  {local_version}")
             self.print_debug(f"Remote version: {remote_version}")
 
-            # Parse and compare versions
             try:
                 local_tuple = parse_calver(local_version)
                 remote_tuple = parse_calver(remote_version)
@@ -1261,8 +1211,8 @@ class FumitmPython:
                 return False
 
             if remote_tuple > local_tuple:
-                # When running from a git working copy on a non-main branch or
-                # with local modifications, the version mismatch is expected.
+                # A git working copy on another branch, or with local
+                # changes, gives a different version.
                 is_dev = VERSION_INFO['branch'] not in ('main', 'master', 'unknown') or VERSION_INFO['dirty']
                 if is_dev:
                     branch = VERSION_INFO['branch']
@@ -1279,8 +1229,8 @@ class FumitmPython:
                 self.print_info(f"  Local:  {local_version}")
                 self.print_info(f"  Remote: {remote_version}")
                 self.print_warn("Update before running --fix to ensure best results:")
-                # Use -k to skip cert verification since user's curl may be broken
-                # (which is likely why they're running this script)
+                # -k stops certificate verification. The curl of the user can
+                # be broken, which is why the user runs this script.
                 self.print_info("  curl -kLsSf https://raw.githubusercontent.com/aberoham/fumitm/main/fumitm.py -o fumitm.py")
                 self.print_warn("=" * 60)
                 print()
@@ -1317,7 +1267,7 @@ class FumitmPython:
         elif os.path.isdir(os.path.dirname(path)):
             return os.access(os.path.dirname(path), os.W_OK)
         else:
-            # Path doesn't exist, check parent directories
+            # The path is absent. Examine the parent directories.
             parent = os.path.dirname(path)
             while not os.path.isdir(parent) and parent != '/':
                 parent = os.path.dirname(parent)
@@ -1329,13 +1279,13 @@ class FumitmPython:
         return os.path.join(self.bundle_dir, purpose, filename)
 
     def _apply_target_user(self, username):
-        """Resolve a username and set HOME so all expanduser calls target it.
+        """Resolve a user name and set HOME, thus each expanduser call uses it.
 
-        Sets _target_uid and _target_gid for ownership correction. When
-        username is 'auto', attempts to detect the console user on macOS.
+        Sets _target_uid and _target_gid for the correction of ownership. When the
+        name is 'auto', fumitm tries to find the console user on macOS.
 
         Args:
-            username: System username or 'auto' for console-user detection.
+            username: A system user name, or 'auto' to find the console user.
         """
         if username == 'auto':
             detected = self._detect_console_user()
@@ -1350,8 +1300,8 @@ class FumitmPython:
         try:
             pw = pwd.getpwnam(username)
         except KeyError:
-            # Entra ID (Azure AD) joined Macs: JAMF may pass the UPN
-            # (e.g. "user@domain.com") instead of the macOS short name.
+            # On a Mac joined to Entra ID, JAMF can give the UPN (for example
+            # "user@domain.com") and not the macOS short name.
             if '@' in username:
                 short_name = username.split('@')[0]
                 try:
@@ -1374,8 +1324,8 @@ class FumitmPython:
         self._target_gid = pw.pw_gid
         os.environ['HOME'] = pw.pw_dir
 
-        # Augment PATH so command_exists() finds user-installed tools.
-        # Root's PATH typically lacks Homebrew and user-local bin directories.
+        # Add directories to PATH, thus command_exists() finds the tools of
+        # the user. The PATH of root usually has no Homebrew directory.
         brew_prefix = (
             '/opt/homebrew/bin'
             if platform.machine() == 'arm64'
@@ -1399,10 +1349,10 @@ class FumitmPython:
 
     @staticmethod
     def _detect_console_user():
-        """Detect the GUI-session user on macOS via /dev/console ownership.
+        """Find the GUI-session user on macOS from the ownership of /dev/console.
 
-        Returns the username or None if detection fails (Linux, no user
-        logged in, or /dev/console inaccessible).
+        Returns the user name, or None. The result is None on Linux, when no user is
+        logged in, and when /dev/console is not accessible.
         """
         if platform.system() != 'Darwin':
             return None
@@ -1416,19 +1366,19 @@ class FumitmPython:
             return None
 
     def _is_running_as_sudo(self):
-        """True when root is acting on behalf of a non-root user.
+        """Return True when root operates for a user who is not root.
 
-        Covers both traditional sudo (SUDO_UID set) and --run-as-user
-        (JAMF/Ansible context where _target_uid is set explicitly).
+        This includes sudo, which sets SUDO_UID, and --run-as-user, which sets
+        _target_uid.
         """
         if self._target_uid is not None and self._target_uid != 0:
             return True
         return os.getuid() == 0 and 'SUDO_UID' in os.environ
 
     def _get_real_user_ids(self):
-        """Return (uid, gid) of the real user, even when running under sudo.
+        """Return the (uid, gid) of the real user, also under sudo.
 
-        Priority: explicit _target_uid > SUDO_UID > current process UID.
+        The sequence is _target_uid, then SUDO_UID, then the UID of the process.
         """
         if self._target_uid is not None:
             return (self._target_uid, self._target_gid)
@@ -1438,10 +1388,10 @@ class FumitmPython:
         return (os.getuid(), os.getgid())
 
     def _fix_ownership(self, path):
-        """Chown a home-directory path back to the real user when running under sudo.
+        """Give a path in the home directory back to the real user under sudo.
 
-        System paths outside $HOME (e.g. /etc/ssl) are left untouched so that
-        files which legitimately belong to root stay root-owned.
+        fumitm does not change a system path such as /etc/ssl. A file that belongs
+        to root stays with root.
         """
         if not self._is_running_as_sudo():
             return
@@ -1471,10 +1421,10 @@ class FumitmPython:
             self._fix_ownership(d)
 
     def _has_user_context(self):
-        """True when a target user is resolved for user-scoped operations.
+        """Return True when fumitm has a target user for user-scoped operations.
 
-        Returns False only when running as real root without --run-as-user
-        and without SUDO_USER, meaning there's no user home to write to.
+        The result is False only when fumitm runs as root with no --run-as-user and
+        no SUDO_USER. There is then no home directory to write to.
         """
         if os.getuid() != 0:
             return True
@@ -1485,7 +1435,7 @@ class FumitmPython:
         # Try environment variable first (current session)
         shell_path = os.environ.get('SHELL')
 
-        # Fallback to pwd module — use target user when running as root
+        # Use the pwd module. Under root, use the target user.
         if not shell_path:
             try:
                 lookup_uid = self._target_uid if self._target_uid is not None else os.getuid()
@@ -1497,10 +1447,8 @@ class FumitmPython:
         if not shell_path:
             shell_path = '/bin/zsh'
         
-        # Extract just the shell name
         shell_name = os.path.basename(shell_path)
         
-        # Normalize common shells
         known_shells = {'bash', 'zsh', 'fish', 'sh', 'tcsh', 'csh', 'dash'}
         
         if shell_name in known_shells:
@@ -1510,16 +1458,15 @@ class FumitmPython:
             return shell_name
 
     def _query_zsh_dotdir(self, home):
-        """Ask zsh for a shell-local ZDOTDIR assignment from .zshenv.
+        """Ask zsh for a shell-local ZDOTDIR value from .zshenv.
 
-        ZDOTDIR need not be exported, so a Python child cannot always discover
-        it through os.environ. A non-interactive zsh reads only .zshenv before
-        executing the command below, which exposes the effective directory
-        without loading .zprofile, .zshrc or .zlogin.
+        zsh does not export ZDOTDIR, thus a Python child cannot always find it in
+        os.environ. A non-interactive zsh reads only .zshenv before the command
+        below. This gives the directory without .zprofile, .zshrc, or .zlogin.
 
-        When fumitm is root on behalf of a target user, the child drops to that
-        user's uid, gid and supplementary groups before reading user-controlled
-        startup code. The query is bounded and falls back safely to HOME.
+        When fumitm is root and operates for a target user, the child changes to the
+        uid, the gid, and the groups of that user before it reads user-controlled
+        startup code. The query has a time limit and returns HOME on a failure.
         """
         shell_path = os.environ.get('SHELL')
         if not shell_path or os.path.basename(shell_path) != 'zsh':
@@ -1594,11 +1541,12 @@ class FumitmPython:
         return None
 
     def _zsh_dotdir(self):
-        """Directory zsh reads its per-user startup files from.
+        """Return the directory that zsh reads its startup files from.
 
-        zsh uses $ZDOTDIR when set, falling back to $HOME. Exported values are
-        visible directly; when .zshenv sets a shell-local value, query zsh once
-        so stubs do not land in HOME files that later startup phases never read.
+        zsh uses $ZDOTDIR if it is set, and HOME if it is not. An exported value is
+        visible. When .zshenv sets a shell-local value, fumitm asks zsh one time.
+        Thus a stub does not go into a HOME file that a later startup phase never
+        reads.
         """
         home = os.path.expanduser("~")
         if 'ZDOTDIR' in os.environ:
@@ -1612,11 +1560,11 @@ class FumitmPython:
         return self._queried_zsh_dotdir
 
     def get_shell_config(self, shell_type):
-        """Get the primary shell config file.
+        """Return the primary shell config file.
 
-        Kept for callers that need a single representative path (messages,
-        prompts). Writes go through get_shell_configs(), which covers every
-        startup file the shell actually reads.
+        Callers that need one path use this method, for a message or a prompt. A
+        write uses get_shell_configs(), which gives each startup file that the shell
+        reads.
         """
         home = os.path.expanduser("~")
         if shell_type == 'bash':
@@ -1633,23 +1581,25 @@ class FumitmPython:
             return os.path.join(home, '.profile')
 
     def get_shell_configs(self, shell_type):
-        """Every startup file that must carry fumitm's block, in read order.
+        """Return each startup file that must contain the block, in read sequence.
 
-        A shell reads a different set of startup files per invocation mode, so
-        writing to only one of them leaves the others exposed to whatever a
-        vendor block (e.g. Aikido) set. The classic failure is a non-interactive
-        login shell (`zsh -lc`, used by many tool launchers): it reads .zprofile
-        but never .zshrc, so exports placed only in .zshrc are silently absent.
+        A shell reads a different set of startup files for each invocation mode. A
+        write to only one file leaves the other files with the settings of a vendor
+        block. The usual failure is a non-interactive login shell (`zsh -lc`, which
+        many tool launchers use). It reads .zprofile and never .zshrc, thus an
+        export only in .zshrc is absent.
 
-        zsh reads .zshenv → .zprofile (login) → .zshrc (interactive) → .zlogin
-        (login). Stubbing .zshenv, .zshrc and .zlogin covers all four modes, and
-        .zlogin lands after .zprofile so a vendor block there loses. .zprofile
-        itself is deliberately never edited — it is vendor territory.
+        zsh reads .zshenv, then .zprofile for a login shell, then .zshrc for an
+        interactive shell, then .zlogin for a login shell. A stub in .zshenv,
+        .zshrc, and .zlogin covers all four modes. .zlogin comes after .zprofile,
+        thus a vendor block in .zprofile does not win. fumitm never changes
+        .zprofile, because that file belongs to the vendors.
 
-        bash reads the first existing of .bash_profile/.bash_login/.profile for
-        login shells and .bashrc for interactive non-login ones. Non-interactive
-        non-login bash reads only $BASH_ENV, which fumitm does not set: forcing a
-        global BASH_ENV would run this file for every script on the system.
+        For a login shell, bash reads the first of .bash_profile, .bash_login, and
+        .profile that is present. For an interactive non-login shell it reads
+        .bashrc. A non-interactive non-login bash reads only $BASH_ENV. fumitm does
+        not set $BASH_ENV, because that file would run for each script on the
+        system.
         """
         home = os.path.expanduser("~")
 
@@ -1670,8 +1620,8 @@ class FumitmPython:
             else:
                 # None exist yet; .bash_profile is bash's first choice on macOS.
                 targets.append(in_home('.bash_profile'))
-            # A /bin/sh login shell reads .profile regardless of which file bash
-            # picked above, so cover it too when the user has one.
+            # A /bin/sh login shell reads .profile. Include it when the user
+            # has one.
             if os.path.exists(in_home('.profile')) and in_home('.profile') not in targets:
                 targets.append(in_home('.profile'))
             return targets
@@ -1683,25 +1633,22 @@ class FumitmPython:
         return os.path.join(os.path.expanduser("~"), self._FUMITM_ENV_FILE_REL)
 
     def _uses_env_file(self, shell_type):
-        """True when the shell can source a POSIX-sh env file.
+        """Return True when the shell can source a POSIX sh env file.
 
-        fish (`set -gx`) and csh derivatives (`setenv`) cannot source POSIX-sh
-        syntax, so they keep the historical inline block in their own config
-        file.
+        fish (`set -gx`) and the csh shells (`setenv`) cannot read POSIX sh syntax,
+        thus they keep the inline block in their own config file.
         """
         return shell_type in ('zsh', 'bash', 'sh', 'dash', 'ksh')
 
     def check_environment_sanity(self):
-        """Check for broken CA-related environment variables pointing to non-existent files.
+        """Find CA environment variables that point to a file that is not present.
 
-        This catches common issues where users have stale environment variables
-        from previous WARP setups or removed shell config exports without unsetting
-        the variables in their current session.
+        A user can have an old variable from a previous WARP installation, or can
+        remove a shell config export and keep the variable in the session.
 
         Returns:
-            bool: True if any broken variables were found, False otherwise
+            bool: True if fumitm found a broken variable.
         """
-        # Environment variables to check (simple file path variables)
         ca_env_vars = [
             'CURL_CA_BUNDLE',
             'SSL_CERT_FILE',
@@ -1713,7 +1660,6 @@ class FumitmPython:
 
         broken_vars = []
 
-        # Check simple path variables
         for var_name in ca_env_vars:
             var_value = os.environ.get(var_name, '')
             if var_value and not os.path.exists(var_value):
@@ -1731,7 +1677,6 @@ class FumitmPython:
         if not broken_vars:
             return False
 
-        # Display prominent warning
         print()
         self.print_warn("=" * 60)
         self.print_warn("BROKEN ENVIRONMENT DETECTED")
@@ -1745,7 +1690,6 @@ class FumitmPython:
             self.print_error("    FILE DOES NOT EXIST")
             print()
 
-        # Provide remediation steps
         self.print_info("To fix in your CURRENT shell session:")
         for var_name, _ in broken_vars:
             if var_name.startswith('JAVA_OPTS'):
@@ -1759,8 +1703,8 @@ class FumitmPython:
         home = os.path.expanduser("~")
         candidates = list(self.get_shell_configs(shell_type))
         if shell_type == 'zsh':
-            # .zprofile is read by login shells and is where vendor installers
-            # commonly write, but fumitm never edits it, so name it explicitly.
+            # Login shells read .zprofile, and vendor installers write there.
+            # fumitm does not change it.
             candidates.insert(1, os.path.join(self._zsh_dotdir(), '.zprofile'))
         for path in candidates:
             if os.path.exists(path):
@@ -1780,21 +1724,21 @@ class FumitmPython:
         return True
 
     def check_ownership_sanity(self):
-        """Detect and warn about root-owned files in the user's home directory.
+        """Find and report files that belong to root in the home directory.
 
-        When users accidentally run ``sudo ./fumitm.py --fix``, the script creates
-        files owned by root inside ``$HOME``. Subsequent non-root runs then fail
-        with PermissionError. This method detects that situation and either warns
-        (when not root) or proactively corrects ownership (when running as sudo).
+        ``sudo ./fumitm.py --fix`` makes files in HOME that belong to root. A later
+        run that is not root then fails with PermissionError. This method finds that
+        condition. It gives a warning when it is not root, and corrects the
+        ownership when it runs under sudo.
 
         Returns:
-            bool: True if problems were found (or corrected), False if clean.
+            bool: True if fumitm found a problem or corrected one.
         """
         managed_paths = [self.cert_path, self.bundle_dir]
         home = os.path.expanduser('~')
 
         if self._is_running_as_sudo():
-            # Running as sudo — fix any pre-existing root-owned managed files
+            # Under sudo, correct each managed file that belongs to root.
             uid, gid = self._get_real_user_ids()
             fixed = []
             for path in managed_paths:
@@ -1828,13 +1772,13 @@ class FumitmPython:
                     except OSError:
                         pass
             if fixed:
-                self.print_warn(f"Running as sudo — corrected ownership on {len(fixed)} file(s) in {home}")
+                self.print_warn(f"Running as sudo. Corrected the ownership of {len(fixed)} file(s) in {home}")
                 self.print_info("New files created during this run will also be owned by the real user")
             else:
-                self.print_info("Running as sudo — ownership correction will be applied to new files")
+                self.print_info("Running as sudo. fumitm corrects the ownership of each new file.")
             return bool(fixed)
 
-        # Not root — check for root-owned files and warn
+        # Not root. Look for files that belong to root and give a warning.
         root_owned = []
         for path in managed_paths:
             if not os.path.exists(path):
@@ -1938,10 +1882,10 @@ class FumitmPython:
         return os.path.basename(java_home)
 
     def find_all_java_homes(self):
-        """Find all Java installations on the system.
+        """Find each Java installation on the system.
 
         Returns:
-            list: List of unique Java home paths with valid cacerts
+            list: The Java home paths that have a valid cacerts file.
         """
         java_homes = set()
 
@@ -1963,7 +1907,6 @@ class FumitmPython:
                     )
                     for line in result.stdout.splitlines():
                         if line and '/' in line and '/Contents/Home' in line:
-                            # Extract path from end of line
                             parts = line.split()
                             for part in reversed(parts):
                                 if '/Contents/Home' in part:
@@ -2013,10 +1956,9 @@ class FumitmPython:
                 except (OSError, PermissionError):
                     pass
 
-        # Strategy 3: SDKMAN-managed installations (~/.sdkman/candidates/java/)
-        # Works on both macOS and Linux; 'current' is a symlink to the active
-        # version and is skipped to avoid duplicating whichever version is active.
-        # Respects $SDKMAN_DIR for non-default installation locations.
+        # Strategy 3: installations that SDKMAN controls. 'current' is a
+        # symlink to the active version, thus fumitm skips it. SDKMAN_DIR
+        # gives a different location.
         sdkman_root = os.environ.get('SDKMAN_DIR') or os.path.expanduser('~/.sdkman')
         sdkman_java_dir = os.path.join(sdkman_root, 'candidates', 'java')
         if os.path.isdir(sdkman_java_dir):
@@ -2027,10 +1969,9 @@ class FumitmPython:
                     version_dir = os.path.join(sdkman_java_dir, entry)
                     if not os.path.isdir(version_dir):
                         continue
-                    # Some vendors (e.g. Azul Zulu on macOS) ship a .jdk app
-                    # bundle inside the version directory rather than a flat JDK.
-                    # Descend into <vendor>.jdk/Contents/Home when present,
-                    # mirroring how the /Library/Java/JavaVirtualMachines scan works.
+                    # Some vendors put a .jdk application bundle in the
+                    # version directory. Go into <vendor>.jdk/Contents/Home
+                    # when it is present.
                     bundle_home = None
                     try:
                         for sub in os.listdir(version_dir):
@@ -2142,21 +2083,20 @@ class FumitmPython:
         return True
     
     def certificate_likely_exists_in_file(self, cert_file, target_file):
-        """Fast certificate check using pure Python string matching.
+        """Look for certificates with pure-Python string matching.
 
-        Verifies that *every* certificate in cert_file is present in
-        target_file, identifying each by the first 100 characters of its base64
-        body. This matters when cert_file holds more than one certificate — for
-        example several Aikido roots returned during a root rotation — since a
-        bundle missing a later root must not be reported as complete. Uses no
-        subprocess calls for performance.
+        Confirms that each certificate in cert_file is in target_file. The
+        identifier is the first 100 characters of the base64 body. cert_file can
+        contain more than one certificate, for example several Aikido roots during a
+        rotation of the root. A bundle without a later root must not look complete.
+        This function makes no subprocess call.
 
         Args:
-            cert_file: Path to the certificate(s) to search for
-            target_file: Path to the bundle file to search in
+            cert_file: The path of the certificates to look for.
+            target_file: The path of the bundle file to look in.
 
         Returns:
-            bool: True if every certificate in cert_file exists in target_file
+            bool: True if each certificate in cert_file is in target_file.
         """
         if not os.path.exists(target_file) or not os.path.exists(cert_file):
             return False
@@ -2182,11 +2122,11 @@ class FumitmPython:
         return False
 
     def _cert_unique_portions(self, cert_file):
-        """Return a unique base64 fingerprint per certificate in cert_file.
+        """Return one base64 identifier for each certificate in cert_file.
 
-        Each certificate is identified by the first 100 characters of its base64
-        body — enough to be unique while needing no subprocess calls. The list
-        preserves file order and is empty when the file holds no certificate.
+        The identifier is the first 100 characters of the base64 body. This is
+        sufficient and needs no subprocess call. The list keeps the sequence of the
+        file and is empty when the file has no certificate.
         """
         unique_portions = []
         current = []
@@ -2206,14 +2146,13 @@ class FumitmPython:
         return unique_portions
 
     def _any_cert_present_in_file(self, cert_file, target_file):
-        """Return True if at least one certificate from cert_file is in target_file.
+        """Return True if one or more certificates from cert_file are in target_file.
 
-        This is the permissive counterpart to certificate_likely_exists_in_file.
-        It tells whether brew sourced any part of a multi-certificate provider
-        bundle (e.g. Netskope's combined root plus intermediate) from the
-        keychain: a bundle holding the root but not the intermediate still counts
-        as sourced, so the intermediate can be topped up by direct append rather
-        than reported as a keychain failure.
+        This is the permissive form of certificate_likely_exists_in_file. It shows
+        if brew took any part of a multi-certificate provider bundle from the
+        keychain, for example the Netskope root with its intermediate. A bundle with
+        the root but not the intermediate still counts. fumitm can then append the
+        intermediate and does not report a keychain failure.
         """
         if not os.path.exists(target_file) or not os.path.exists(cert_file):
             return False
@@ -2229,24 +2168,22 @@ class FumitmPython:
             return False
 
     def certificate_exists_in_file(self, cert_file, target_file):
-        """Check if a certificate already exists in a file.
+        """Find if a certificate is already in a file.
 
-        Uses fast pure-Python string matching for performance. The previous
-        fingerprint-based comparison was O(N) in subprocess calls where N is
-        the number of certificates in the target file. The string matching
-        approach is O(1) and sufficient for duplicate detection.
+        Uses pure-Python string matching. The previous comparison used fingerprints
+        and made one subprocess call for each certificate in the target file. String
+        matching makes no subprocess call and is sufficient to find a duplicate.
 
         Args:
-            cert_file: Path to the certificate to search for
-            target_file: Path to the bundle file to search in
+            cert_file: The path of the certificate to look for.
+            target_file: The path of the bundle file to look in.
 
         Returns:
-            bool: True if certificate exists in target file
+            bool: True if the certificate is in the target file.
         """
-        # Use the fast pure-Python check for all modes
-        # This is sufficient because:
-        # 1. False negatives (cert exists but not found) -> duplicate appended, harmless
-        # 2. False positives (cert not there but found) -> extremely unlikely with 100-char match
+        # The pure-Python check is sufficient. A false negative appends a
+        # duplicate, which does no damage. A false positive is very unlikely
+        # with a match of 100 characters.
         return self.certificate_likely_exists_in_file(cert_file, target_file)
 
     def count_certificates_in_file(self, path):
@@ -2276,9 +2213,10 @@ class FumitmPython:
             return False
 
     def is_suspicious_full_bundle(self, bundle_path, warp_cert_path=None):
-        """Detect bundles that likely contain only WARP CA or are too small to be full.
+        """Find a bundle that contains only the WARP CA or is too small.
 
-        Returns (is_suspicious: bool, reason: str)
+        Returns:
+            tuple: (is_suspicious: bool, reason: str)
         """
         try:
             if not os.path.exists(bundle_path):
@@ -2287,7 +2225,7 @@ class FumitmPython:
             try:
                 size = os.path.getsize(bundle_path)
             except Exception:
-                # Fallback: approximate by length of content
+                # Use the length of the content as an approximation.
                 try:
                     with open(bundle_path, 'r') as f:
                         size = len(f.read().encode('utf-8'))
@@ -2295,11 +2233,10 @@ class FumitmPython:
                     size = 0
 
             cert_count = self.count_certificates_in_file(bundle_path)
-            # Debug one-liner summary
             if self.is_debug_mode():
                 self.print_debug(f"Bundle stats for {bundle_path}: {cert_count} cert(s), size={size}B")
 
-            # Obvious misconfig: just a single certificate
+            # One certificate only. This is an incorrect configuration.
             if cert_count <= 1:
                 return (True, f"contains {cert_count} certificate(s), size={size}B")
 
@@ -2307,7 +2244,7 @@ class FumitmPython:
             if cert_count <= SMALL_BUNDLE_MAX_CERTS and size <= SMALL_BUNDLE_MAX_SIZE_BYTES:
                 return (True, f"contains {cert_count} certificates and is only {size}B")
 
-            # If we have a reference WARP cert, exact-equality to it is suspicious
+            # A file that is equal to the WARP certificate is suspicious.
             if warp_cert_path and self.files_are_identical(bundle_path, warp_cert_path):
                 return (True, "bundle is identical to the proxy certificate file")
 
@@ -2317,16 +2254,16 @@ class FumitmPython:
             return (False, "")
 
     def create_bundle_with_system_certs(self, bundle_path):
-        """Create a CA bundle initialized with system certificates.
+        """Make a CA bundle that starts with the system certificates.
 
-        Copies system CA certificates to the specified bundle path. This is used
-        when creating new certificate bundles for tools that need a full CA chain.
+        Tools that need a full CA chain use this bundle.
 
         Args:
-            bundle_path: Path where the bundle should be created
+            bundle_path: The path to make the bundle at.
 
         Returns:
-            bool: True if system certs were copied, False if empty bundle created
+            bool: True if fumitm copied the system certificates. False if it made an
+            empty bundle.
         """
         if os.path.exists("/etc/ssl/cert.pem"):
             shutil.copy("/etc/ssl/cert.pem", bundle_path)
@@ -2342,51 +2279,45 @@ class FumitmPython:
             return False
 
     def safe_append_certificate(self, cert_file, target_file):
-        """Safely append a certificate to a target file, ensuring proper PEM formatting.
+        """Append a certificate to a file and keep the PEM format correct.
 
-        This method handles the case where the target file doesn't end with a newline,
-        which would otherwise produce malformed PEM like:
+        A target file that does not end with a newline would give a malformed PEM
+        such as:
         -----END CERTIFICATE----------BEGIN CERTIFICATE-----
 
         Args:
-            cert_file: Path to the certificate file to append
-            target_file: Path to the target bundle file
+            cert_file: The path of the certificate file to append.
+            target_file: The path of the target bundle file.
 
         Returns:
-            bool: True if successful, False otherwise
+            bool: True on success.
         """
         if not os.path.exists(cert_file):
             self.print_error(f"Certificate file not found: {cert_file}")
             return False
 
-        # Check if certificate already exists in target
         if self.certificate_exists_in_file(cert_file, target_file):
             self.print_debug(f"Certificate already exists in {target_file}, skipping append")
             return True
 
         try:
-            # Read certificate content
             with open(cert_file, 'r') as cf:
                 cert_content = cf.read()
 
-            # Ensure certificate content ends with newline
             if not cert_content.endswith('\n'):
                 cert_content = cert_content + '\n'
 
-            # Check if target file exists and whether it ends with a newline
             needs_leading_newline = False
             if os.path.exists(target_file):
                 with open(target_file, 'rb') as tf:
-                    # Seek to end and read last byte
                     tf.seek(0, 2)  # Seek to end
                     if tf.tell() > 0:  # File is not empty
                         tf.seek(-1, 2)  # Seek to last byte
                         last_byte = tf.read(1)
-                        # Check for newline (LF) or carriage return (CR for CRLF)
+                        # Look for LF, or CR for a CRLF file.
                         if last_byte not in (b'\n', b'\r'):
                             needs_leading_newline = True
 
-            # Append certificate with proper formatting
             with open(target_file, 'a') as f:
                 if needs_leading_newline:
                     f.write('\n')
@@ -2401,18 +2332,18 @@ class FumitmPython:
             return False
 
     def _parse_fumitm_block(self, content):
-        """Split shell-config content into foreign lines and the managed block.
+        """Divide shell config content into other lines and the managed block.
 
-        Returns a tuple of (other_lines, managed) where other_lines preserves
-        every line outside fumitm's managed block verbatim (user lines and any
-        vendor block such as Aikido's), and managed is an insertion-ordered dict
-        of the var->value pairs parsed from inside the block.
+        Returns a tuple of (other_lines, managed). other_lines keeps each line
+        outside the managed block without a change. This includes the lines of the
+        user and a vendor block such as the Aikido block. managed is a dict of the
+        variable and value pairs from inside the block, in sequence.
 
-        The last begin marker is paired with the first end marker that follows
-        it, so a stale unmatched begin marker left earlier in the file is treated
-        as foreign content rather than being closed by a fresh block's end marker.
-        A begin marker with no following end is malformed: all content is kept
-        verbatim and the block is reported empty so a fresh one is appended.
+        fumitm pairs the last begin marker with the first end marker after it. Thus
+        an old begin marker with no pair is other content, and the end marker of a
+        new block does not close it. A begin marker with no end marker is malformed.
+        fumitm then keeps all content without a change and reports an empty block,
+        thus it appends a new block.
         """
         lines = content.splitlines()
         begin_idx = None
@@ -2468,11 +2399,11 @@ class FumitmPython:
         ])
 
     def _read_text_or_none(self, path):
-        """Read a file, returning None when it is absent or unreadable.
+        """Read a file. Return None if it is absent or unreadable.
 
-        os.path.exists() succeeding does not guarantee the open will: the path
-        may be a dangling symlink, be unreadable, or vanish in between. Callers
-        treat None as "no existing content" rather than crashing the run.
+        A successful os.path.exists() does not show that the open will succeed. The
+        path can be a dangling symlink, be unreadable, or be removed in the
+        interval. A caller reads None as "no content" and does not stop the run.
         """
         try:
             with open(path, 'r') as f:
@@ -2484,11 +2415,11 @@ class FumitmPython:
             return None
 
     def _write_managed_file(self, path, new, label):
-        """Write `new` to `path`, backing up the pre-run original once per run.
+        """Write `new` to `path` and back up the original file one time each run.
 
-        Returns True when the file changed (or would change in dry-run mode).
-        Shared by the env file and the per-startup-file stubs so both get the
-        same backup, ownership and dry-run handling.
+        Returns True when the file changed, or would change in dry-run mode. The env
+        file and each stub use this method, thus they get the same backup, ownership,
+        and dry-run operation.
         """
         original = self._read_text_or_none(path)
 
@@ -2550,11 +2481,10 @@ class FumitmPython:
         )
 
     def _ensure_stub(self, shell_config):
-        """Ensure `shell_config` ends with the managed source stub.
+        """Make sure that `shell_config` ends with the managed source stub.
 
-        Any pre-existing managed block is removed first, so an inline export
-        block written by an older fumitm is replaced in place by the stub rather
-        than left behind to fight with it.
+        fumitm removes a managed block that is already present. Thus the stub
+        replaces an inline export block from an older fumitm.
         """
         other_lines, _ = self._parse_fumitm_block(
             self._read_text_or_none(shell_config) or ""
@@ -2574,25 +2504,25 @@ class FumitmPython:
         return managed
 
     def add_to_shell_config(self, var_name, var_value, shell_config=None):
-        """Upsert an export so it applies in every mode the user's shell runs in.
+        """Write an export, thus it applies in each mode that the shell runs in.
 
-        For POSIX-sh-compatible shells the value is written to a single sourced
-        env file, and a marker-delimited stub sourcing it is re-emitted at the
-        end of each startup file the shell reads (see get_shell_configs). Because
-        the stub is always last, it wins by last-export-wins over any earlier
-        vendor block (e.g. Aikido) without fumitm ever editing that block.
+        For a shell that reads POSIX sh syntax, fumitm writes the value to one env
+        file. It then writes a stub with markers at the end of each startup file
+        that the shell reads. See get_shell_configs. The stub is always last, thus
+        it replaces the settings of an earlier vendor block. fumitm never changes
+        that block.
 
-        fish and csh derivatives keep the historical inline block in their own
-        config file, since they cannot source POSIX-sh syntax.
+        fish and the csh shells keep the inline block in their own config file,
+        because they cannot read POSIX sh syntax.
 
         Args:
-            shell_config: optional extra startup file to stub, in addition to the
-                detected shell's standard set. Retained so existing callers can
-                keep passing the path they resolved.
+            shell_config: An optional startup file to add a stub to, with the
+                standard set of the shell. Callers that resolved a path can
+                continue to give it.
 
         Returns:
-            bool: True when anything changed (or would change in dry-run mode),
-            False on a no-op. The gcloud setup uses this to report pre-bootstrap.
+            bool: True when something changed, or would change in dry-run mode. The
+            gcloud setup uses this result to report a pre-bootstrap write.
         """
         shell_type = self.detect_shell()
 
@@ -2606,14 +2536,13 @@ class FumitmPython:
         if shell_config and shell_config not in targets:
             targets.append(shell_config)
 
-        # Hoist values from any legacy inline block first so upgrading from an
-        # older fumitm preserves what it had already configured; the env file
-        # wins where both carry the same variable, being the newer source.
+        # Take the values from a legacy inline block first, thus an upgrade
+        # keeps what an older fumitm configured. The env file wins when both
+        # have the same variable.
         #
-        # The merged set is always written back, never short-circuited on
-        # "value already correct": replacing a legacy block with a stub removes
-        # that block's exports from the startup file, so anything hoisted out of
-        # it must reach the env file or the setting is silently lost.
+        # Always write the merged set. Do not stop when the value is already
+        # correct. The stub replaces the legacy block and removes its exports,
+        # thus each value from that block must reach the env file.
         existing = self._read_env_file()
         managed = {}
         for path in targets:
@@ -2636,11 +2565,11 @@ class FumitmPython:
         return changed
 
     def _write_inline_block(self, var_name, var_value, shell_config):
-        """Upsert an export into fumitm's managed, always-last inline block.
+        """Write an export into the managed inline block, which is always last.
 
-        The pre-env-file behaviour, retained for shells that cannot source a
-        POSIX-sh file. A user's own earlier export of the same variable is
-        preserved but overridden.
+        This is the operation from before the env file. Shells that cannot source a
+        POSIX sh file use it. fumitm keeps an earlier export of the user but
+        replaces its value.
         """
         original = None
         if os.path.exists(shell_config):
@@ -2684,15 +2613,12 @@ class FumitmPython:
 
     def is_devcontainer(self):
         """Check if running inside a VS Code devcontainer."""
-        # Check for devcontainer environment variables
         if os.environ.get('REMOTE_CONTAINERS') or os.environ.get('CODESPACES'):
             return True
         
-        # Check for .dockerenv file (Docker container indicator)
         if os.path.exists('/.dockerenv'):
             return True
         
-        # Check for container environment in cgroup
         try:
             with open('/proc/1/cgroup', 'r') as f:
                 cgroup = f.read()
@@ -2701,7 +2627,6 @@ class FumitmPython:
         except Exception:
             pass
         
-        # Check for WSL
         try:
             with open('/proc/version', 'r') as f:
                 version = f.read().lower()
@@ -2751,7 +2676,6 @@ class FumitmPython:
                 self.print_error("No file path provided")
                 return None
             
-            # Expand user path
             file_path = os.path.expanduser(file_path)
             
             if not os.path.exists(file_path):
@@ -2766,7 +2690,7 @@ class FumitmPython:
                 self.print_error(f"Error reading file: {e}")
                 return None
         else:
-            # Default to paste mode - make it easier
+            # Paste mode is the default, because it is easier.
             print()
             self.print_info("Paste the certificate now (Ctrl+V or right-click paste)")
             self.print_info("Then press Enter twice when done:")
@@ -2784,7 +2708,6 @@ class FumitmPython:
             
             cert_content = '\n'.join(lines[:-1] if lines and lines[-1] == "" else lines)
         
-        # Validate the certificate format
         if not cert_content.strip():
             self.print_error("No certificate provided")
             return None
@@ -2797,17 +2720,16 @@ class FumitmPython:
             self.print_error("Invalid certificate format: missing END CERTIFICATE marker")
             return None
         
-        # Ensure proper formatting
         cert_lines = cert_content.strip().split('\n')
         formatted_cert = '\n'.join(cert_lines) + '\n'
         
         return formatted_cert
     
     def _get_warp_cert(self):
-        """Retrieve the CA certificate from warp-cli.
+        """Get the CA certificate from warp-cli.
 
         Returns:
-            str or None: PEM certificate text, or None on failure.
+            str or None: The PEM certificate text, or None on a failure.
         """
         try:
             result = subprocess.run(
@@ -2824,20 +2746,20 @@ class FumitmPython:
             return None
 
     def _get_netskope_cert(self):
-        """Retrieve the Netskope CA certificate.
+        """Get the Netskope CA certificate.
 
-        Tries these sources in order:
-        1. Known file paths (nscacert_combined.pem, then nscacert.pem)
-        2. macOS Keychain extraction (root + intermediate)
-        3. Detects encrypted .enc certs and advises --cert-file
+        fumitm tries these sources in this sequence:
+        1. The known file paths: nscacert_combined.pem, then nscacert.pem.
+        2. The macOS Keychain, for the root and the intermediate.
+        3. An encrypted .enc certificate. fumitm then tells the user to use
+           --cert-file.
 
         Returns:
-            str or None: PEM certificate text, or None on failure.
+            str or None: The PEM certificate text, or None on a failure.
         """
         plat = platform.system()
         cert_sources = self.provider.get('cert_sources', {}).get(plat, [])
 
-        # Try reading from known file paths
         for path in cert_sources:
             if os.path.exists(path):
                 try:
@@ -2849,8 +2771,8 @@ class FumitmPython:
                 except Exception as e:
                     self.print_debug(f"Could not read {path}: {e}")
 
-        # Check for encrypted cert variant — the encryptClientConfig hardening
-        # flag encrypts on-disk certs. We note this and try the keychain instead.
+        # The encryptClientConfig flag encrypts the certificates on disk.
+        # Record this and try the keychain.
         found_encrypted = False
         for path in cert_sources:
             enc_path = path + '.enc'
@@ -2878,15 +2800,14 @@ class FumitmPython:
         return None
 
     def _get_netskope_cert_from_keychain(self):
-        """Extract Netskope root and intermediate CA certificates from the macOS System Keychain.
+        """Get the Netskope root and intermediate CAs from the macOS System Keychain.
 
-        The root CA typically has a CN containing "certadmin" and the
-        intermediate has a CN containing "goskope". The -c flag on
-        security find-certificate does substring matching, which handles
-        org-specific variants like ca.thg.goskope.com.
+        The CN of the root usually contains "certadmin" and the CN of the
+        intermediate contains "goskope". The -c flag of security find-certificate
+        matches a substring, thus it accepts a variant such as ca.thg.goskope.com.
 
         Returns:
-            str or None: Combined PEM certificate text, or None on failure.
+            str or None: The combined PEM text, or None on a failure.
         """
         certs = []
 
@@ -2958,10 +2879,8 @@ class FumitmPython:
         
         # Priority 3: Auto-detect devcontainer/WSL without native CLI
         elif self.is_devcontainer() and not self.command_exists('warp-cli'):
-            # Check if certificate already exists
             if os.path.exists(self.cert_path):
                 self.print_info(f"Found existing certificate at {self.cert_path}")
-                # In install mode, ask if they want to update it
                 if self.is_install_mode():
                     response = self._prompt("Do you want to update it with a new certificate? (y/N) ")
                     if response.lower() == 'y':
@@ -2973,12 +2892,10 @@ class FumitmPython:
                             warp_cert = f.read()
                         self.print_info("Using existing certificate")
                 else:
-                    # In status mode, just use existing
                     with open(self.cert_path, 'r') as f:
                         warp_cert = f.read()
                     self.print_info("Using existing certificate for status check")
             else:
-                # No existing cert - must get from user
                 warp_cert = self.get_certificate_from_user()
                 if not warp_cert:
                     self.print_error("Cannot proceed without a certificate in devcontainer environment")
@@ -2998,12 +2915,10 @@ class FumitmPython:
             self.print_error(f"{provider_name} provider has no certificate retrieval method.")
             return False
         
-        # Create a temp file for the proxy certificate
         with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as temp_cert:
             temp_cert.write(warp_cert)
             temp_cert_path = temp_cert.name
         
-        # Verify it's a valid PEM certificate
         try:
             result = subprocess.run(
                 ['openssl', 'x509', '-noout', '-in', temp_cert_path],
@@ -3020,7 +2935,6 @@ class FumitmPython:
         
         self.print_info(f"{provider_name} certificate retrieved successfully")
 
-        # Check if certificate needs to be saved
         needs_save = False
         if os.path.exists(self.cert_path):
             with open(self.cert_path, 'r') as f:
@@ -3035,32 +2949,28 @@ class FumitmPython:
             self.print_info(f"Certificate will be saved to {self.cert_path}")
             needs_save = True
 
-        # Save certificate if needed
         if needs_save:
             if not self.is_install_mode():
                 self.print_action(f"Would save certificate to {self.cert_path}")
             else:
-                # Save certificate
                 shutil.copy(temp_cert_path, self.cert_path)
                 self._fix_ownership(self.cert_path)
                 self.print_info(f"Certificate saved to {self.cert_path}")
 
-        # Clean up
         os.unlink(temp_cert_path)
         
-        # Cache the fingerprint for later use
         self.get_cert_fingerprint()
 
         return True
 
     def _prepare_extra_roots(self):
-        """Materialize each detected supplemental root CA to a file on disk.
+        """Write each supplemental root CA that fumitm detected to a file.
 
-        In install mode the root is written to its persistent cert_path with
-        ownership corrected; in status mode it is written to a temp file tracked
-        for cleanup. Each surviving entry gains a 'path' key. Entries whose root
-        cannot be retrieved or validated are dropped, so downstream bundle
-        assembly silently skips them.
+        In install mode fumitm writes the root to its permanent cert_path and
+        corrects the ownership. In status mode it writes to a temporary file and
+        removes that file later. Each entry that stays gets a 'path' key. fumitm
+        removes an entry when it cannot get or validate the root, thus the assembly
+        of the bundle ignores it.
         """
         if not self.extra_roots:
             return
@@ -3143,26 +3053,26 @@ class FumitmPython:
         for entry in self.extra_roots:
             if entry.get('path'):
                 self.print_info(
-                    f"{entry['name']} detected — supplemental root CA will be "
-                    f"added to managed bundles alongside {self.provider['short_name']}"
+                    f"{entry['name']} detected. fumitm adds its supplemental root CA "
+                    f"to the managed bundles with the {self.provider['short_name']} root"
                 )
 
     def _all_proxy_root_paths(self):
-        """Return the on-disk paths of every CA root that bundles must contain.
+        """Return the path of each CA root that a bundle must contain.
 
-        Always begins with the primary provider cert, followed by any
-        materialized supplemental roots. When no supplemental roots are active
-        this is exactly [self.cert_path], preserving original behavior.
+        The list starts with the primary provider certificate. Each supplemental
+        root that fumitm materialized comes after it. With no supplemental root the
+        list is [self.cert_path].
         """
         paths = [self.cert_path]
         paths.extend(e['path'] for e in self.extra_roots if e.get('path'))
         return paths
 
     def _append_all_proxy_roots(self, target_file):
-        """Append every proxy root (primary + supplemental) to target_file.
+        """Append the primary root and each supplemental root to target_file.
 
-        Each append is individually idempotent via safe_append_certificate.
-        Returns True only if every root was appended (or already present).
+        safe_append_certificate makes each append idempotent. Returns True only if
+        fumitm appended each root, or each root was already present.
         """
         ok = True
         for path in self._all_proxy_root_paths():
@@ -3171,11 +3081,10 @@ class FumitmPython:
         return ok
 
     def _all_roots_present_in_file(self, target_file, likely=False):
-        """Return True only if every proxy root is already present in target_file.
+        """Return True only if each proxy root is already in target_file.
 
-        With likely=True, uses the faster pure-Python matcher. When no
-        supplemental roots are active this reduces to a single primary-cert
-        check, preserving original behavior.
+        With likely=True this uses the faster pure-Python matcher. With no
+        supplemental root this is one check of the primary certificate.
         """
         matcher = (self.certificate_likely_exists_in_file if likely
                    else self.certificate_exists_in_file)
@@ -3185,12 +3094,12 @@ class FumitmPython:
         )
 
     def _status_roots_present(self, primary_cert_path, target_file, likely=False):
-        """Status-mode 'all roots present' check.
+        """Find if each root is present, in status mode.
 
-        Uses the supplied primary certificate path (typically a temp file, since
-        the primary may not be saved to cert_path during a status check) plus
-        every materialized supplemental root. When no supplemental roots are
-        active this reduces to the single primary check, preserving behavior.
+        Uses the given primary certificate path with each supplemental root that
+        fumitm materialized. The primary path is usually a temporary file, because a
+        status check does not write cert_path. With no supplemental root this is one
+        check of the primary certificate.
         """
         matcher = (self.certificate_likely_exists_in_file if likely
                    else self.certificate_exists_in_file)
@@ -3304,12 +3213,11 @@ class FumitmPython:
 
     def _ensure_roots_in_keystore(self, keytool_bin, keystore, label, storetype=None,
                                   alias_pairs=None, split_chains=False):
-        """Import every proxy root (primary + supplemental) into a Java keystore.
+        """Import the primary root and each supplemental root into a Java keystore.
 
-        Each root is imported under its own alias and skipped when already
-        present. Returns 'already_ok', 'configured', or 'failed' for the
-        keystore as a whole. With no supplemental roots active this is
-        equivalent to the original single-alias check-then-import.
+        Each root gets its own alias. fumitm does not import a root that is already
+        present. Returns 'already_ok', 'configured', or 'failed' for the full
+        keystore.
         """
         imported = False
         failed = False
@@ -3454,14 +3362,12 @@ class FumitmPython:
         return True
 
     def _status_container_certs_present(self, primary_cert_path, docker_certs_dir):
-        """Status-mode check that every proxy root is present in its own file.
+        """Find if each proxy root is in its own file, in status mode.
 
-        Install writes the primary provider root and each supplemental root to
-        separate {container_cert_name}.crt files, so each must be checked in its
-        own file rather than expecting the primary file to contain them all. The
-        primary is compared against the supplied temp cert because status mode may
-        not have written cert_path. With no supplemental roots active this reduces
-        to the single primary-file check, preserving behavior.
+        Install writes the primary root and each supplemental root to a separate
+        {container_cert_name}.crt file. Thus fumitm must examine each file. The
+        primary root goes against the given temporary certificate, because status
+        mode can leave cert_path unwritten.
         """
         primary_dest = os.path.join(
             docker_certs_dir, f"{self.provider['container_cert_name']}.crt"
@@ -3490,10 +3396,9 @@ class FumitmPython:
     def _get_brew_prefix(self):
         """Return the Homebrew prefix directory.
 
-        Runs `brew --prefix` and validates the output. Falls back to a
-        platform-aware default (/opt/homebrew on Apple Silicon,
-        /usr/local on Intel macOS) when the command fails or returns
-        empty output.
+        Runs `brew --prefix` and validates the output. If the command fails or gives
+        no output, fumitm uses a default: /opt/homebrew on Apple Silicon and
+        /usr/local on Intel macOS.
         """
         default = (
             '/opt/homebrew'
@@ -3520,16 +3425,14 @@ class FumitmPython:
         return default
 
     def _stage_adoption_cert(self):
-        """Copy the provider root into a private temp file for adoption.
+        """Copy the primary root into a private temporary file for adoption.
 
-        The materialized root lives in a home directory the target user can
-        write, so handing that path to a root-level aikido-doctor invocation
-        would let that user swap the file between fumitm's checks and the
-        privileged read. The staged copy is created by mkstemp with 0600
-        permissions and owned by the invoking user, and every read in the
-        adoption flow — idempotency check, the doctor itself, post-run
-        verification — sees the same bytes. Returns None when the root is not
-        materialized or unreadable.
+        The materialized root is in a home directory that the target user can write.
+        That user could replace the file between the checks of fumitm and the
+        privileged read. mkstemp makes the staged copy with mode 0600, and the
+        invoking user owns it. Each read in the adoption sequence gets the same
+        bytes: the idempotency check, the doctor, and the verification after the
+        run. Returns None when the root is absent or unreadable.
         """
         try:
             with open(self.cert_path, 'rb') as f:
@@ -3545,31 +3448,28 @@ class FumitmPython:
 
     @staticmethod
     def _trusted_system_executable(path):
-        """Vet an executable for root-level invocation.
+        """Examine an executable before fumitm runs it as root.
 
-        Returns `(resolved_path, None)` when the path is trusted, or
-        `(None, reason)` naming the specific disqualification. The reason is not
-        decoration: a rejected candidate is reported to the user, and a message
-        that blames the wrong cause is worse than none.
+        Returns `(resolved_path, None)` when the path is trusted, or `(None,
+        reason)` with the disqualification. fumitm reports the reason to the user. A
+        message with the incorrect cause is worse than no message.
 
-        The aikido-adopt tool may execute this binary as root, so a path
-        selected from a target user's PATH must not be trusted merely because it
-        exists. The executable itself must be root-owned and writable by nobody
-        else — group-writability is disqualifying whatever the group, since
-        anyone in it could rewrite the binary's bytes without ever holding root.
-        Its parent directories must likewise be root-owned and not
-        world-writable, but there group-writability is tolerated for
+        The aikido-adopt tool can run this binary as root. Thus a path from the PATH
+        of a target user is not trusted because it is present. Root must own the
+        executable, and no other user can have write access to it. A group-writable
+        executable is always rejected, because a member of that group could change
+        the bytes of the binary without root.
+
+        Root must also own each parent directory, and no other user can have write
+        access. But a directory can be group-writable if the group is in
         PRIVILEGED_GROUPS.
 
-        That tolerance leaves a residual race, stated plainly because the
-        earlier docstring denied it: write permission on a directory allows
-        unlinking and recreating the file it holds, so a process running as a
-        member of admin can replace a validated binary between this check and
-        the privileged execution. Resolving the symlink narrows the window but
-        does not close it. The exposure is accepted on the same ground as
-        PRIVILEGED_GROUPS itself — admin membership already confers sudo, so an
-        attacker who has it can invoke the doctor directly and gains nothing
-        from the swap.
+        That exemption leaves one risk. Write access to a directory permits an
+        unlink and a new file with the same name. Thus a process that is a member of
+        admin can replace the executable between this check and the privileged run.
+        The symlink resolution makes the interval short but does not remove it.
+        fumitm accepts this risk for the same reason as PRIVILEGED_GROUPS: a member
+        of admin can already use sudo and can run the doctor directly.
         """
         try:
             resolved = os.path.realpath(path)
@@ -3599,12 +3499,10 @@ class FumitmPython:
             return None, f'could not be inspected: {e}'
 
     def _find_aikido_doctor(self):
-        """Find aikido-doctor without selecting an untrusted user executable.
+        """Find aikido-doctor and do not select an untrusted executable.
 
-        Rejected candidates are reported at debug level rather than passed over
-        silently: a present-but-rejected binary and an absent one lead to very
-        different diagnoses, and conflating them sent one investigation down the
-        wrong path entirely.
+        fumitm reports a rejected candidate at the debug level. A binary that is
+        present but rejected and a binary that is absent need different corrections.
         """
         for directory in os.environ.get('PATH', '').split(os.pathsep):
             directory = directory or os.curdir
@@ -3612,9 +3510,9 @@ class FumitmPython:
             trusted, reason = self._trusted_system_executable(candidate)
             if trusted:
                 return trusted
-            # lexists, not exists: a dangling symlink is the likeliest shape of
-            # a broken install now that the doctor resolves into an application
-            # bundle, and following the link would hide exactly that case.
+            # Use lexists and not exists. A dangling symlink is the usual
+            # shape of a broken install, and exists() follows the link and
+            # hides it.
             if os.path.lexists(candidate):
                 self.print_debug(f"Ignoring {candidate}: {reason}")
         return None
@@ -3622,16 +3520,15 @@ class FumitmPython:
     def _aikido_doctor_supports_adopt(self, doctor):
         """Return True when this aikido-doctor has the `certconfig adopt` subcommand.
 
-        Asked rather than assumed, because the failure is otherwise silent and
-        permanent: the CLI answers an unknown subcommand with "Unknown command"
-        on stdout and exits *zero*, so an agent predating `certconfig` would
-        sail past the return-code check and be caught only by the post-adopt
-        verification, which reports a hard failure. A host in that state would
-        go red on every scheduled run with no path back to green.
+        fumitm asks and does not assume. For an unknown subcommand the CLI writes
+        "Unknown command" to stdout and exits zero. Thus an agent from before
+        `certconfig` passes the return-code check. Only the verification after the
+        adoption finds it, and that gives a failure. Such a host would stay red at
+        each scheduled run.
 
-        `certconfig --help` needs no privilege, costs a few milliseconds, and
-        names its subcommands, so the answer comes from the CLI itself rather
-        than from pattern-matching an error message.
+        `certconfig --help` needs no privilege, takes a few milliseconds, and gives
+        the names of the subcommands. Thus the answer comes from the CLI and not
+        from a match against an error message.
         """
         if self._aikido_adopt_supported is None:
             try:
@@ -3647,25 +3544,25 @@ class FumitmPython:
         return self._aikido_adopt_supported
 
     def setup_aikido_adopt(self):
-        """Adopt the primary provider root into Aikido's own CA bundles.
+        """Adopt the primary provider root into the CA bundles of Aikido.
 
-        Newer Aikido agents ship `aikido-doctor certconfig adopt <pem>`, which
-        registers an external root and rebuilds every bundle it maintains (node,
-        npm, pip, git, ruby, curl, nix, bazel) around it, so the bundles Aikido
-        env-injects trust the primary provider too. The defensive machinery
-        elsewhere (trust-var reclaim, curlrc override, exports kept last) stays
-        for hosts where the agent predates certconfig.
+        A recent Aikido agent has `aikido-doctor certconfig adopt <pem>`. It records
+        an external root and builds each bundle that it keeps current around that
+        root: node, npm, pip, git, ruby, curl, nix, and bazel. Thus the bundles that
+        Aikido sets in the environment also trust the primary provider. The other
+        protections stay for a host with an older agent: the reclaim of the trust
+        variables, the curlrc override, and the exports that stay last.
         """
         if not any(e['key'] == 'aikido' for e in self.extra_roots):
             return ToolResult('aikido-adopt', 'skipped', 'Aikido not active')
         if platform.system() != 'Darwin':
-            # Aikido's adopted-CA record lives under /Library/Application
-            # Support, so adoption elsewhere could never be recognized and
-            # every run would repeat it.
+            # The adoption record of Aikido is under /Library/Application
+            # Support. On another platform fumitm cannot read it, thus each
+            # run would adopt again.
             return ToolResult('aikido-adopt', 'skipped', 'Aikido adoption is macOS-only')
-        # This runs as root, directly or through sudo. Do not resolve from a
-        # user-writable PATH entry: --run-as-user deliberately adds the target
-        # user's Homebrew and ~/.local/bin directories to PATH.
+        # This runs as root. Do not use a PATH entry that the user can write.
+        # --run-as-user adds the Homebrew and ~/.local/bin directories of the
+        # target user to PATH.
         doctor = self._find_aikido_doctor()
         if not doctor:
             return ToolResult(
@@ -3683,13 +3580,11 @@ class FumitmPython:
 
         try:
             if self._aikido_built_bundles() is None:
-                # Adopting without being able to read the bundles would be a
-                # privileged command run blind, with no way to tell afterwards
-                # whether it took. Report the directory instead; that is the
-                # fault to fix. Skipped rather than failed because fumitm never
-                # gains the privilege that would fix it — the escalation covers
-                # the doctor invocation alone — so a hard failure would go red
-                # on every scheduled run with nothing able to clear it.
+                # Adoption with no read access to the bundles is a privileged
+                # command with no way to confirm the result. Report the
+                # directory. This is 'skipped' and not 'failed'. fumitm never
+                # gets the privilege that makes the directory readable, thus a
+                # failure would stay red at each scheduled run.
                 run_dir = SUPPLEMENTAL_ROOTS['aikido']['run_dir']
                 message = f"Could not read Aikido's bundle directory {run_dir}"
                 self.print_warn(message)
@@ -3704,11 +3599,10 @@ class FumitmPython:
             as_root = os.getuid() == 0
             prefix = [] if as_root else ['sudo']
             argv = prefix + [doctor, 'certconfig', 'adopt', staged]
-            # Messages reference the durable cert path, not the staged copy,
-            # which is gone by the time a user could rerun the command. The
-            # parts are shell-quoted because the doctor resolves into an
-            # application bundle whose name contains spaces, and this string is
-            # printed for the user to paste into a shell.
+            # Messages show the durable certificate path and not the staged
+            # copy. The staged copy is gone when a user runs the command. The
+            # parts are shell-quoted because the path of the doctor contains
+            # spaces.
             command_str = shlex.join(argv[:-1] + [self.cert_path])
 
             if not self.is_install_mode():
@@ -3716,9 +3610,9 @@ class FumitmPython:
                 return ToolResult('aikido-adopt', 'skipped', 'Dry run')
 
             if not as_root:
-                # sudo reads its password from the TTY, so without one it would hang
-                # even under --yes. Hand the command over rather than let _prompt
-                # raise NonInteractiveError and abort the whole run with exit code 2.
+                # sudo reads its password from the TTY. With no TTY it stops,
+                # also with --yes. Give the command to the user, thus _prompt
+                # does not raise NonInteractiveError and end the run.
                 if self.headless or not sys.stdin.isatty():
                     self.print_warn(f"Adopting the {short} root into Aikido's bundles requires sudo")
                     self.print_action(f"Run manually: {command_str}")
@@ -3744,13 +3638,11 @@ class FumitmPython:
                 return ToolResult('aikido-adopt', 'failed', message)
 
             if not self._aikido_trusts_root(staged):
-                # A doctor that exited 0 without leaving a record did not adopt,
-                # and saying so is the whole point of verifying. But bundles are
-                # rebuilt by the agent, not by the CLI's return, so a bundle
-                # still lagging after a recorded adoption is a state we neither
-                # control nor can wait out — failing on it would turn every
-                # scheduled MDM run red for a condition the next agent pass
-                # clears. Name the laggards instead.
+                # A doctor that exits 0 and writes no record adopted nothing.
+                # But the agent rebuilds the bundles, and the CLI does not. A
+                # bundle that is behind after a recorded adoption is not in
+                # our control. A failure would make each scheduled run red
+                # until the next agent pass. Give the names of those bundles.
                 if self._aikido_has_adopted(staged) is not True:
                     message = f'aikido-doctor exited 0 but did not adopt the {short} root'
                     self.print_error(message)
@@ -3774,13 +3666,13 @@ class FumitmPython:
                 pass
 
     def setup_brew_cacerts(self):
-        """Regenerate Homebrew's ca-certificates bundle to include the proxy CA.
+        """Build the ca-certificates bundle of Homebrew again with the proxy CA.
 
-        Homebrew's ca-certificates formula builds its bundle from the macOS
-        system keychain, which already contains the MITM proxy CA. Running
-        `brew postinstall ca-certificates` regenerates the bundle at
-        $(brew --prefix)/etc/ca-certificates/cert.pem, fixing all Homebrew
-        tools that link against Homebrew OpenSSL.
+        The ca-certificates formula builds its bundle from the macOS system
+        keychain, which contains the MITM proxy CA. `brew postinstall
+        ca-certificates` builds the bundle at
+        $(brew --prefix)/etc/ca-certificates/cert.pem again. This corrects each
+        Homebrew tool that links against Homebrew OpenSSL.
         """
         if not self.command_exists('brew'):
             return ToolResult('brew-cacerts', 'skipped', 'Homebrew not installed')
@@ -3829,17 +3721,18 @@ class FumitmPython:
         return self._run_brew_postinstall(bundle_path)
 
     def _run_brew_postinstall(self, bundle_path):
-        """Regenerate the Homebrew CA bundle and verify every proxy root landed.
+        """Build the Homebrew CA bundle again and confirm that each root is in it.
 
-        brew rebuilds the bundle from the macOS system keychain. Certificates
-        that live only in the maintained combined PEM are therefore dropped: a
-        provider intermediate the keychain lacks (e.g. Netskope ships root plus
-        intermediate but the keychain holds only the root) and every supplemental
-        root (e.g. Aikido). Whatever is missing is appended to the regenerated
-        bundle directly. Failure is reported only when brew sourced no part of
-        the primary proxy CA, which signals the keychain is missing it entirely;
-        appending the primary there would be wiped on the next ca-certificates
-        upgrade, so the keychain problem is surfaced instead.
+        brew builds the bundle from the macOS system keychain. Thus it removes a
+        certificate that is only in the combined PEM. This includes a provider
+        intermediate that the keychain does not have, for example the Netskope
+        intermediate, and each supplemental root such as the Aikido root. fumitm
+        appends what is absent to the new bundle.
+
+        fumitm reports a failure only when brew took no part of the primary proxy
+        CA. That shows that the keychain does not have it. An append of the primary
+        root there would be removed at the next ca-certificates upgrade, thus fumitm
+        reports the keychain problem.
         """
         result = subprocess.run(
             ['brew', 'postinstall', 'ca-certificates'],
@@ -3862,9 +3755,8 @@ class FumitmPython:
             return ToolResult('brew-cacerts', 'failed', 'Proxy certificate not found in bundle after postinstall')
 
         if not self._all_roots_present_in_file(bundle_path):
-            # brew sourced the primary root from the keychain but dropped certs
-            # that live only in the combined PEM (provider intermediate and any
-            # supplemental root); append the missing ones directly.
+            # brew took the primary root from the keychain. It dropped the
+            # certificates that are only in the combined PEM. Append them.
             self._append_all_proxy_roots(bundle_path)
             if not self._all_roots_present_in_file(bundle_path):
                 self.print_warn(
@@ -3890,7 +3782,8 @@ class FumitmPython:
         if node_extra_ca_certs:
             other_provider = self._path_belongs_to_other_provider(node_extra_ca_certs)
             if other_provider:
-                # Path belongs to a different provider — migrate to current provider's bundle
+                # The path belongs to a different provider. Move to the bundle
+                # of the current provider.
                 needs_setup = True
                 node_bundle = os.path.join(self.bundle_dir, "node/ca-bundle.pem")
                 self.print_info("Configuring Node.js certificate...")
@@ -3907,16 +3800,13 @@ class FumitmPython:
                     self.add_to_shell_config("NODE_EXTRA_CA_CERTS", node_bundle, shell_config)
                     self.print_info(f"Migrated Node.js CA bundle to {node_bundle}")
             elif os.path.exists(node_extra_ca_certs):
-                # Check if the file contains our certificate using normalized comparison
                 if self._all_roots_present_in_file(node_extra_ca_certs):
-                    # Certificate already exists in NODE_EXTRA_CA_CERTS, skip to npm setup
                     pass
                 else:
                     needs_setup = True
                     self.print_info("Configuring Node.js certificate...")
                     self.print_info(f"NODE_EXTRA_CA_CERTS is already set to: {node_extra_ca_certs}")
 
-                    # Check if we can write to the file
                     if not self.is_writable(node_extra_ca_certs):
                         self.print_error(f"Cannot write to {node_extra_ca_certs} (permission denied)")
                         new_path = self.suggest_user_path(node_extra_ca_certs, "node")
@@ -3959,7 +3849,6 @@ class FumitmPython:
         else:
             needs_setup = True
             self.print_info("Configuring Node.js certificate...")
-            # NODE_EXTRA_CA_CERTS not set, create a new bundle
             node_bundle = os.path.join(self.bundle_dir, "node/ca-bundle.pem")
             
             if not self.is_install_mode():
@@ -3970,8 +3859,8 @@ class FumitmPython:
                 self.print_info(f"Creating Node.js CA bundle at {node_bundle}")
                 self._safe_makedirs(os.path.dirname(node_bundle))
                 
-                # Start with just the proxy certificates
-                # (NODE_EXTRA_CA_CERTS supplements system certs, doesn't replace them)
+                # Start with the proxy certificates. NODE_EXTRA_CA_CERTS adds
+                # to the system certificates and does not replace them.
                 shutil.copy(self.cert_path, node_bundle)
                 self._fix_ownership(node_bundle)
                 self._append_all_proxy_roots(node_bundle)
@@ -3979,7 +3868,6 @@ class FumitmPython:
                 self.add_to_shell_config("NODE_EXTRA_CA_CERTS", node_bundle, shell_config)
                 self.print_info("Created Node.js CA bundle with proxy certificate")
         
-        # Setup npm cafile if npm is available
         if self.command_exists('npm'):
             self.setup_npm_cafile()
 
@@ -3995,7 +3883,6 @@ class FumitmPython:
 
     def setup_npm_cafile(self):
         """Setup npm cafile."""
-        # Check current npm cafile setting
         try:
             result = subprocess.run(
                 ['npm', 'config', 'get', 'cafile'],
@@ -4026,7 +3913,6 @@ class FumitmPython:
                 return
 
             if os.path.exists(current_cafile):
-                # First check if the existing cafile looks suspiciously small
                 suspicious, reason = self.is_suspicious_full_bundle(current_cafile, self.cert_path)
                 if suspicious:
                     self.print_info("Configuring npm certificate...")
@@ -4042,12 +3928,10 @@ class FumitmPython:
                         self.print_info(f"Repointed npm cafile to managed bundle: {npm_bundle}")
                     return
 
-                # Check if the file contains our certificate using normalized comparison
                 if not self._all_roots_present_in_file(current_cafile):
                     self.print_info("Configuring npm certificate...")
                     self.print_warn("Current npm cafile doesn't contain proxy certificate")
                     
-                    # Check if we can write to the npm cafile
                     if not self.is_writable(current_cafile):
                         self.print_error(f"Cannot write to npm cafile: {current_cafile} (permission denied)")
                         self.print_warn(f"Will use alternative path: {npm_bundle}")
@@ -4058,14 +3942,11 @@ class FumitmPython:
                             self.print_action(f"Would run: npm config set cafile {npm_bundle}")
                         else:
                             self._safe_makedirs(os.path.dirname(npm_bundle))
-                            # Create a full bundle with system certs
                             if (not self.create_bundle_with_system_certs(npm_bundle)
                                     and os.path.exists(current_cafile)):
-                                # Copy existing bundle if available
                                 shutil.copy(current_cafile, npm_bundle)
                                 self._fix_ownership(npm_bundle)
 
-                            # Append certificate to bundle
                             self._append_all_proxy_roots(npm_bundle)
 
                             subprocess.run(['npm', 'config', 'set', 'cafile', npm_bundle], check=False)
@@ -4110,7 +3991,6 @@ class FumitmPython:
                     subprocess.run(['npm', 'config', 'set', 'cafile', npm_bundle], check=False)
                     self.print_info(f"Configured npm cafile to: {npm_bundle}")
                     
-                    # Verify the setting
                     try:
                         result = subprocess.run(
                             ['npm', 'config', 'get', 'cafile'],
@@ -4125,11 +4005,11 @@ class FumitmPython:
                         pass
 
     def cleanup_yarn_cafile(self):
-        """Check and clean up yarn cafile configuration.
+        """Examine and remove the cafile configuration of yarn.
 
-        Yarn respects NODE_EXTRA_CA_CERTS, so explicit cafile configs are
-        usually unnecessary and often point to stale/broken paths from
-        old scripts (like warp.sh) or manual configuration.
+        yarn reads NODE_EXTRA_CA_CERTS, thus a cafile setting is usually
+        unnecessary. Such a setting often points at an old path from a previous
+        script such as warp.sh.
         """
         if not self.command_exists('yarn'):
             return
@@ -4142,7 +4022,6 @@ class FumitmPython:
                 return
             is_berry = yarn_version[0] in ('2', '3', '4')
 
-            # Get current cafile setting
             if is_berry:
                 config_key = 'httpsCaFilePath'
                 delete_cmd = ['yarn', 'config', 'unset', 'httpsCaFilePath']
@@ -4154,7 +4033,6 @@ class FumitmPython:
                                    capture_output=True, text=True, check=False)
             current_cafile = result.stdout.strip()
 
-            # Check if set to something problematic
             if not current_cafile or current_cafile in ['undefined', '']:
                 return  # Not set, nothing to do
 
@@ -4163,11 +4041,9 @@ class FumitmPython:
             if current_cafile == npm_bundle:
                 return  # Points to fumitm-managed bundle, that's OK
 
-            # Check if file exists and contains WARP cert
             if os.path.exists(current_cafile) and self._all_roots_present_in_file(current_cafile):
                 return  # Working config, leave it
 
-            # Problematic config - delete it
             self.print_info("Configuring yarn...")
             if not os.path.exists(current_cafile):
                 self.print_warn(f"yarn {config_key} points to non-existent file: {current_cafile}")
@@ -4185,10 +4061,10 @@ class FumitmPython:
             self.print_debug(f"Error checking yarn cafile: {e}")
 
     def cleanup_pnpm_cafile(self):
-        """Check and clean up pnpm cafile configuration.
+        """Examine and remove the cafile configuration of pnpm.
 
-        pnpm respects NODE_EXTRA_CA_CERTS, so explicit cafile configs are
-        usually unnecessary and often point to stale/broken paths.
+        pnpm reads NODE_EXTRA_CA_CERTS, thus a cafile setting is usually
+        unnecessary and often points at an old path.
         """
         if not self.command_exists('pnpm'):
             return
@@ -4206,11 +4082,9 @@ class FumitmPython:
             if current_cafile == npm_bundle:
                 return  # Points to fumitm-managed bundle, that's OK
 
-            # Check if file exists and contains WARP cert
             if os.path.exists(current_cafile) and self._all_roots_present_in_file(current_cafile):
                 return  # Working config, leave it
 
-            # Problematic config - delete it
             self.print_info("Configuring pnpm...")
             if not os.path.exists(current_cafile):
                 self.print_warn(f"pnpm cafile points to non-existent file: {current_cafile}")
@@ -4228,12 +4102,12 @@ class FumitmPython:
             self.print_debug(f"Error checking pnpm cafile: {e}")
 
     def _export_python_trust_vars(self, bundle, shell_config):
-        """Point every Python-ecosystem TLS-trust var at the both-roots bundle.
+        """Point each Python TLS trust variable at the bundle with both roots.
 
-        Includes the vars a supplemental-root vendor (e.g. Aikido) exports at its
-        own single-root bundle — PIP_CERT, POETRY_CERTIFICATES_PYPI_CERT, and
-        BUNDLE_SSL_CA_CERT — so pip/poetry/bundler trust both proxies, not just
-        the vendor's. Returns True if any export changed the shell config.
+        This includes the variables that a supplemental-root vendor sets at its own
+        single-root bundle: PIP_CERT, POETRY_CERTIFICATES_PYPI_CERT, and
+        BUNDLE_SSL_CA_CERT. Thus pip, poetry, and bundler trust both proxies.
+        Returns True if an export changed the shell config.
         """
         trust_vars = (
             'SSL_CERT_FILE', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE',
@@ -4251,27 +4125,25 @@ class FumitmPython:
             self.print_info("Python not found, skipping Python setup")
             return ToolResult('python', 'skipped', 'python not found in PATH')
 
-        # Note: Unlike gcloud which uses a consistent system trust store, different
-        # Python installations (system, Homebrew, venvs) may have different trust
-        # configurations. We intentionally do NOT skip based on verify_connection()
-        # because environment variables ensure ALL Python environments work, not just
-        # the one running this script. Env vars are inherited by venvs and child processes.
+        # Different Python installations can have different trust
+        # configuration. Do not skip on a successful verify_connection(). The
+        # environment variables make all Python environments work, not only
+        # the one that runs this script. Virtual environments and child
+        # processes inherit them.
 
         shell_type = self.detect_shell()
         shell_config = self.get_shell_config(shell_type)
 
-        # Create combined certificate bundle for Python
         python_bundle = os.path.expanduser("~/.python-ca-bundle.pem")
         needs_setup = False
 
         requests_ca_bundle = os.environ.get('REQUESTS_CA_BUNDLE', '')
 
-        # A supplemental-root vendor (e.g. Aikido) may export REQUESTS_CA_BUNDLE
-        # at its own maintained, root-owned bundle. fumitm must not adopt or
-        # relocate that file: it is the vendor's to manage and would be reverted
-        # on the vendor's next update. Ignore it and fall through to building
-        # fumitm's own ~/.python-ca-bundle.pem with every root, which the
-        # vendor-untouched SSL_CERT_FILE then points at.
+        # A supplemental-root vendor can export REQUESTS_CA_BUNDLE at its own
+        # root-owned bundle. Do not use or move that file. The vendor controls
+        # it, and its next update reverts a change. Build the bundle of fumitm
+        # at ~/.python-ca-bundle.pem with all roots. SSL_CERT_FILE then points
+        # at that bundle.
         if requests_ca_bundle and self._is_vendor_injected_bundle(requests_ca_bundle):
             self.print_info(
                 f"Ignoring vendor-injected REQUESTS_CA_BUNDLE ({requests_ca_bundle}); "
@@ -4281,7 +4153,6 @@ class FumitmPython:
 
         if requests_ca_bundle:
             if os.path.exists(requests_ca_bundle):
-                # Check if we can write to the file
                 if not self.is_writable(requests_ca_bundle):
                     self.print_error(f"Cannot write to {requests_ca_bundle} (permission denied)")
                     new_path = self.suggest_user_path(requests_ca_bundle, "python")
@@ -4305,7 +4176,6 @@ class FumitmPython:
                                     Path(new_path).touch()
                                     self._fix_ownership(new_path)
 
-                            # Append certificate to the new path
                             self._append_all_proxy_roots(new_path)
 
                             needs_setup = True
@@ -4318,13 +4188,11 @@ class FumitmPython:
                         else:
                             return ToolResult('python', 'skipped', 'User declined alternative path')
                 else:
-                    # Check if the existing bundle looks suspicious (likely just WARP CA)
                     suspicious, reason = self.is_suspicious_full_bundle(requests_ca_bundle, self.cert_path)
                     if suspicious:
-                        # Repoint at fumitm's managed bundle, then fall through to
-                        # the trust-var post-pass below rather than returning here:
-                        # an early return would leave the vendor vars
-                        # (PIP_CERT/Poetry/Bundler) pointing at the old bundle.
+                        # Point at the managed bundle of fumitm. Continue to
+                        # the trust-variable pass below. A return here leaves
+                        # the vendor variables at the old bundle.
                         needs_setup = True
                         self.print_info("Configuring Python certificate...")
                         self.print_warn(f"REQUESTS_CA_BUNDLE looks suspiciously small ({reason})")
@@ -4339,9 +4207,9 @@ class FumitmPython:
                             self.add_to_shell_config("CURL_CA_BUNDLE", python_bundle, shell_config)
                             self.print_info(f"Repointed REQUESTS_CA_BUNDLE to managed bundle: {python_bundle}")
 
-                    # Check if the file contains our certificate using normalized
-                    # comparison. Only when the bundle was not suspicious — the
-                    # suspicious branch has already abandoned it for python_bundle.
+                    # Look for the certificate in the file. Do this only when
+                    # the bundle is not suspicious. The suspicious branch
+                    # already uses python_bundle.
                     elif not self._all_roots_present_in_file(requests_ca_bundle):
                         needs_setup = True
                         self.print_info("Configuring Python certificate...")
@@ -4353,8 +4221,8 @@ class FumitmPython:
                             self.print_info(f"Appending proxy certificate to {requests_ca_bundle}")
                             self._append_all_proxy_roots(requests_ca_bundle)
                     else:
-                        # REQUESTS_CA_BUNDLE is healthy — ensure SSL_CERT_FILE is also set,
-                        # since tools like httpx and Python's ssl module use it independently.
+                        # REQUESTS_CA_BUNDLE is correct. Set SSL_CERT_FILE
+                        # also, because httpx and the ssl module read it.
                         shell_config = self.get_shell_config(shell_type)
                         ssl_cert_file = os.environ.get('SSL_CERT_FILE', '')
                         if not ssl_cert_file:
@@ -4386,8 +4254,8 @@ class FumitmPython:
             self.add_to_shell_config("SSL_CERT_FILE", python_bundle, shell_config)
             self.add_to_shell_config("CURL_CA_BUNDLE", python_bundle, shell_config)
 
-        # Independently check SSL_CERT_FILE for suspicious bundles
-        # This handles the case where REQUESTS_CA_BUNDLE is fine but SSL_CERT_FILE is broken
+        # Examine SSL_CERT_FILE for a suspicious bundle. REQUESTS_CA_BUNDLE
+        # can be correct while SSL_CERT_FILE is broken.
         ssl_cert_file = os.environ.get('SSL_CERT_FILE', '')
         if ssl_cert_file and ssl_cert_file != python_bundle:
             if os.path.exists(ssl_cert_file):
@@ -4399,7 +4267,6 @@ class FumitmPython:
                     if not self.is_install_mode():
                         self.print_action(f"Would repoint SSL_CERT_FILE to {python_bundle}")
                     else:
-                        # Ensure the managed bundle exists
                         if not os.path.exists(python_bundle):
                             self.create_bundle_with_system_certs(python_bundle)
                             self._append_all_proxy_roots(python_bundle)
@@ -4430,11 +4297,10 @@ class FumitmPython:
                     self.add_to_shell_config("SSL_CERT_FILE", python_bundle, shell_config)
                     self.print_info(f"Repointed SSL_CERT_FILE to managed bundle: {python_bundle}")
 
-        # Reclaim the Python-ecosystem trust vars a supplemental-root vendor
-        # (e.g. Aikido) may have exported at its own single-root bundle. Earlier
-        # branches above can exit while PIP_CERT/POETRY/BUNDLE_SSL_CA_CERT still
-        # point at an Aikido-only bundle, so assert all of them at the both-roots
-        # Python bundle whenever Aikido is active or any vendor var is present.
+        # Take back the Python trust variables that a supplemental-root
+        # vendor sets at its own single-root bundle. A branch above can exit
+        # while PIP_CERT, POETRY, and BUNDLE_SSL_CA_CERT still point at that
+        # bundle. Set all of them at the Python bundle with both roots.
         vendor_trust_vars = (
             'PIP_CERT', 'POETRY_CERTIFICATES_PYPI_CERT', 'BUNDLE_SSL_CA_CERT'
         )
@@ -4442,8 +4308,8 @@ class FumitmPython:
         if aikido_active or any(os.environ.get(v) for v in vendor_trust_vars):
             bundle_repaired = False
             if self.is_install_mode():
-                # A bundle built before Aikido was active is stale and would still
-                # be missing the Aikido root, so repair it before pointing vars at it.
+                # A bundle built before Aikido was active has no Aikido root.
+                # Repair it before the variables point at it.
                 if not os.path.exists(python_bundle):
                     self.create_bundle_with_system_certs(python_bundle)
                     self._append_all_proxy_roots(python_bundle)
@@ -4465,13 +4331,13 @@ class FumitmPython:
         return ToolResult('python', 'skipped', 'Dry run')
 
     def _ensure_gcloud_properties(self, ca_bundle):
-        """Pre-create ~/.config/gcloud/properties with custom_ca_certs_file.
+        """Make ~/.config/gcloud/properties with custom_ca_certs_file.
 
-        The gcloud SDK reads this file during bootstrap, before any config
-        commands are available. This is the only reliable way to pass a custom
-        CA bundle to `brew install --cask gcloud-cli`, because Homebrew
-        sanitizes environment variables (stripping CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE)
-        and gcloud's bundled requests ignores REQUESTS_CA_BUNDLE.
+        The gcloud SDK reads this file during its bootstrap, before a config command
+        is available. This is the only reliable way to give a custom CA bundle to
+        `brew install --cask gcloud-cli`. Homebrew removes
+        CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE from the environment, and the requests
+        library in gcloud ignores REQUESTS_CA_BUNDLE.
         """
         properties_dir = os.path.expanduser("~/.config/gcloud")
         properties_file = os.path.join(properties_dir, "properties")
@@ -4490,7 +4356,7 @@ class FumitmPython:
                         if os.path.exists(current_value) and \
                                 self._all_roots_present_in_file(current_value):
                             return False
-                # Existing value is stale or wrong — replace it
+                # The value is old or incorrect. Replace it.
                 lines = content.splitlines()
                 new_lines = []
                 for line in lines:
@@ -4507,7 +4373,7 @@ class FumitmPython:
                     self.print_info(f"Updated custom_ca_certs_file in {properties_file}")
                 return True
 
-            # File exists but no custom_ca_certs_file — append under [core]
+            # The file has no custom_ca_certs_file. Append it under [core].
             if "[core]" in content:
                 if not self.is_install_mode():
                     self.print_action(f"Would add custom_ca_certs_file to {properties_file}")
@@ -4541,28 +4407,26 @@ class FumitmPython:
         return True
 
     def _ensure_gcloud_reauth_trust(self, complete_bundle, shell_config):
-        """Make gcloud's reauth handshake trust the full proxy bundle.
+        """Make the reauth handshake of gcloud trust the full proxy bundle.
 
-        The IAP tunnel and ordinary API calls read core/custom_ca_certs_file, but
-        the reauth flow — the reauth.googleapis.com session handshake gcloud runs
-        when credentials need refreshing — goes through gcloud's bundled requests
-        library, which ignores that property and trusts REQUESTS_CA_BUNDLE, then
-        CURL_CA_BUNDLE, instead. A supplemental-root vendor such as Aikido exports
-        both at its own combined bundle, which carries the public roots and the
-        vendor root but not the primary proxy root (e.g. Netskope) that actually
-        intercepts Google traffic. The reauth handshake then fails with
-        "self-signed certificate in certificate chain" even though the property is
-        correct and ``gcloud projects list`` otherwise works.
+        The IAP tunnel and the usual API calls read core/custom_ca_certs_file. But
+        the reauth flow does not. gcloud runs that flow against
+        reauth.googleapis.com when it must refresh the credentials. It goes through
+        the requests library in gcloud, which reads REQUESTS_CA_BUNDLE and then
+        CURL_CA_BUNDLE. A supplemental-root vendor such as Aikido sets both at its
+        own combined bundle. That bundle has the public roots and the vendor root
+        but not the primary proxy root, for example the Netskope root, which
+        intercepts the Google traffic. The reauth handshake then fails with
+        "self-signed certificate in certificate chain", although the property is
+        correct and ``gcloud projects list`` operates.
 
-        Re-assert both variables at the complete fumitm bundle (public roots plus
-        every proxy root). The always-last managed block wins over the vendor's
-        earlier export by last-export-wins. This only acts when a supplemental
-        root is active, leaving the environment of plain single-provider hosts
-        untouched.
+        fumitm sets both variables at the complete bundle, with the public roots and
+        each proxy root. The managed block is always last, thus it replaces the
+        earlier export of the vendor. This operates only when a supplemental root is
+        active, thus a host with one provider keeps its environment.
 
         Returns:
-            bool: True when a shell-config export changed (or would change in
-            dry-run mode), False otherwise.
+            bool: True when an export changed, or would change in dry-run mode.
         """
         if not self.extra_roots:
             return False
@@ -4574,9 +4438,8 @@ class FumitmPython:
 
     def setup_gcloud_cert(self):
         """Setup gcloud certificate."""
-        # Pre-create the gcloud properties file so that future gcloud installs
-        # (e.g. `brew install --cask gcloud-cli`) can bootstrap behind a MITM
-        # proxy. Also set the env var for direct gcloud invocations.
+        # Make the gcloud properties file now, thus a later gcloud install
+        # can start behind a MITM proxy. Set the environment variable also.
         pre_bootstrap = False
         python_bundle = os.path.expanduser("~/.python-ca-bundle.pem")
         if os.path.exists(python_bundle):
@@ -4601,19 +4464,16 @@ class FumitmPython:
                 return ToolResult('gcloud', 'skipped', 'Dry run')
             return ToolResult('gcloud', 'skipped', 'gcloud not found in PATH')
 
-        # We do NOT short-circuit on a successful basic HTTPS check here. The
-        # IAP tunnel WebSocket path (gcloud compute ssh --tunnel-through-iap)
-        # builds its own SSL context with an explicit ca_certs path read from
-        # core/custom_ca_certs_file — it ignores the system trust store and
-        # the SSL_CERT_FILE environment variable. So we always make sure the
-        # property is set to a bundle that contains our proxy CA, even when a
-        # plain `gcloud projects list` already works.
+        # Do not stop on a successful HTTPS check. The IAP tunnel WebSocket
+        # path makes its own SSL context with the ca_certs path from
+        # core/custom_ca_certs_file. It ignores the system trust store and
+        # SSL_CERT_FILE. Thus always set the property to a bundle that
+        # contains the proxy CA.
 
         gcloud_cert_dir = os.path.expanduser("~/.config/gcloud/certs")
         gcloud_bundle = os.path.join(gcloud_cert_dir, "combined-ca-bundle.pem")
         needs_setup = False
 
-        # Check current gcloud custom CA setting
         try:
             result = subprocess.run(
                 ['gcloud', 'config', 'get-value', 'core/custom_ca_certs_file'],
@@ -4623,11 +4483,9 @@ class FumitmPython:
         except Exception:
             current_ca_file = ""
         
-        # Check if gcloud needs configuration
         if not current_ca_file:
             needs_setup = True
         elif os.path.exists(current_ca_file):
-            # First check if the existing CA file looks suspiciously small
             suspicious, reason = self.is_suspicious_full_bundle(current_ca_file, self.cert_path)
             if suspicious:
                 self.print_info("Configuring gcloud certificate...")
@@ -4644,7 +4502,6 @@ class FumitmPython:
                     return ToolResult('gcloud', 'configured', 'Repointed suspicious gcloud CA file')
                 return ToolResult('gcloud', 'skipped', 'Dry run')
 
-            # Check if current CA file contains our certificate using normalized comparison
             if not self._all_roots_present_in_file(current_ca_file):
                 needs_setup = True
         else:
@@ -4657,20 +4514,17 @@ class FumitmPython:
 
         self.print_info("Configuring gcloud certificate...")
         
-        # Create directory if it doesn't exist
         if self.is_install_mode():
             self._safe_makedirs(gcloud_cert_dir)
         
         if current_ca_file and current_ca_file != gcloud_bundle:
             self.print_warn(f"gcloud is already configured with custom CA: {current_ca_file}")
             
-            # Check if the current CA file is writable
             if os.path.exists(current_ca_file) and not self.is_writable(current_ca_file):
                 self.print_error(f"Cannot write to current gcloud CA file: {current_ca_file} (permission denied)")
                 self.print_warn(f"Will use alternative path: {gcloud_bundle}")
                 if not self.is_install_mode():
                     self.print_action(f"Would create new gcloud CA bundle at {gcloud_bundle}")
-                # Continue with the new path
             else:
                 if not self.is_install_mode():
                     self.print_action("Would ask to update gcloud CA configuration")
@@ -4687,12 +4541,10 @@ class FumitmPython:
             self.print_action(f"Would run: gcloud config set core/custom_ca_certs_file {gcloud_bundle}")
             return ToolResult('gcloud', 'skipped', 'Dry run')
         else:
-            # Create combined bundle
             self.print_info(f"Creating gcloud CA bundle at {gcloud_bundle}")
             self.create_bundle_with_system_certs(gcloud_bundle)
             self._append_all_proxy_roots(gcloud_bundle)
 
-            # Configure gcloud
             result = subprocess.run(
                 ['gcloud', 'config', 'set', 'core/custom_ca_certs_file', gcloud_bundle],
                 capture_output=True,
@@ -4718,13 +4570,11 @@ class FumitmPython:
         if not self.command_exists('git'):
             return ToolResult('git', 'skipped', 'git not found in PATH')
         git_bundle = os.path.join(self.bundle_dir, "git/ca-bundle.pem")
-        # Check current setting
         try:
             result = subprocess.run(['git', 'config', '--global', 'http.sslCAInfo'], capture_output=True, text=True, check=False)
             current_ca = result.stdout.strip() if result.returncode == 0 else ""
         except Exception:
             current_ca = ""
-        # Decide whether to repoint
         repoint = False
         if current_ca:
             other_provider = self._path_belongs_to_other_provider(current_ca)
@@ -4767,7 +4617,6 @@ class FumitmPython:
             self.print_action(f"Would create Git CA bundle at {git_bundle}")
             self.print_action(f"Would run: git config --global http.sslCAInfo {git_bundle}")
             return ToolResult('git', 'skipped', 'Dry run')
-        # Build full bundle and configure
         self._safe_makedirs(os.path.dirname(git_bundle))
         self.create_bundle_with_system_certs(git_bundle)
         self._append_all_proxy_roots(git_bundle)
@@ -4776,9 +4625,9 @@ class FumitmPython:
         return ToolResult('git', 'configured', f'Set http.sslCAInfo to {git_bundle}')
 
     def _find_effective_curlrc(self):
-        """Return the config file curl would read, or None if there is none.
+        """Return the config file that curl reads, or None.
 
-        curl uses only the first file found, checking $CURL_HOME/.curlrc,
+        curl uses only the first file that it finds. It examines $CURL_HOME/.curlrc,
         then $XDG_CONFIG_HOME/curlrc, then ~/.curlrc.
         """
         candidates = []
@@ -4795,11 +4644,11 @@ class FumitmPython:
     def _parse_curlrc_cacert(self, content):
         """Return (path, in_fumitm_block) for the effective cacert directive.
 
-        curlrc entries behave like command-line options, which outrank the
-        CURL_CA_BUNDLE environment variable, and for single-value options the
-        last occurrence wins. Accepts the separators curl allows (whitespace,
-        '=' or ':'), an optional leading '--', and optional quotes around the
-        value. Returns (None, False) when no directive is present.
+        A curlrc entry operates as a command-line option, which has more authority
+        than the CURL_CA_BUNDLE variable. For an option with one value, the last
+        entry wins. This function accepts the separators that curl permits
+        (whitespace, '=', or ':'), an optional '--' at the start, and optional
+        quotes around the value. Returns (None, False) when no directive is present.
         """
         result = (None, False)
         in_block = False
@@ -4822,10 +4671,10 @@ class FumitmPython:
         return result
 
     def _effective_curlrc_cacert(self):
-        """Return (curlrc_path, cacert_path, in_fumitm_block) for curl's config.
+        """Return (curlrc_path, cacert_path, in_fumitm_block) for the curl config.
 
-        Returns (None, None, False) when no curlrc exists, it is unreadable,
-        or it contains no cacert directive.
+        Returns (None, None, False) when no curlrc is present, when it is
+        unreadable, or when it has no cacert directive.
         """
         curlrc = self._find_effective_curlrc()
         if not curlrc:
@@ -4841,14 +4690,14 @@ class FumitmPython:
         return curlrc, cacert, in_block
 
     def _set_curlrc_cacert(self, curlrc, bundle_path):
-        """Upsert a fumitm-managed cacert block at the end of curlrc.
+        """Write a managed cacert block at the end of curlrc.
 
-        Mirrors add_to_shell_config: the block is re-emitted last on every
-        write so its cacert wins by last-directive-wins over any earlier
-        vendor block (e.g. Aikido's), which is left untouched.
+        This is the same operation as add_to_shell_config. fumitm writes the block
+        last at each write, thus its cacert replaces the cacert of an earlier vendor
+        block. fumitm does not change that block.
 
         Returns:
-            bool: True when the file changed (or would change in dry-run mode).
+            bool: True when the file changed, or would change in dry-run mode.
         """
         original = None
         if os.path.exists(curlrc):
@@ -4887,19 +4736,18 @@ class FumitmPython:
         return True
 
     def _fix_curlrc_override(self, target_bundle):
-        """Handle a curlrc cacert directive that overrides CURL_CA_BUNDLE.
+        """Correct a curlrc cacert directive that replaces CURL_CA_BUNDLE.
 
-        A vendor agent (e.g. Aikido) may write a cacert directive into curlrc
-        pointing at a bundle that lacks the primary proxy CA; that directive
-        outranks the environment variable, so curl keeps failing after --fix.
-        The fix appends a fumitm-managed block whose cacert points at
-        target_bundle, kept last so it wins. If curlrc is not writable, falls
-        back to appending the proxy roots into the referenced bundle when that
-        is writable.
+        A vendor agent can write a cacert directive into curlrc that points at a
+        bundle without the primary proxy CA. That directive has more authority than
+        the variable, thus curl continues to fail after --fix. fumitm appends a
+        managed block with a cacert at target_bundle and keeps it last. If curlrc is
+        not writable, fumitm appends the proxy roots to the bundle that the
+        directive names, if that bundle is writable.
 
         Returns:
-            ToolResult when a directive was found and handled, or None when no
-            override is in play (caller continues its normal flow).
+            ToolResult when fumitm found and corrected a directive, or None when
+            there is no override. The caller then continues.
         """
         curlrc, rc_cacert, in_block = self._effective_curlrc_cacert()
         if rc_cacert is None:
@@ -4928,20 +4776,20 @@ class FumitmPython:
         return ToolResult('curl', 'already_ok', f'cacert in {curlrc} already points at {target_bundle}')
 
     def setup_curl_cert(self):
-        """Setup curl certificate configuration.
+        """Configure the certificate for curl.
 
-        Handles multiple scenarios:
-        1. curl works via system trust (SecureTransport on macOS) - skip
-        2. CURL_CA_BUNDLE points to suspicious/broken bundle - fix it
-        3. CURL_CA_BUNDLE points to non-existent file - fix it
-        4. curl fails with no CURL_CA_BUNDLE set - configure it
-        5. curlrc cacert directive overrides CURL_CA_BUNDLE - fix the curlrc
+        This method operates on five conditions:
+        1. curl operates through the system trust, such as SecureTransport on macOS.
+           fumitm makes no change.
+        2. CURL_CA_BUNDLE points at a suspicious or broken bundle.
+        3. CURL_CA_BUNDLE points at a file that is not present.
+        4. curl fails and CURL_CA_BUNDLE is not set.
+        5. A curlrc cacert directive replaces CURL_CA_BUNDLE.
         """
         if not self.command_exists('curl'):
             return ToolResult('curl', 'skipped', 'curl not found in PATH')
 
-        # First check if curl already works (e.g., via system trust store)
-        # If it works, don't add unnecessary configuration
+        # If curl already works, add no configuration.
         verify_result = self.verify_connection("curl")
         if verify_result == "WORKING":
             self.print_debug("curl already works via system trust, skipping configuration")
@@ -4950,7 +4798,7 @@ class FumitmPython:
         curl_bundle = os.path.join(self.bundle_dir, "curl/ca-bundle.pem")
         curl_env = os.environ.get('CURL_CA_BUNDLE', '')
 
-        # Case 1: CURL_CA_BUNDLE is set — check for provider mismatch first
+        # Case 1: CURL_CA_BUNDLE is set. Look for a different provider first.
         if curl_env:
             other_provider = self._path_belongs_to_other_provider(curl_env)
             if other_provider:
@@ -4977,8 +4825,9 @@ class FumitmPython:
                         self.print_action(f"Would repoint CURL_CA_BUNDLE to {curl_bundle}")
                         return ToolResult('curl', 'skipped', 'Dry run')
                 else:
-                    # Bundle looks OK but curl still fails — a curlrc cacert
-                    # directive outranks CURL_CA_BUNDLE and may be the cause
+                    # The bundle is correct but curl fails. A cacert
+                    # directive in curlrc has more authority than
+                    # CURL_CA_BUNDLE.
                     rc_result = self._fix_curlrc_override(curl_env)
                     if rc_result is not None:
                         return rc_result
@@ -4986,14 +4835,13 @@ class FumitmPython:
                     self.print_info("This may require manual investigation")
                     return ToolResult('curl', 'already_ok', 'CURL_CA_BUNDLE looks valid; may need manual investigation')
         else:
-            # Case 2: No CURL_CA_BUNDLE set and curl doesn't work
+            # Case 2: CURL_CA_BUNDLE is not set and curl does not operate.
             self.print_info("Configuring curl certificate bundle...")
             if not self.is_install_mode():
                 self.print_action(f"Would create curl CA bundle at {curl_bundle}")
                 self.print_action(f"Would set CURL_CA_BUNDLE={curl_bundle}")
                 return ToolResult('curl', 'skipped', 'Dry run')
 
-        # Create the bundle and configure
         self._safe_makedirs(os.path.dirname(curl_bundle))
         self.create_bundle_with_system_certs(curl_bundle)
         self._append_all_proxy_roots(curl_bundle)
@@ -5007,11 +4855,11 @@ class FumitmPython:
         return ToolResult('curl', 'configured', f'Set CURL_CA_BUNDLE to {curl_bundle}')
 
     def setup_aws_cert(self):
-        """Setup AWS CLI certificate configuration.
+        """Configure the certificate for the AWS CLI.
 
-        Configures AWS_CA_BUNDLE environment variable to point to a CA bundle
-        that includes the proxy's certificate. This fixes SSL errors when using
-        aws cli commands (e.g., aws configure sso, aws s3 ls).
+        Sets AWS_CA_BUNDLE at a CA bundle that contains the proxy certificate. This
+        corrects the SSL errors of a command such as `aws configure sso` or
+        `aws s3 ls`.
         """
         if not self.command_exists('aws'):
             return ToolResult('aws', 'skipped', 'aws not found in PATH')
@@ -5020,7 +4868,7 @@ class FumitmPython:
         aws_env = os.environ.get('AWS_CA_BUNDLE', '')
         verify_result = self.verify_connection("aws")
 
-        # Case 1: AWS_CA_BUNDLE is set — check for provider mismatch first
+        # Case 1: AWS_CA_BUNDLE is set. Look for a different provider first.
         if aws_env:
             other_provider = self._path_belongs_to_other_provider(aws_env)
             if other_provider:
@@ -5047,7 +4895,7 @@ class FumitmPython:
                         self.print_action(f"Would repoint AWS_CA_BUNDLE to {aws_bundle}")
                         return ToolResult('aws', 'skipped', 'Dry run')
                 elif not self._all_roots_present_in_file(aws_env, likely=True):
-                    # Bundle exists and looks OK but doesn't contain our proxy cert
+                    # The bundle is correct but has no proxy certificate.
                     self.print_info("Configuring AWS CLI certificate bundle...")
                     self.print_info(f"AWS_CA_BUNDLE bundle is missing the {self.provider['name']} proxy certificate")
                     if not self.is_install_mode():
@@ -5058,7 +4906,8 @@ class FumitmPython:
                     if verify_result == "WORKING":
                         self.print_debug("AWS CLI already works with configured bundle, skipping configuration")
                     else:
-                        # Bundle exists, looks OK, and contains our cert — unclear why it fails
+                        # The bundle is correct and has the certificate. The
+                        # cause of the failure is unknown.
                         self.print_warn("AWS CLI connection failed but AWS_CA_BUNDLE looks valid")
                         self.print_info("This may require manual investigation")
                     return ToolResult('aws', 'already_ok', 'AWS_CA_BUNDLE looks valid')
@@ -5066,14 +4915,13 @@ class FumitmPython:
             if verify_result == "WORKING":
                 self.print_debug("AWS CLI already works via system trust, skipping configuration")
                 return ToolResult('aws', 'already_ok', 'Works via system trust store')
-            # Case 2: No AWS_CA_BUNDLE set and aws doesn't work
+            # Case 2: AWS_CA_BUNDLE is not set and aws does not operate.
             self.print_info("Configuring AWS CLI certificate bundle...")
             if not self.is_install_mode():
                 self.print_action(f"Would create AWS CA bundle at {aws_bundle}")
                 self.print_action(f"Would set AWS_CA_BUNDLE={aws_bundle}")
                 return ToolResult('aws', 'skipped', 'Dry run')
 
-        # Create the bundle and configure
         self._safe_makedirs(os.path.dirname(aws_bundle))
         self.create_bundle_with_system_certs(aws_bundle)
         self._append_all_proxy_roots(aws_bundle)
@@ -5130,7 +4978,6 @@ class FumitmPython:
         """Check curl configuration status."""
         has_issues = False
         if self.command_exists('curl'):
-            # First, verify if curl can actually connect
             verify_result = self.verify_connection("curl")
 
             if verify_result == "WORKING":
@@ -5150,7 +4997,6 @@ class FumitmPython:
                             self.print_action("    Run with --fix to migrate to the current provider's bundle")
                             has_issues = True
                         elif os.path.exists(curl_bundle):
-                            # Check if the bundle is suspicious
                             suspicious, reason = self.is_suspicious_full_bundle(curl_bundle, temp_warp_cert)
                             if suspicious:
                                 self.print_warn(f"  ⚠ CURL_CA_BUNDLE looks suspiciously small ({reason})")
@@ -5161,7 +5007,6 @@ class FumitmPython:
                 except Exception:
                     pass
             else:
-                # curl doesn't work, check configuration
                 curl_bundle = os.environ.get('CURL_CA_BUNDLE', '')
                 curlrc, rc_cacert, _ = self._effective_curlrc_cacert()
                 rc_covered = (
@@ -5201,7 +5046,6 @@ class FumitmPython:
         """Check AWS CLI configuration status."""
         has_issues = False
         if self.command_exists('aws'):
-            # First, verify if aws can actually connect
             verify_result = self.verify_connection("aws")
 
             if verify_result == "WORKING":
@@ -5225,7 +5069,6 @@ class FumitmPython:
                 else:
                     self.print_info("  - Using system certificate trust (no custom CA needed)")
             else:
-                # aws doesn't work, check configuration
                 aws_bundle = os.environ.get('AWS_CA_BUNDLE', '')
                 if aws_bundle:
                     other_provider = self._path_belongs_to_other_provider(aws_bundle)
@@ -5251,10 +5094,10 @@ class FumitmPython:
         return has_issues
 
     def get_jenv_java_homes(self):
-        """Get unique Java home directories from jenv.
+        """Return the Java home directories from jenv.
 
         Returns:
-            list: List of unique physical JDK installation paths
+            list: The physical JDK installation paths.
         """
         if not self.command_exists('jenv'):
             return []
@@ -5274,13 +5117,11 @@ class FumitmPython:
             for line in result.stdout.splitlines():
                 # Look for lines with --> which indicate symlink targets
                 if '-->' in line:
-                    # Extract path after -->
                     path = line.split('-->')[1].strip()
                     if not path:
                         continue
-                    # Validate that this is actually a JDK by checking for
-                    # cacerts. The "system" entry often resolves to the CWD
-                    # or user home when no system Java is configured.
+                    # Look for cacerts to confirm a JDK. The "system" entry
+                    # often gives the working directory or the home directory.
                     cacerts = os.path.join(path, 'lib', 'security', 'cacerts')
                     jre_cacerts = os.path.join(path, 'jre', 'lib', 'security', 'cacerts')
                     if os.path.exists(cacerts) or os.path.exists(jre_cacerts):
@@ -5296,14 +5137,12 @@ class FumitmPython:
         if not self.command_exists('java') and not self.command_exists('keytool'):
             return ToolResult('java', 'skipped', 'Java/keytool not found')
 
-        # Find all Java installations
         java_homes = self.find_all_java_homes()
 
         if not java_homes:
             self.print_warn("No Java installations found")
             return ToolResult('java', 'skipped', 'No Java installations found')
 
-        # Show count if multiple installations found
         if len(java_homes) > 1:
             self.print_info(f"Found {len(java_homes)} Java installation(s)")
 
@@ -5311,7 +5150,6 @@ class FumitmPython:
         already_ok_count = 0
         failed_count = 0
 
-        # Process each Java installation
         for java_home in java_homes:
             version_name = self.java_version_label(java_home)
 
@@ -5433,11 +5271,9 @@ class FumitmPython:
         dbeaver_keytool = "/Applications/DBeaver.app/Contents/Eclipse/jre/Contents/Home/bin/keytool"
         dbeaver_cacerts = "/Applications/DBeaver.app/Contents/Eclipse/jre/Contents/Home/lib/security/cacerts"
 
-        # Check if DBeaver is installed at the default location
         if not os.path.exists(dbeaver_keytool):
             return ToolResult('dbeaver', 'skipped', 'DBeaver not installed')
 
-        # Check if the cacerts file exists
         if not os.path.exists(dbeaver_cacerts):
             self.print_error(f"DBeaver cacerts file not found at: {dbeaver_cacerts}")
             return ToolResult('dbeaver', 'failed', 'DBeaver cacerts file not found')
@@ -5455,8 +5291,8 @@ class FumitmPython:
     def _last_active_wgetrc_ca(self, content):
         """Return the path from the last active ca_certificate= line, or None.
 
-        wget honors the last directive, so the trust check must look at the final
-        non-commented ca_certificate= entry, not the first.
+        wget uses the last directive. Thus the trust check must examine the final
+        ca_certificate= entry that is not a comment, and not the first entry.
         """
         found = None
         for line in content.splitlines():
@@ -5472,8 +5308,7 @@ class FumitmPython:
         if not self.command_exists('wget'):
             return ToolResult('wget', 'skipped', 'wget not found in PATH')
 
-        # First check if wget already works (e.g., via system trust store)
-        # If it works, don't add unnecessary configuration
+        # If wget already works, add no configuration.
         verify_result = self.verify_connection("wget")
         if verify_result == "WORKING":
             self.print_debug("wget already works via system trust, skipping configuration")
@@ -5502,14 +5337,14 @@ class FumitmPython:
             self.print_action(f"Would set in {wgetrc_path}: {config_line}")
             return ToolResult('wget', 'skipped', 'Dry run')
 
-        # Build the both-roots bundle (primary + every supplemental root) so wget
-        # trusts whichever proxy intercepts the connection.
+        # Build the bundle with the primary root and each supplemental root,
+        # thus wget trusts the proxy that intercepts the connection.
         self._safe_makedirs(os.path.dirname(wget_bundle))
         self.create_bundle_with_system_certs(wget_bundle)
         self._append_all_proxy_roots(wget_bundle)
 
-        # Deterministically rewrite ~/.wgetrc: drop any active ca_certificate
-        # directives and append ours last so wget honors the both-roots bundle.
+        # Rewrite ~/.wgetrc. Remove each active ca_certificate directive and
+        # append ours last.
         kept = [
             line for line in original.splitlines()
             if not line.strip().startswith('ca_certificate=')
@@ -5558,10 +5393,10 @@ class FumitmPython:
             return False
 
     def _install_cert_via_podman_ssh(self):
-        """Install cert into Podman VM via podman machine ssh.
+        """Install the certificate into the Podman VM with podman machine ssh.
 
-        Podman VMs are Fedora-based, so uses /etc/pki/ca-trust paths.
-        Used as fallback when Docker nsenter is unavailable.
+        A Podman VM uses Fedora, thus this method uses the /etc/pki/ca-trust paths.
+        fumitm uses this method when Docker nsenter is not available.
 
         Returns:
             tuple: (success: bool, message: str)
@@ -5589,12 +5424,12 @@ class FumitmPython:
             return False, str(e)
 
     def setup_podman_cert(self):
-        """Setup Podman certificate.
+        """Configure the certificate for Podman.
 
-        Installs to ~/.docker/certs.d/ for registry trust and into the Podman
-        VM via podman machine ssh. Always uses Podman-native SSH rather than
-        Docker nsenter to avoid cross-installing into a different runtime's VM
-        when both Podman and Docker are present.
+        fumitm writes to ~/.docker/certs.d/ for registry trust, and into the Podman
+        VM with podman machine ssh. It always uses the Podman SSH and not Docker
+        nsenter. Thus it does not install into the VM of a different runtime when
+        both Podman and Docker are present.
         """
         if not self.command_exists('podman'):
             return ToolResult('podman', 'skipped', 'Podman not installed')
@@ -5669,7 +5504,7 @@ class FumitmPython:
             return False
 
     def _install_cert_via_rdctl_shell(self):
-        """Install cert into Rancher Desktop VM via rdctl shell.
+        """Install the certificate into the Rancher Desktop VM with rdctl shell.
 
         Returns:
             tuple: (success: bool, message: str)
@@ -5697,10 +5532,10 @@ class FumitmPython:
             return False, str(e)
 
     def setup_rancher_cert(self):
-        """Setup Rancher Desktop certificate.
+        """Configure the certificate for Rancher Desktop.
 
-        Installs to ~/.docker/certs.d/ for registry trust and into the VM
-        via rdctl shell (native), falling back to Docker nsenter.
+        fumitm writes to ~/.docker/certs.d/ for registry trust, and into the VM with
+        rdctl shell. If that fails, it uses Docker nsenter.
         """
         if not self.command_exists('rdctl'):
             return ToolResult('rancher', 'skipped', 'Rancher Desktop not installed')
@@ -5772,7 +5607,6 @@ class FumitmPython:
 
         self.print_info("Checking for Android Emulator setup...")
 
-        # Check if any emulator is running
         try:
             result = subprocess.run(['adb', 'devices'], capture_output=True, text=True, check=False)
             running_devices = sum(1 for line in result.stdout.splitlines() if 'emulator-' in line)
@@ -5852,7 +5686,7 @@ class FumitmPython:
             return False
 
     def _install_cert_via_colima_ssh(self):
-        """Install cert into Colima VM via colima ssh.
+        """Install the certificate into the Colima VM with colima ssh.
 
         Returns:
             tuple: (success: bool, message: str)
@@ -5880,11 +5714,11 @@ class FumitmPython:
             return False, str(e)
 
     def setup_colima_cert(self):
-        """Setup Colima certificate.
+        """Configure the certificate for Colima.
 
-        Installs to ~/.docker/certs.d/ (persistent, auto-mounted by Colima)
-        and into the VM via colima ssh (native), falling back to Docker
-        nsenter. Restarts Docker in the VM after installation.
+        fumitm writes to ~/.docker/certs.d/, which Colima mounts automatically, and
+        into the VM with colima ssh. If that fails, it uses Docker nsenter. It then
+        starts Docker in the VM again.
         """
         if not self.command_exists('colima'):
             return ToolResult('colima', 'skipped', 'Colima not installed')
@@ -5961,14 +5795,14 @@ class FumitmPython:
             return False
 
     def _find_nsenter_image(self):
-        """Find a locally cached Docker image that has nsenter.
+        """Find a local Docker image that has nsenter.
 
-        Tries common lightweight images with --pull=never to avoid network
-        requests. This prevents a bootstrap failure when the Docker daemon
-        can't pull images because the MITM CA isn't trusted yet.
+        fumitm tries the usual small images with --pull=never, thus it makes no
+        network request. A pull would fail when the Docker daemon does not yet trust
+        the MITM CA.
 
         Returns:
-            str or None: Image name if found locally, None otherwise.
+            str or None: The image name, or None.
         """
         candidates = ['alpine:latest', 'alpine', 'busybox:latest', 'busybox',
                        'debian:latest', 'ubuntu:latest']
@@ -5987,17 +5821,17 @@ class FumitmPython:
         return None
 
     def _run_nsenter(self, script, stdin_data=None, timeout=30):
-        """Run a command in the Docker VM's namespace via nsenter.
+        """Run a command in the namespace of the Docker VM with nsenter.
 
-        Finds a locally cached image first (no network pull), then falls
-        back to pulling alpine:latest as a last resort.
+        fumitm looks for a local image first and makes no network pull. If it finds
+        no image, it pulls alpine:latest.
 
         Returns:
-            subprocess.CompletedProcess or None on failure to find an image.
+            subprocess.CompletedProcess, or None when fumitm finds no image.
         """
         image = self._find_nsenter_image()
         if not image:
-            # Last resort: try pulling alpine (may fail behind MITM proxy)
+            # Pull alpine. This can fail behind a MITM proxy.
             self.print_debug("No local image found, attempting to pull alpine")
             try:
                 pull = subprocess.run(
@@ -6022,10 +5856,10 @@ class FumitmPython:
         return subprocess.run(cmd, **kwargs, check=False)
 
     def _check_cert_in_docker_vm(self):
-        """Check whether the proxy CA cert exists in the Docker VM.
+        """Find if the proxy CA certificate is in the Docker VM.
 
-        Uses nsenter via a locally cached container image to probe the VM's
-        filesystem. Checks both Debian-style and Fedora-style cert paths.
+        Uses nsenter with a local container image to examine the file system of the
+        VM. Examines the Debian paths and the Fedora paths.
         """
         try:
             for cert_name, _ in self._all_container_certs():
@@ -6041,21 +5875,19 @@ class FumitmPython:
             return False
 
     def _install_cert_in_docker_vm(self):
-        """Install the proxy CA cert into the Docker VM's OS trust store.
+        """Install the proxy CA certificate into the trust store of the Docker VM.
 
-        Uses Docker nsenter to access the VM regardless of which framework
-        (OrbStack, Colima, Docker Desktop, Lima, etc.) manages it. Detects
-        Debian-style vs Fedora-style CA paths automatically. Uses locally
-        cached images to avoid bootstrap failures when the daemon cannot
-        pull from registries.
+        Uses Docker nsenter, thus it operates with each framework: OrbStack, Colima,
+        Docker Desktop, Lima, and others. It finds the Debian paths or the Fedora
+        paths automatically. It uses a local image, thus it does not fail when the
+        daemon cannot pull from a registry.
 
         Returns:
             tuple: (success: bool, message: str)
         """
-        # Each root is written under its own filename so multiple roots
-        # (primary provider + supplemental, e.g. Aikido) all land in the VM.
-        # Debian/Alpine use .crt in /usr/local/share/ca-certificates/;
-        # Fedora/RHEL use .pem in /etc/pki/ca-trust/source/anchors/.
+        # Write each root with its own file name, thus all roots go into the
+        # VM. Debian and Alpine use .crt in /usr/local/share/ca-certificates/.
+        # Fedora and RHEL use .pem in /etc/pki/ca-trust/source/anchors/.
         try:
             for cert_name, cert_path in self._all_container_certs():
                 install_script = (
@@ -6083,9 +5915,9 @@ class FumitmPython:
             return False, str(e)
 
     def _restart_docker_in_vm(self):
-        """Restart the Docker daemon inside the VM.
+        """Start the Docker daemon in the VM again.
 
-        Detects the framework and uses the appropriate restart command.
+        fumitm finds the framework and uses the correct command.
         """
         restart_strategies = [
             (['orb', 'restart', 'docker'], 'orb'),
@@ -6121,14 +5953,15 @@ class FumitmPython:
         return False
 
     def setup_docker_cert(self):
-        """Install the proxy CA certificate for Docker (any backend).
+        """Install the proxy CA certificate for Docker with any backend.
 
-        Works with OrbStack, Colima, Docker Desktop, Lima, Rancher Desktop,
-        or any other Docker-compatible runtime. Two layers of trust:
+        This operates with OrbStack, Colima, Docker Desktop, Lima, Rancher Desktop,
+        and other Docker runtimes. There are two layers of trust:
 
-        1. Persistent cert in ~/.docker/certs.d/ for Docker registry connections.
-        2. VM-level trust via nsenter so the Docker daemon and BuildKit trust
-           the CA (covers docker pull/push and BuildKit fetch operations).
+        1. A permanent certificate in ~/.docker/certs.d/ for registry connections.
+        2. Trust in the VM through nsenter, thus the Docker daemon and BuildKit
+           trust the CA. This covers docker pull, docker push, and the fetch
+           operations of BuildKit.
         """
         if not self.command_exists('docker'):
             return ToolResult('docker', 'skipped', 'Docker not installed')
@@ -6187,12 +6020,13 @@ class FumitmPython:
             return ToolResult('docker', 'already_ok', 'Certificate already installed')
 
     def _print_docker_build_hint(self):
-        """Print required Dockerfile changes for Docker build trust.
+        """Give the necessary Dockerfile changes for trust during a build.
 
-        Docker build containers use the base image's CA store, not the host
-        VM's trust store. The proxy cert must be injected into the Dockerfile
-        for RUN commands that make HTTPS connections (pip install, npm install,
-        curl, etc.). This applies to all Docker-compatible runtimes.
+        A build container uses the CA store of the base image and not the trust
+        store of the host VM. The user must put the proxy certificate into the
+        Dockerfile for each RUN command that makes an HTTPS connection, such as a
+        pip install, an npm install, or a curl command. This applies to each Docker
+        runtime.
         """
         cert_name = f"{self.provider['container_cert_name']}.crt"
         cert_src = os.path.expanduser(f"~/.docker/certs.d/{cert_name}")
@@ -6217,7 +6051,6 @@ class FumitmPython:
 
     def verify_connection(self, tool_name):
         """Verify if a tool can connect through proxy."""
-        # Skip verification if requested or in devcontainer
         if self.skip_verify:
             self.print_debug(f"Skipping {tool_name} verification (--skip-verify flag)")
             return "SKIPPED"
@@ -6237,7 +6070,6 @@ class FumitmPython:
                 self.print_debug(f"Node.js found at: {shutil.which('node')}")
                 self.print_debug(f"NODE_EXTRA_CA_CERTS: {os.environ.get('NODE_EXTRA_CA_CERTS', 'not set')}")
                 
-                # Test SSL connection
                 node_script = f"""
 const https = require('https');
 https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {{
@@ -6285,32 +6117,27 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 result = "NOT_INSTALLED"
         
         elif tool_name == "python":
-            # Check if Python trusts the system proxy certificate
             self.print_info("Checking if Python trusts system proxy certificate...")
             
             try:
-                # Create a simple HTTPS request
                 req = urllib.request.Request(test_url, headers={'User-Agent': 'Mozilla/5.0'})
                 
-                # Try to open the URL
                 with urllib.request.urlopen(req, timeout=5) as response:
                     self.print_debug(f"Success - HTTP {response.code}")
                     result = "WORKING"
                     
-                    # Additional validation - check SSL context
                     self.print_debug(f"Python SSL default verify paths: {ssl.get_default_verify_paths()}")
                     self.print_debug("Python successfully trusts the system proxy certificate")
                     
             except urllib.error.HTTPError as e:
                 self.print_debug(f"HTTP Error {e.code} - but SSL worked")
-                # HTTP errors (like 403) are OK - we're testing SSL
+                # An HTTP error such as 403 is acceptable. This tests SSL.
                 result = "WORKING"
             except urllib.error.URLError as e:
                 self.print_debug(f"URL Error: {e.reason}")
-                # SSL errors mean the cert isn't trusted
+                # An SSL error shows that the certificate is not trusted.
                 result = "FAILED"
                 
-                # Check if REQUESTS_CA_BUNDLE or SSL_CERT_FILE would help
                 if os.environ.get('REQUESTS_CA_BUNDLE') or os.environ.get('SSL_CERT_FILE'):
                     self.print_debug("Python needs environment variables set for certificate trust")
                 else:
@@ -6334,7 +6161,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     )
                     self.print_debug(f"curl version: {version_result.stdout.splitlines()[0]}")
                     
-                    # Test connection
                     if self.is_debug_mode():
                         curl_result = subprocess.run(
                             ['curl', '-v', '-s', '-o', '/dev/null', test_url],
@@ -6354,7 +6180,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                         self.print_debug(f"curl test failed with exit code: {curl_result.returncode}")
                     
                     if self.is_debug_mode() and curl_result.stderr:
-                        # Show relevant SSL info
                         for line in curl_result.stderr.splitlines():
                             if any(keyword in line for keyword in ['SSL', 'certificate', 'TLS']):
                                 self.print_debug(f"curl: {line}")
@@ -6389,7 +6214,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                         self.print_debug(f"wget test failed with exit code: {wget_result.returncode}")
                     
                     if self.is_debug_mode() and wget_result.stderr:
-                        # Show relevant SSL info
                         for line in wget_result.stderr.splitlines():
                             if any(keyword in line for keyword in ['SSL', 'certificate', 'CA']):
                                 self.print_debug(f"wget: {line}")
@@ -6404,10 +6228,9 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 self.print_debug(f"aws found at: {shutil.which('aws')}")
 
                 try:
-                    # Use --no-sign-request to force an actual HTTPS call without
-                    # needing credentials. Without it, aws may fail with "Unable to
-                    # locate credentials" before making any network call, masking
-                    # SSL issues.
+                    # --no-sign-request makes an HTTPS call with no
+                    # credentials. Without it, aws can stop before the network
+                    # call and hide an SSL problem.
                     aws_result = subprocess.run(
                         ['aws', '--no-sign-request', 'sts', 'get-caller-identity'],
                         capture_output=True, text=True, timeout=15, check=False
@@ -6418,8 +6241,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                         result = "FAILED"
                         self.print_debug(f"AWS SSL error: {aws_result.stderr}")
                     else:
-                        # Any response (success, not configured, access denied)
-                        # means TLS connectivity is working
+                        # Any response shows that TLS works.
                         result = "WORKING"
                         if aws_result.returncode == 0:
                             self.print_debug("AWS API call succeeded")
@@ -6440,23 +6262,19 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 self.print_debug(f"gcloud found at: {shutil.which('gcloud')}")
 
                 try:
-                    # Use 'gcloud projects list --limit=1' which makes a real HTTPS call
-                    # to GCP APIs. This verifies TLS connectivity even if the user lacks
-                    # permissions or isn't authenticated - we just need the SSL handshake
-                    # to succeed.
+                    # 'gcloud projects list --limit=1' makes an HTTPS call to
+                    # the GCP APIs. Only the SSL handshake must succeed.
                     gcloud_result = subprocess.run(
                         ['gcloud', 'projects', 'list', '--limit=1'],
                         capture_output=True, text=True, timeout=15, check=False
                     )
 
-                    # Check for SSL-specific errors in stderr
                     stderr_lower = gcloud_result.stderr.lower()
                     if 'ssl' in stderr_lower or 'certificate' in stderr_lower:
                         result = "FAILED"
                         self.print_debug(f"gcloud SSL error: {gcloud_result.stderr}")
                     else:
-                        # Any response (success, permission denied, not authenticated)
-                        # means TLS connectivity is working
+                        # Any response shows that TLS works.
                         result = "WORKING"
                         if gcloud_result.returncode == 0:
                             self.print_debug("gcloud API call succeeded")
@@ -6590,7 +6408,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 self.print_warn("  ✗ NODE_EXTRA_CA_CERTS not configured")
                 has_issues = True
             
-            # Check npm
             if self.command_exists('npm'):
                 try:
                     result = subprocess.run(['npm', 'config', 'get', 'cafile'], capture_output=True, text=True, check=False)
@@ -6622,7 +6439,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 except Exception:
                     pass
 
-            # Check yarn for stale cafile config
             if self.command_exists('yarn'):
                 try:
                     result = subprocess.run(['yarn', '--version'], capture_output=True, text=True, check=False)
@@ -6659,7 +6475,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 except Exception:
                     pass
 
-            # Check pnpm for stale cafile config
             if self.command_exists('pnpm'):
                 try:
                     result = subprocess.run(['pnpm', 'config', 'get', 'cafile'],
@@ -6698,17 +6513,15 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         """Check Python configuration status."""
         has_issues = False
         if self.command_exists('python3') or self.command_exists('python'):
-            # First check if Python trusts the system certificate
             python_verify_result = self.verify_connection("python")
             
             if python_verify_result == "WORKING":
                 self.print_info("  ✓ Python trusts the system proxy certificate")
                 self.print_info("  ✓ Python can connect through proxy without additional configuration")
-                # verify_connection() exercises Python's default trust (which
-                # honors REQUESTS_CA_BUNDLE), but rustls clients such as uv read
-                # SSL_CERT_FILE instead. A managed SSL_CERT_FILE that is missing
-                # a required root (e.g. the Aikido supplemental root) leaves uv
-                # broken even though Python itself works, so flag it explicitly.
+                # verify_connection() uses the default trust of Python, which
+                # reads REQUESTS_CA_BUNDLE. A rustls client such as uv reads
+                # SSL_CERT_FILE. A managed SSL_CERT_FILE without a necessary
+                # root leaves uv broken while Python works. Report it.
                 ssl_cert_file = os.environ.get('SSL_CERT_FILE', '')
                 if (ssl_cert_file and os.path.exists(ssl_cert_file)
                         and not self._status_roots_present(temp_warp_cert, ssl_cert_file)):
@@ -6720,7 +6533,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     )
                     has_issues = True
             else:
-                # Python doesn't trust system cert, check environment variables
                 python_configured = False
                 
                 requests_ca_bundle = os.environ.get('REQUESTS_CA_BUNDLE', '')
@@ -6741,7 +6553,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     else:
                         self.print_warn(f"  ✗ REQUESTS_CA_BUNDLE points to non-existent file: {requests_ca_bundle}")
 
-                # Also check SSL_CERT_FILE if set
                 ssl_cert_file = os.environ.get('SSL_CERT_FILE', '')
                 if ssl_cert_file:
                     self.print_info(f"  SSL_CERT_FILE is set to: {ssl_cert_file}")
@@ -6770,16 +6581,14 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         """Check gcloud configuration status."""
         has_issues = False
         if self.command_exists('gcloud'):
-            # First, verify if gcloud can actually connect
             verify_result = self.verify_connection("gcloud")
 
             if verify_result == "WORKING":
                 self.print_info("  ✓ gcloud can connect through proxy")
 
-                # core/custom_ca_certs_file is required for the IAP tunnel
-                # WebSocket path even when basic HTTPS already works through the
-                # system trust store, so we report a missing/stale value as an
-                # issue rather than informational.
+                # The IAP tunnel WebSocket path needs
+                # core/custom_ca_certs_file, also when HTTPS already works.
+                # Thus a missing or old value is an issue.
                 try:
                     result = subprocess.run(
                         ['gcloud', 'config', 'get-value', 'core/custom_ca_certs_file'],
@@ -6803,7 +6612,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     self.print_warn("  ✗ Failed to check gcloud configuration")
                     has_issues = True
             elif verify_result == "SKIPPED":
-                # Can't verify, fall back to config check
+                # Verification is not possible. Examine the configuration.
                 try:
                     result = subprocess.run(
                         ['gcloud', 'config', 'get-value', 'core/custom_ca_certs_file'],
@@ -6828,7 +6637,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     self.print_warn("  ✗ Failed to check gcloud configuration")
                     has_issues = True
             else:
-                # gcloud can't connect - check if custom CA would help
                 self.print_warn("  ✗ gcloud connection test failed")
                 try:
                     result = subprocess.run(
@@ -6863,18 +6671,15 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             self.print_info("  - Java not installed (would configure if present)")
             return has_issues
 
-        # Find all Java installations
         java_homes = self.find_all_java_homes()
 
         if not java_homes:
             self.print_warn("  ✗ No Java installations found")
             return True
 
-        # Show count if multiple installations
         if len(java_homes) > 1:
             self.print_info(f"  Checking {len(java_homes)} Java installation(s):")
 
-        # Check each installation
         for java_home in java_homes:
             version_name = self.java_version_label(java_home)
 
@@ -6884,7 +6689,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 has_issues = True
                 continue
 
-            # Check if cert exists in keystore
             try:
                 result = subprocess.run(
                     ['keytool', '-list', '-alias', self.provider['keytool_alias'],
@@ -6925,7 +6729,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 has_issues = True
                 continue
 
-            # Check if certificate exists
             try:
                 result = subprocess.run(
                     ['keytool', '-list', '-alias', self.provider['keytool_alias'],
@@ -7009,7 +6812,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         """Check wget configuration status."""
         has_issues = False
         if self.command_exists('wget'):
-            # First, verify if wget can actually connect
             verify_result = self.verify_connection("wget")
 
             wgetrc_path = os.path.expanduser("~/.wgetrc")
@@ -7029,7 +6831,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 else:
                     self.print_info("  - Using system certificate trust (no custom CA needed)")
             else:
-                # wget doesn't work, check configuration
                 if has_all_roots:
                     self.print_warn("  ✗ wget configured but connection test failed")
                 else:
@@ -7040,9 +6841,9 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         return has_issues
 
     def check_podman_status(self, temp_warp_cert):
-        """Check Podman configuration status.
+        """Report the status of the Podman configuration.
 
-        Checks both the persistent ~/.docker/certs.d/ location and the running VM.
+        Examines the permanent ~/.docker/certs.d/ location and the VM.
         """
         has_issues = False
         if self.command_exists('podman'):
@@ -7060,11 +6861,9 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 self.print_warn("  ✗ Certificate not installed in ~/.docker/certs.d/")
                 has_issues = True
 
-            # Check VM status if running
             try:
                 result = subprocess.run(['podman', 'machine', 'list'], capture_output=True, text=True, check=False)
                 if 'Currently running' in result.stdout:
-                    # VM is running - also check certificate in VM
                     result = subprocess.run(
                         ['podman', 'machine', 'ssh', f'test -f /etc/pki/ca-trust/source/anchors/{self.provider["container_cert_name"]}.pem'],
                         capture_output=True, check=False
@@ -7082,9 +6881,9 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         return has_issues
 
     def check_rancher_status(self, temp_warp_cert):
-        """Check Rancher Desktop configuration status.
+        """Report the status of the Rancher Desktop configuration.
 
-        Checks both the persistent ~/.docker/certs.d/ location and the running VM.
+        Examines the permanent ~/.docker/certs.d/ location and the VM.
         """
         has_issues = False
         if self.command_exists('rdctl'):
@@ -7102,7 +6901,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 self.print_warn("  ✗ Certificate not installed in ~/.docker/certs.d/")
                 has_issues = True
 
-            # Check VM status if running
             try:
                 version_result = subprocess.run(['rdctl', 'version'], capture_output=True, text=True, check=False)
                 if version_result.returncode == 0:
@@ -7119,10 +6917,10 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         return has_issues
 
     def check_docker_status(self, temp_warp_cert):
-        """Check Docker configuration status (any backend).
+        """Report the status of the Docker configuration with any backend.
 
-        Checks the persistent ~/.docker/certs.d/ location and, when Docker
-        is running, probes the VM's CA store via nsenter.
+        Examines the permanent ~/.docker/certs.d/ location. When Docker operates, it
+        also examines the CA store of the VM with nsenter.
         """
         has_issues = False
         if self.command_exists('docker'):
@@ -7172,9 +6970,9 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         return has_issues
 
     def check_colima_status(self, temp_warp_cert):
-        """Check Colima configuration status.
+        """Report the status of the Colima configuration.
 
-        Checks both the persistent ~/.docker/certs.d/ location and the running VM.
+        Examines the permanent ~/.docker/certs.d/ location and the VM.
         """
         has_issues = False
         if self.command_exists('colima'):
@@ -7192,7 +6990,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 self.print_warn("  ✗ Certificate not installed in ~/.docker/certs.d/")
                 has_issues = True
 
-            # Check VM status if running
             try:
                 status_result = subprocess.run(['colima', 'status'], capture_output=True, check=False)
                 if status_result.returncode == 0:
@@ -7209,10 +7006,11 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         return has_issues
 
     def _get_status_cert(self):
-        """Retrieve the current provider certificate for status comparisons.
+        """Get the current provider certificate for a status comparison.
 
         Returns:
-            str or None: Path to a temp file containing the cert, or None on failure.
+            str or None: The path of a temporary file with the certificate, or None
+            on a failure.
         """
         provider_name = self.provider['name']
 
@@ -7255,10 +7053,10 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         return None
 
     def _check_provider_connection(self):
-        """Check whether the MITM proxy is connected/running.
+        """Find if the MITM proxy operates.
 
         Returns:
-            bool: True if issues were detected.
+            bool: True if fumitm found a problem.
         """
         provider_name = self.provider['name']
         short = self.provider['short_name']
@@ -7322,7 +7120,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         self.print_info("=" * (len(f"Checking {provider_name} Certificate Status")))
         print()
 
-        # Retrieve the current certificate for comparison
         temp_warp_cert = self._get_status_cert()
         if not temp_warp_cert:
             return False
@@ -7331,20 +7128,17 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         self.cert_fingerprint = self.get_cert_fingerprint(temp_warp_cert)
         self.print_debug(f"{short} certificate fingerprint: {self.cert_fingerprint}")
 
-        # Materialize supplemental roots so per-tool status checks can verify
-        # each managed bundle contains them alongside the primary cert.
+        # Materialize the supplemental roots, thus each status check can look
+        # for them in the managed bundles.
         self._prepare_extra_roots()
         self._announce_extra_roots()
 
-        # Check provider connection
         if self._check_provider_connection():
             has_issues = True
         print()
         
-        # Check certificate status
         self.print_status("Certificate Status:")
         
-        # Check if proxy certificate is valid
         try:
             result = subprocess.run(
                 ['openssl', 'x509', '-noout', '-checkend', '86400', '-in', temp_warp_cert],
@@ -7353,11 +7147,9 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             if result.returncode == 0:
                 self.print_info(f"  ✓ {short} certificate is valid")
                 
-                # Check where the certificate is currently stored
                 cert_locations = []
                 cert_found = False
                 
-                # Check common locations
                 if os.path.exists(self.cert_path):
                     with open(self.cert_path, 'r') as f:
                         existing_cert = f.read()
@@ -7367,21 +7159,18 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                         cert_locations.append(f"    - {self.cert_path}")
                         cert_found = True
                 
-                # Check NODE_EXTRA_CA_CERTS
                 node_extra_ca_certs = os.environ.get('NODE_EXTRA_CA_CERTS', '')
                 if (node_extra_ca_certs and os.path.exists(node_extra_ca_certs)
                         and self.certificate_exists_in_file(temp_warp_cert, node_extra_ca_certs)):
                     cert_locations.append(f"    - {node_extra_ca_certs} (NODE_EXTRA_CA_CERTS)")
                     cert_found = True
                 
-                # Check REQUESTS_CA_BUNDLE
                 requests_ca_bundle = os.environ.get('REQUESTS_CA_BUNDLE', '')
                 if (requests_ca_bundle and os.path.exists(requests_ca_bundle)
                         and self.certificate_exists_in_file(temp_warp_cert, requests_ca_bundle)):
                     cert_locations.append(f"    - {requests_ca_bundle} (REQUESTS_CA_BUNDLE)")
                     cert_found = True
                 
-                # Check SSL_CERT_FILE
                 ssl_cert_file = os.environ.get('SSL_CERT_FILE', '')
                 if (ssl_cert_file and os.path.exists(ssl_cert_file)
                         and self.certificate_exists_in_file(temp_warp_cert, ssl_cert_file)):
@@ -7404,13 +7193,11 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             has_issues = True
         print()
         
-        # Display selected tools info if filtering
         if self.selected_tools:
             selected_tools_info = self.get_selected_tools_info()
             self.print_info(f"Selected tools: {', '.join(selected_tools_info)}")
             print()
         
-        # Check each tool
         for tool_key, tool_info in self.tools_registry.items():
             if not self.should_process_tool(tool_key):
                 continue
@@ -7446,7 +7233,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 else:
                     self.print_info("  - No container runtimes detected")
             print()
-        # Show information about additional tools if not filtering
         if not self.selected_tools:
             self.print_status("Additional Tools (not yet automated):")
             self.print_info("  - RubyGems/Bundler: May work with SSL_CERT_FILE environment variable")
@@ -7465,21 +7251,20 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             self.print_info(f"✓ All configured tools are properly set up for {provider_name}")
         print()
         
-        # Cleanup
         if temp_warp_cert:
             os.unlink(temp_warp_cert)
     
     def _run_setup(self, tool_key, func):
-        """Run a setup function and infer its result.
+        """Run a setup function and find its result.
 
-        Uses an error-counting side-channel: print_error() increments
-        _setup_error_count during execution. This lets us detect failures
-        without changing setup function signatures.
+        fumitm counts the errors: print_error() increments _setup_error_count during
+        the run. Thus fumitm finds a failure and the signature of the setup function
+        does not change.
 
-        Status accuracy before individual ToolResult retrofit:
-        - 'failed' is reliable (print_error was called or exception raised)
-        - 'completed' means "ran without errors" (could be changed or already_ok)
-        - 'configured' and 'already_ok' require explicit ToolResult returns
+        The accuracy of the status before each function returns a ToolResult:
+        - 'failed' is reliable. print_error ran, or an exception occurred.
+        - 'completed' means "ran with no error". The change is unknown.
+        - 'configured' and 'already_ok' need an explicit ToolResult.
         """
         self._in_setup_context = True
         self._setup_error_count = 0
@@ -7503,11 +7288,11 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
 
     @staticmethod
     def _compute_changes_made(results):
-        """Determine changes_made from a list of ToolResult values.
+        """Find changes_made from a list of ToolResult values.
 
-        Returns True if any tool returned 'configured', False if all returned
-        'already_ok' or 'skipped' (or results are empty), or None if only
-        legacy 'completed' statuses exist (change status unknown).
+        Returns True if a tool gave 'configured'. Returns False if each tool gave
+        'already_ok' or 'skipped', or if the list is empty. Returns None if only the
+        old 'completed' status is present, because the change is then unknown.
         """
         if not results:
             return False
@@ -7605,15 +7390,14 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         return exit_code
 
     def _shell_reload_command(self):
-        """The exact command that activates fumitm's exports in the current shell.
+        """Return the command that activates the exports in the current shell.
 
-        POSIX shells source the small generated env file, never a whole rc
-        file: re-running .zshrc/.bashrc repeats unrelated agents, hooks,
-        aliases and PATH mutations that are not idempotent. Returns None for
-        shells with no safe one-liner — including fish, which cannot source
-        the POSIX env file and whose config.fish would repeat the same
-        non-idempotent startup work; fish users get the new-session fallback
-        until a dedicated fish env file exists.
+        A POSIX shell sources the small env file and never a full rc file. A second
+        run of .zshrc or .bashrc repeats agents, hooks, aliases, and PATH changes
+        that are not idempotent. Returns None for a shell with no safe command. This
+        includes fish, which cannot source the POSIX env file and whose config.fish
+        would repeat the same startup work. A fish user must start a new session
+        until a fish env file is available.
         """
         shell_type = self.detect_shell()
         if self._uses_env_file(shell_type):
@@ -7621,26 +7405,24 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         return None
 
     def _shell_env_file(self):
-        """Absolute path of the generated env file when it exists, else None.
+        """Return the absolute path of the env file, or None if it is absent.
 
-        Reported in FUMITM_RESULT for automation wrappers: a root Jamf
-        process using --run-as-user writes the target user's env file, but
-        shell_reload_command is $HOME-relative and would resolve against the
-        wrapper's own $HOME (/var/root). This path is absolute and already
-        resolved against the target user's corrected home directory.
+        fumitm reports this path in FUMITM_RESULT for an automation wrapper. A root
+        Jamf process with --run-as-user writes the env file of the target user, but
+        shell_reload_command is relative to HOME and would resolve against the HOME
+        of the wrapper (/var/root). This path is absolute and resolves against the
+        corrected home directory of the target user.
 
-        Deliberately independent of shell_modified: on a converged rerun
-        nothing on disk changes, but a freshly started wrapper process has
-        not inherited the environment and still needs this path for its
-        dependent children.
+        This value is independent of shell_modified. On a converged run nothing on
+        disk changes, but a new wrapper process did not inherit the environment and
+        still needs this path for its children.
 
-        Trust boundary: the file is owned and writable by the target user
-        (fumitm chowns it back after writing). A privileged wrapper must
-        never source it — that evaluates user-controlled shell code as
-        root. It should instead drop privileges and let the dependent
-        child source the file as the target user (e.g. via sudo -u). Only
-        the deterministic path is reported, never the file's contents,
-        precisely so nothing privileged is tempted to trust them.
+        Trust boundary: the target user owns the file and can write it. fumitm
+        corrects the ownership after each write. Thus a privileged wrapper must
+        never source it, because that runs user-controlled shell code as root. The
+        wrapper must drop privileges and let the child source the file as the target
+        user, for example with sudo -u. fumitm reports only the path and never the
+        content of the file.
         """
         if not self._uses_env_file(self.detect_shell()):
             return None
@@ -7648,15 +7430,14 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         return path if os.path.exists(path) else None
 
     def _print_shell_reload_notice(self):
-        """Final, unmissable instruction to activate exports in this shell.
+        """Give the final instruction to activate the exports in this shell.
 
-        A child process cannot modify its parent shell's environment, so after
-        a --fix the invoking terminal still carries the old variables until the
-        user sources the env file (or the chained README command does it for
-        them). Printed last so it is not buried under later informational
-        output. Suppressed in headless mode: a root Jamf/MDM policy log has no
-        interactive shell for the instruction to act on; automation reads the
-        shell_reload_* fields in FUMITM_RESULT instead.
+        A child process cannot change the environment of its parent shell. Thus
+        after a --fix the terminal keeps the old variables until the user sources
+        the env file. The command in the README does this also. fumitm writes this
+        notice last, thus later output does not hide it. In headless mode fumitm
+        does not write it: a root Jamf policy log has no interactive shell.
+        Automation reads the shell_reload_* fields in FUMITM_RESULT.
         """
         if not self.shell_modified or self.headless:
             return
@@ -7717,7 +7498,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             if not self.skip_update_check:
                 self.check_for_updates()
 
-            # Auto-detect devcontainer and adjust behavior
             if self.is_devcontainer():
                 if not self.skip_verify:
                     self.skip_verify = True
@@ -7729,13 +7509,11 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 self.print_info("   Network verification tests will be skipped")
                 print()
 
-            # Check for broken CA environment variables early
             self.check_environment_sanity()
 
             # Check for root-owned files that would cause PermissionError
             self.check_ownership_sanity()
 
-            # Validate selected tools
             if self.selected_tools:
                 invalid_tools = self.validate_selected_tools()
                 if invalid_tools:
@@ -7760,8 +7538,8 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     self.print_error("Failed to download certificate. Exiting.")
                     return 1
 
-                # Materialize any supplemental roots (e.g. Aikido) so every tool
-                # fixer can append them alongside the primary provider cert.
+                # Materialize the supplemental roots, thus each tool fixer can
+                # append them with the primary provider certificate.
                 self._prepare_extra_roots()
                 self._announce_extra_roots()
 
@@ -7889,7 +7667,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Handle --version first
     if args.version:
         print(f"fumitm {__version__}")
         version_info = VERSION_INFO
@@ -7900,7 +7677,6 @@ def main():
                 print("  (with local modifications)")
         sys.exit(0)
 
-    # Resolve headless from flag or environment variable
     headless = args.headless or os.environ.get('FUMITM_HEADLESS') == '1'
     if headless:
         args.no_color = True
@@ -7909,11 +7685,9 @@ def main():
     # Respect NO_COLOR environment variable (https://no-color.org/)
     no_color = args.no_color or os.environ.get('NO_COLOR') is not None
 
-    # Validate --run-as-user requires root
     if args.run_as_user and os.getuid() != 0:
         parser.error('--run-as-user requires root privileges')
 
-    # Handle --list-tools
     if args.list_tools:
         temp_fumitm = FumitmPython(no_color=no_color)
         print("Available tools:")
@@ -7923,7 +7697,6 @@ def main():
         print("\nExamples: ./fumitm.py --fix --tools node,python  or  ./fumitm.py --fix --tools node-npm --tools gcp")
         sys.exit(0)
 
-    # Process --tools argument
     selected_tools = []
     if args.tools:
         for tool_arg in args.tools:

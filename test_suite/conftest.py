@@ -1,7 +1,6 @@
-"""
-Pytest configuration for fumitm integration tests.
+"""Pytest configuration for the fumitm tests.
 
-This module provides shared fixtures and configuration for all tests.
+This module gives the shared fixtures and the configuration for each test.
 """
 import sys
 from pathlib import Path
@@ -18,12 +17,12 @@ from helpers import MockBuilder, create_temp_cert_file
 
 @pytest.fixture(autouse=True)
 def isolate_home(tmp_path_factory, monkeypatch):
-    """Point $HOME at a throwaway directory for every test.
+    """Point HOME at a temporary directory for each test.
 
-    fumitm resolves shell startup files and its managed env file from ~, so a
-    test that only passes a tmp_path config would otherwise still write to the
-    developer's real dotfiles. Tests that need a specific HOME override this by
-    calling monkeypatch.setenv afterwards (e.g. the mock_home_dir fixture).
+    fumitm resolves the shell startup files and its env file from ~. Thus a test
+    that gives only a tmp_path config would write to the real dotfiles of the
+    developer. A test that needs a different HOME calls monkeypatch.setenv after
+    this fixture. The mock_home_dir fixture does this.
     """
     home = tmp_path_factory.mktemp("home")
     monkeypatch.setenv("HOME", str(home))

@@ -1,9 +1,8 @@
-"""
-Tests for headless/MDM deployment features (issue #50).
+"""Tests for the headless and MDM operations (issue #50).
 
-Covers color control, log files, JSON-lines logging, --headless flag,
-NonInteractiveError, --run-as-user, ToolResult wrapper, changes_made
-accuracy, exit codes, and orchestrator environment simulations.
+These tests cover the control of color, the log files, the JSON-lines log, the
+--headless flag, NonInteractiveError, --run-as-user, the ToolResult wrapper, the
+accuracy of changes_made, the exit codes, and the orchestrator conditions.
 """
 import json
 import os
@@ -996,10 +995,13 @@ class TestShellReloadNotice(FumitmTestCase):
         assert data['shell_env_file'] is None
 
     def test_result_json_env_file_is_absolute_target_path(self, capsys):
-        """shell_env_file must be usable by an automation wrapper whose own
-        $HOME differs from the target user's (root Jamf + --run-as-user):
-        absolute and resolved against the corrected home, unlike the
-        $HOME-relative shell_reload_command."""
+        """shell_env_file must be usable by an automation wrapper.
+
+        The HOME of the wrapper can be different from the HOME of the target user,
+        for example a root Jamf process with --run-as-user. Thus the path must be
+        absolute and must resolve against the corrected home directory. The
+        shell_reload_command is relative to HOME.
+        """
         instance = self.create_fumitm_instance()
         instance.shell_modified = True
         self._create_env_file(instance)
@@ -1012,10 +1014,12 @@ class TestShellReloadNotice(FumitmTestCase):
         assert data['shell_env_file'].endswith('.config/fumitm/env.sh')
 
     def test_result_json_env_file_reported_on_converged_rerun(self, capsys):
-        """A converged rerun changes nothing on disk, but a freshly started
-        wrapper process has not inherited the environment: shell_env_file
-        must still point at the existing env file while
-        shell_reload_required stays false."""
+        """A converged run changes nothing on disk.
+
+        But a new wrapper process did not inherit the environment. Thus
+        shell_env_file must give the path of the env file, and
+        shell_reload_required must stay false.
+        """
         instance = self.create_fumitm_instance()
         self._create_env_file(instance)
         with patch.object(instance, 'detect_shell', return_value='zsh'):
@@ -1123,11 +1127,13 @@ class TestReadmeActivationBlock(FumitmTestCase):
     @pytest.mark.parametrize('status', [0, 1, 3])
     def test_block_survives_interactive_errexit(
             self, isolate_home, shell, status):
-        """An interactive shell with set -e must survive the block whatever
-        fumitm's exit status. A bare failing `(exit N)` is a top-level
-        command, so errexit would terminate the session instead of
-        returning to the prompt; the `case $- in *i*)` guard skips status
-        restoration in interactive shells."""
+        """An interactive shell with set -e must continue after the block.
+
+        This applies at each exit status of fumitm. A `(exit N)` that fails is a
+        top-level command, thus errexit would end the session and not return to the
+        prompt. The `case $- in *i*)` guard does not restore the status in an
+        interactive shell.
+        """
         if shutil.which(shell) is None:
             pytest.skip(f'{shell} not installed')
         script = ('set -e\n'
@@ -1146,8 +1152,8 @@ class TestReadmeActivationBlock(FumitmTestCase):
     @pytest.mark.parametrize('shell', ['bash', 'zsh'])
     def test_block_pasted_into_pty_returns_prompt(self, isolate_home, shell):
         """The primary README use case: paste the block into an
-        already-running interactive shell on a real terminal — with
-        errexit enabled and fumitm failing — and get the prompt back."""
+        already-running interactive shell on a real terminal, with errexit
+        enabled and fumitm failing, and get the prompt back."""
         pty = pytest.importorskip('pty')
         if shutil.which(shell) is None:
             pytest.skip(f'{shell} not installed')
@@ -1215,12 +1221,14 @@ class TestShellEnvFileTrustBoundary(FumitmTestCase):
         assert 'drop privileges' in doc
 
     def test_privilege_drop_example_executes(self, tmp_path):
-        """Run the documented privilege-drop pattern verbatim (minus sudo)
-        and assert the child actually receives the environment. The
-        wrapper's $env_file variable is not visible inside the
-        single-quoted `sh -c` body, so the example must deliver the path
-        as a positional argument; an example that references $env_file
-        inside the quotes fails before launching the child."""
+        """Run the documented privilege-drop example and confirm that it operates.
+
+        The example runs without sudo. The child must receive the environment. The
+        $env_file variable of the wrapper is not visible in the `sh -c` body, which
+        has single quotes. Thus the example must give the path as a positional
+        argument. An example that names $env_file in the quotes fails before the
+        child starts.
+        """
         doc = (Path(__file__).resolve().parent.parent
                / 'README-automation.md').read_text()
         match = re.search(r'^\s*sudo -u "\$target_user" (sh -c .*)$',

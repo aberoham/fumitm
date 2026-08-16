@@ -1,8 +1,7 @@
-"""
-Tests for detecting suspiciously small CA bundles.
+"""Tests for the detection of a CA bundle that is too small.
 
-These tests focus on the helper heuristics introduced to catch cases where
-users accidentally point full-bundle env vars at a single WARP CA cert.
+These tests examine the checks that find a full-bundle variable which points at
+one WARP CA certificate.
 """
 
 from unittest.mock import ANY, patch
@@ -170,12 +169,11 @@ class TestSuspiciousBundles(FumitmTestCase):
             assert has_issues is True
 
     def test_npm_repoint_even_when_node_extra_ca_certs_already_has_cert(self):
-        """Regression test for issue #37: npm cafile fix should run even when
-        NODE_EXTRA_CA_CERTS already contains the WARP certificate.
+        """The npm cafile correction must run when NODE_EXTRA_CA_CERTS has the root.
 
-        Previously, setup_node_cert() would early-return when the certificate
-        was already in NODE_EXTRA_CA_CERTS, skipping the call to setup_npm_cafile().
-        This left npm with a suspicious single-cert bundle.
+        This covers issue #37. setup_node_cert() returned early when the certificate
+        was in NODE_EXTRA_CA_CERTS. It did not call setup_npm_cafile(), thus npm
+        kept a suspicious bundle with one certificate.
         """
         node_extra_ca = f"{mock_data.HOME_DIR}/.cloudflare-warp/cloudflare-warp.pem"
         npm_current = node_extra_ca  # npm cafile points to same small file

@@ -1,8 +1,7 @@
-"""
-Integration tests for fumitm.py
+"""Integration tests for fumitm.py.
 
-These tests verify the core workflows and functionality of the fumitm script
-by mocking external dependencies and testing realistic scenarios.
+These tests examine the main operations of the script. They mock the external
+dependencies and give realistic conditions.
 """
 import os
 import subprocess
@@ -13,8 +12,6 @@ from unittest.mock import MagicMock, call, mock_open, patch
 
 import mock_data
 import pytest
-
-# Import test utilities
 from helpers import (
     FumitmTestCase,
     MockBuilder,
@@ -22,7 +19,6 @@ from helpers import (
     mock_fumitm_environment,
 )
 
-# Import the fumitm module
 import fumitm
 
 
@@ -63,7 +59,6 @@ class TestCertificateManagement(FumitmTestCase):
         
         with mock_fumitm_environment(mock_config) as mocks:
             instance = self.create_fumitm_instance()
-            # Trigger certificate validation through status check
             instance.check_all_status()
             
             # The actual command uses x509 -checkend, not just verify
@@ -82,7 +77,6 @@ class TestCertificateManagement(FumitmTestCase):
             instance = self.create_fumitm_instance()
             instance.check_all_status()
             
-            # Should check existing certificate validity
             assert mocks['exists'].called
 
 
@@ -101,7 +95,6 @@ class TestToolSetup(FumitmTestCase):
             .with_tool(tool)
             .build())
         
-        # Add appropriate responses for each tool
         for _ in check_commands:
             mock_config['subprocess_side_effect'].append(MagicMock(returncode=0, stdout=""))
         
@@ -146,7 +139,6 @@ class TestToolSetup(FumitmTestCase):
             instance = self.create_fumitm_instance(mode='status')
             instance.setup_python_cert()
             
-            # Python should have been checked
             assert mocks['which'].called
             assert any(call('python3') in mocks['which'].call_args_list for call in [call])
 
@@ -164,7 +156,6 @@ class TestBrewCacerts(FumitmTestCase):
             instance = self.create_fumitm_instance(mode='install')
             # brew is not in which_mapping, so command_exists returns False
             instance.setup_brew_cacerts()
-            # No error, just silently returns
 
     def test_setup_skips_when_formula_not_installed(self):
         """setup_brew_cacerts returns early when ca-certificates is not installed."""
@@ -316,7 +307,6 @@ class TestBrewCacerts(FumitmTestCase):
             )
             .build())
 
-        # Bundle does not exist
         mock_config['exists_side_effect'] = lambda p: {
             f"{mock_data.HOME_DIR}/.cloudflare-ca.pem": True,
         }.get(str(p), False)
@@ -341,16 +331,13 @@ class TestBrewCacerts(FumitmTestCase):
             .with_subprocess_response(returncode=0)  # brew postinstall
             .build())
 
-        # Bundle does not exist before postinstall
         mock_config['exists_side_effect'] = lambda p: {
             f"{mock_data.HOME_DIR}/.cloudflare-ca.pem": True,
         }.get(str(p), False)
 
         with mock_fumitm_environment(mock_config):
             instance = self.create_fumitm_instance(mode='install')
-            # cert_exists_in_file returns False since bundle doesn't exist
             instance.setup_brew_cacerts()
-            # Should have warned (no assertion error means it ran through)
 
     def test_get_brew_prefix_fallback_on_failure(self):
         """_get_brew_prefix falls back to default when brew --prefix fails."""
@@ -462,17 +449,14 @@ class TestJavaMultiInstallation(FumitmTestCase):
              patch('os.listdir', return_value=[]), \
              patch('subprocess.run') as mock_run:
 
-            # Mock /usr/libexec/java_home exists
             def exists_side_effect(path):
                 if path == '/usr/libexec/java_home':
                     return True
-                # Mock cacerts files exist for all Java homes
                 return 'lib/security/cacerts' in path
 
             mock_exists.side_effect = exists_side_effect
             mock_isfile.side_effect = lambda path: 'lib/security/cacerts' in path
 
-            # Mock java_home -V output
             mock_result = MagicMock()
             mock_result.stdout = java_home_output
             mock_run.return_value = mock_result
@@ -495,12 +479,10 @@ class TestJavaMultiInstallation(FumitmTestCase):
              patch('os.listdir') as mock_listdir, \
              patch('subprocess.run') as mock_run:
 
-            # Mock java_home -V returns empty
             mock_result = MagicMock()
             mock_result.stdout = ""
             mock_run.return_value = mock_result
 
-            # Mock directory listings
             def listdir_side_effect(path):
                 if 'JavaVirtualMachines' in path:
                     return ['temurin-21.jdk', 'temurin-17.jdk', 'not-a-jdk']
@@ -511,7 +493,6 @@ class TestJavaMultiInstallation(FumitmTestCase):
             instance = fumitm.FumitmPython(mode='status')
             java_homes = instance.find_all_java_homes()
 
-            # Should find the .jdk directories
             assert any('temurin-21' in home for home in java_homes)
             assert any('temurin-17' in home for home in java_homes)
 
@@ -528,7 +509,6 @@ class TestJavaMultiInstallation(FumitmTestCase):
              patch('os.path.isdir', return_value=True), \
              patch('subprocess.run') as mock_run:
 
-            # Mock update-alternatives output
             mock_result = MagicMock()
             mock_result.returncode = 0
             mock_result.stdout = alternatives_output
@@ -597,9 +577,7 @@ class TestJavaMultiInstallation(FumitmTestCase):
 
                 has_issues = instance.check_java_status('/fake/cert.pem')
 
-                # Should report issues because second installation is missing cert
                 assert has_issues is True
-                # Should have checked both installations
                 assert mock_run.call_count == len(fake_java_homes)
 
     def test_find_all_java_homes_validates_cacerts(self):
@@ -609,20 +587,17 @@ class TestJavaMultiInstallation(FumitmTestCase):
              patch('os.path.isdir', return_value=True), \
              patch('subprocess.run') as mock_run:
 
-            # Mock java_home returns empty
             mock_result = MagicMock()
             mock_result.stdout = ""
             mock_run.return_value = mock_result
 
             instance = fumitm.FumitmPython(mode='status')
 
-            # Mock find_java_home to return a path but find_java_cacerts returns empty
             with patch.object(instance, 'find_java_home', return_value='/fake/java'), \
                  patch.object(instance, 'find_java_cacerts', return_value=''):
 
                 java_homes = instance.find_all_java_homes()
 
-                # Should return empty because cacerts validation fails
                 assert len(java_homes) == 0
 
     def test_find_all_java_homes_includes_sdkman_installations(self):
@@ -710,13 +685,13 @@ class TestJavaMultiInstallation(FumitmTestCase):
         assert java_homes == []
 
     def test_find_all_java_homes_sdkman_macos_bundle_layout(self):
-        """find_all_java_homes handles vendors that ship a .jdk bundle under the version dir.
+        """find_all_java_homes accepts a vendor that gives a .jdk bundle.
 
-        Some SDKMAN distributions (e.g. Azul Zulu on macOS) are extracted as:
+        Some SDKMAN distributions, such as Azul Zulu on macOS, extract to:
             ~/.sdkman/candidates/java/11.0.18-zulu/zulu-11.jdk/Contents/Home
-        rather than the flat layout:
+        Other distributions use the flat form:
             ~/.sdkman/candidates/java/21.0.2-tem/
-        Both must be discovered and produce a valid Java home.
+        fumitm must find both and give a valid Java home for each.
         """
         sdkman_java_dir = os.path.expanduser('~/.sdkman/candidates/java')
         version_dir = os.path.join(sdkman_java_dir, '11.0.18-zulu')
@@ -898,14 +873,10 @@ class TestCLIAndWorkflow(FumitmTestCase):
         
         with mock_fumitm_environment(mock_config) as mocks:
             instance = self.create_fumitm_instance()
-            # Run the complete status check
             instance.check_all_status()
             
-            # Should have checked for various tools
             assert mocks['which'].called
-            # Check that npm config was queried
             assert_subprocess_called_with(mocks['subprocess'], ['npm', 'config', 'get'])
-            # Check that keytool was found
             assert any(call('keytool') in mocks['which'].call_args_list for call in [call])
 
 
@@ -924,7 +895,6 @@ class TestToolSelection(FumitmTestCase):
         """Test selecting tools by their tags."""
         instance = self.create_fumitm_instance(selected_tools=['nodejs', 'pip'])
         
-        # Should match by tag
         assert instance.should_process_tool('node') is True  # 'nodejs' tag
         assert instance.should_process_tool('python') is True  # 'pip' tag
         assert instance.should_process_tool('java') is False
@@ -1005,12 +975,9 @@ class TestErrorScenarios(FumitmTestCase):
         
         with mock_fumitm_environment(mock_config) as mocks:
             instance = self.create_fumitm_instance(mode='status')
-            # Run status check - should handle missing tools gracefully
             instance.check_all_status()
             
-            # Should have tried to check for various tools
             assert mocks['which'].called
-            # Should have completed without errors despite missing tools
             assert True  # If we get here, no exceptions were raised
 
 
@@ -1075,22 +1042,21 @@ class TestPlatformSpecific(FumitmTestCase):
         with patch('platform.system', return_value=platform):
             fumitm.FumitmPython(mode='status')
 
-            # Check that instance is aware of platform
             # This would need actual implementation testing
             assert True  # Placeholder for actual platform-specific tests
 
 
 class TestStatusFunctionContracts(FumitmTestCase):
-    """Contract tests for all check_*_status() functions.
+    """Contract tests for each check_*_status() function.
 
-    These tests verify that all status check functions return a boolean value,
-    preventing bugs like issue #20 where a function forgot to return has_issues.
+    These tests confirm that each status function gives a boolean value. Issue
+    #20 occurred because a function did not return has_issues.
     """
 
     def get_all_status_methods(self, instance):
-        """Discover all check_*_status methods via introspection.
+        """Find each check_*_status method by introspection.
 
-        Excludes check_all_status() which is the orchestrator method.
+        This does not include check_all_status(), which controls the other methods.
         """
         return [
             name for name in dir(instance)
@@ -1100,13 +1066,11 @@ class TestStatusFunctionContracts(FumitmTestCase):
         ]
 
     def test_all_status_functions_return_boolean(self, tmp_path):
-        """Ensure all check_*_status() functions return a boolean (not None).
+        """Confirm that each check_*_status() function gives a boolean and not None.
 
-        Regression test for issue #20 - prevents forgetting return statements.
-        This test automatically discovers all check_*_status methods and verifies
-        each returns a proper boolean value.
+        This covers issue #20. The test finds each check_*_status method and
+        confirms that it gives a boolean value.
         """
-        # Create a temporary cert file for the status checks
         cert_file = tmp_path / "test-cert.pem"
         cert_file.write_text(mock_data.MOCK_CERTIFICATE)
 
@@ -1115,10 +1079,8 @@ class TestStatusFunctionContracts(FumitmTestCase):
 
         status_methods = self.get_all_status_methods(instance)
 
-        # Verify we found the expected methods (sanity check)
         assert len(status_methods) >= 12, f"Expected at least 12 status methods, found {len(status_methods)}: {status_methods}"
 
-        # Expected methods based on the codebase
         expected_methods = [
             'check_brew_cacerts_status',
             'check_git_status', 'check_node_status', 'check_python_status',
@@ -1130,7 +1092,6 @@ class TestStatusFunctionContracts(FumitmTestCase):
         for expected in expected_methods:
             assert expected in status_methods, f"Expected method {expected} not found"
 
-        # Test each status method
         failed_methods = []
         for method_name in status_methods:
             method = getattr(instance, method_name)
@@ -1164,7 +1125,6 @@ class TestStatusFunctionContracts(FumitmTestCase):
         for method_name in status_methods:
             method = getattr(instance, method_name)
 
-            # Mock tool as not installed
             with patch.object(instance, 'command_exists', return_value=False), \
                  patch.object(instance, 'get_jenv_java_homes', return_value=[]), \
                  patch.object(instance, 'find_all_java_homes', return_value=[]), \
@@ -1173,14 +1133,13 @@ class TestStatusFunctionContracts(FumitmTestCase):
 
                 result = method(str(cert_file))
 
-                # When tool is not installed, there should be no issues to report
                 assert result is False, f"{method_name} should return False when tool not installed, got {result}"
 
     def test_check_jenv_status_returns_boolean_with_java_homes(self, tmp_path):
-        """Verify check_jenv_status returns boolean when jenv has Java installations.
+        """Confirm that check_jenv_status gives a boolean when jenv has Java homes.
 
-        Regression test for issue #20 - the bug only manifests when jenv has
-        Java homes because empty java_homes triggers an early return.
+        This covers issue #20. The defect occurs only when jenv has a Java home,
+        because an empty list causes an early return.
         """
         cert_file = tmp_path / "test-cert.pem"
         cert_file.write_text(mock_data.MOCK_CERTIFICATE)
@@ -1212,7 +1171,6 @@ class TestBundleCreation(FumitmTestCase):
 
     def test_creates_bundle_from_macos_system_certs(self, tmp_path):
         """Test bundle creation when /etc/ssl/cert.pem exists (macOS)."""
-        # Create a mock system cert file
         mock_system_cert = tmp_path / "system-cert.pem"
         mock_system_cert.write_text(mock_data.SAMPLE_CA_BUNDLE)
 
@@ -1221,14 +1179,12 @@ class TestBundleCreation(FumitmTestCase):
         with patch('platform.system', return_value='Darwin'):
             instance = fumitm.FumitmPython(mode='install')
 
-            # Mock os.path.exists to simulate macOS system cert location
             with patch('os.path.exists') as mock_exists:
                 mock_exists.side_effect = lambda p: p == "/etc/ssl/cert.pem" or p == str(target_bundle.parent)
 
                 with patch('shutil.copy') as mock_copy:
                     result = instance.create_bundle_with_system_certs(str(target_bundle))
 
-                    # Should have copied from macOS location
                     mock_copy.assert_called_once_with("/etc/ssl/cert.pem", str(target_bundle))
                     assert result is True
 
@@ -1239,14 +1195,12 @@ class TestBundleCreation(FumitmTestCase):
         with patch('platform.system', return_value='Linux'):
             instance = fumitm.FumitmPython(mode='install')
 
-            # Mock os.path.exists: macOS path doesn't exist, Linux path does
             with patch('os.path.exists') as mock_exists:
                 mock_exists.side_effect = lambda p: p == "/etc/ssl/certs/ca-certificates.crt"
 
                 with patch('shutil.copy') as mock_copy:
                     result = instance.create_bundle_with_system_certs(str(target_bundle))
 
-                    # Should have copied from Linux location
                     mock_copy.assert_called_once_with("/etc/ssl/certs/ca-certificates.crt", str(target_bundle))
                     assert result is True
 
@@ -1257,14 +1211,13 @@ class TestBundleCreation(FumitmTestCase):
         with patch('platform.system', return_value='Darwin'):
             instance = fumitm.FumitmPython(mode='install')
 
-            # Mock os.path.exists: neither system cert location exists.
-            # The assertions run outside this patch because Python 3.13's
-            # pathlib.Path.exists() delegates to os.path.exists(), so a global
-            # patch would otherwise mask the file the method actually created.
+            # Neither system certificate location is present. The assertions are
+            # outside this patch. pathlib.Path.exists() calls os.path.exists() in
+            # Python 3.13, thus a global patch would hide the file that the method
+            # made.
             with patch('os.path.exists', return_value=False):
                 result = instance.create_bundle_with_system_certs(str(target_bundle))
 
-            # Should create empty file and return False
             assert result is False
             assert target_bundle.exists()
             assert target_bundle.read_text() == ""
@@ -1276,13 +1229,11 @@ class TestBundleCreation(FumitmTestCase):
         with patch('platform.system', return_value='Darwin'):
             instance = fumitm.FumitmPython(mode='install')
 
-            # Test True case (system certs exist)
             with patch('os.path.exists', side_effect=lambda p: p == "/etc/ssl/cert.pem"), \
                     patch('shutil.copy'):
                 result = instance.create_bundle_with_system_certs(str(target_bundle))
                 assert result is True
 
-            # Test False case (no system certs)
             with patch('os.path.exists', return_value=False):
                 result = instance.create_bundle_with_system_certs(str(target_bundle))
                 assert result is False
@@ -1292,129 +1243,104 @@ class TestCertificateAppending(FumitmTestCase):
     """Tests for certificate appending to ensure proper PEM formatting (issue #13)."""
 
     def test_append_to_bundle_without_trailing_newline(self, tmp_path):
-        """Ensure appending to a bundle without newline doesn't corrupt PEM.
+        """Confirm that an append to a bundle with no final newline keeps the PEM valid.
 
-        This tests the fix for issue #13 where appending to a file without
-        a trailing newline would produce malformed PEM like:
+        This covers issue #13. An append to such a file gave a malformed PEM:
         -----END CERTIFICATE----------BEGIN CERTIFICATE-----
         """
-        # Create a CA bundle file WITHOUT trailing newline
         bundle_file = tmp_path / "ca-bundle.pem"
         bundle_file.write_text(mock_data.SAMPLE_CA_BUNDLE_NO_NEWLINE)
 
-        # Create a certificate file to append
         cert_file = tmp_path / "cert.pem"
         cert_file.write_text(mock_data.MOCK_CERTIFICATE)
 
-        # Create instance and call safe_append_certificate
         with patch('platform.system', return_value='Darwin'):
             instance = fumitm.FumitmPython(mode='install')
             result = instance.safe_append_certificate(str(cert_file), str(bundle_file))
 
         assert result is True
 
-        # Read the resulting file
         content = bundle_file.read_text()
 
-        # Verify that -----END CERTIFICATE----- is followed by newline, not -----BEGIN
-        # This pattern should NOT appear in a valid PEM file
+        # A newline must come after -----END CERTIFICATE-----, and not -----BEGIN.
+        # A valid PEM file does not have that pattern.
         assert "-----END CERTIFICATE----------BEGIN CERTIFICATE-----" not in content
 
-        # Verify proper separation exists
         assert "-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----" in content or \
                "-----END CERTIFICATE-----\n\n-----BEGIN CERTIFICATE-----" in content
 
     def test_append_to_bundle_with_trailing_newline(self, tmp_path):
         """Verify normal case still works - bundle with trailing newline."""
-        # Create a CA bundle file WITH trailing newline
         bundle_file = tmp_path / "ca-bundle.pem"
         bundle_file.write_text(mock_data.SAMPLE_CA_BUNDLE)  # Has trailing newline
 
-        # Create a certificate file to append
         cert_file = tmp_path / "cert.pem"
         cert_file.write_text(mock_data.MOCK_CERTIFICATE)
 
-        # Create instance and call safe_append_certificate
         with patch('platform.system', return_value='Darwin'):
             instance = fumitm.FumitmPython(mode='install')
             result = instance.safe_append_certificate(str(cert_file), str(bundle_file))
 
         assert result is True
 
-        # Read the resulting file
         content = bundle_file.read_text()
 
-        # Verify that the malformed pattern doesn't exist
         assert "-----END CERTIFICATE----------BEGIN CERTIFICATE-----" not in content
 
     def test_append_ensures_certificate_ends_with_newline(self, tmp_path):
         """Ensure appended certificate itself ends with newline."""
-        # Create an empty bundle file
         bundle_file = tmp_path / "ca-bundle.pem"
         bundle_file.write_text("")
 
-        # Create a certificate file WITHOUT trailing newline
         cert_file = tmp_path / "cert.pem"
         cert_file.write_text(mock_data.MOCK_CERTIFICATE_NO_NEWLINE)
 
-        # Create instance and call safe_append_certificate
         with patch('platform.system', return_value='Darwin'):
             instance = fumitm.FumitmPython(mode='install')
             result = instance.safe_append_certificate(str(cert_file), str(bundle_file))
 
         assert result is True
 
-        # Read the resulting file
         content = bundle_file.read_text()
 
-        # Verify the file ends with a newline
         assert content.endswith('\n')
 
     def test_append_skips_if_certificate_already_exists(self, tmp_path):
         """Verify that appending skips if certificate already exists in bundle."""
-        # Create a bundle that already contains the certificate
         bundle_file = tmp_path / "ca-bundle.pem"
         bundle_file.write_text(mock_data.MOCK_CERTIFICATE)
 
-        # Use the same certificate file
         cert_file = tmp_path / "cert.pem"
         cert_file.write_text(mock_data.MOCK_CERTIFICATE)
 
         original_size = bundle_file.stat().st_size
 
-        # Create instance and mock certificate_exists_in_file to return True
-        # (since mock certificates don't work with openssl fingerprint check)
+        # certificate_exists_in_file gives True. openssl cannot make a
+        # fingerprint of a mock certificate.
         with patch('platform.system', return_value='Darwin'):
             instance = fumitm.FumitmPython(mode='install')
             with patch.object(instance, 'certificate_exists_in_file', return_value=True):
                 result = instance.safe_append_certificate(str(cert_file), str(bundle_file))
 
-        # Should return True (success, even though skipped)
         assert result is True
 
-        # File size should be the same (nothing appended)
         assert bundle_file.stat().st_size == original_size
 
     def test_append_to_nonexistent_target_creates_file(self, tmp_path):
         """Verify appending to a non-existent file creates it with the certificate."""
-        # Target file doesn't exist
         bundle_file = tmp_path / "new-bundle.pem"
 
-        # Create a certificate file
         cert_file = tmp_path / "cert.pem"
         cert_file.write_text(mock_data.MOCK_CERTIFICATE)
 
-        # Create instance and call safe_append_certificate
         with patch('platform.system', return_value='Darwin'):
             instance = fumitm.FumitmPython(mode='install')
             result = instance.safe_append_certificate(str(cert_file), str(bundle_file))
 
         assert result is True
 
-        # File should now exist
         assert bundle_file.exists()
 
-        # Content should be the certificate
         content = bundle_file.read_text()
         assert "-----BEGIN CERTIFICATE-----" in content
         assert "-----END CERTIFICATE-----" in content
@@ -1424,27 +1350,24 @@ class TestCodeQuality:
     """Static analysis tests to catch unsafe patterns in the codebase."""
 
     def test_no_unsafe_certificate_appends_in_fumitm(self):
-        """Ensure fumitm.py uses safe_append_certificate() for all certificate appends.
+        """Confirm that fumitm.py uses safe_append_certificate() for each append.
 
-        Regression test for issue #21 - prevents adding new unsafe certificate
-        appends that could produce malformed PEM files.
-
-        Unsafe patterns detected:
-        - Direct file opens with 'a' mode for certificate/bundle files
-        - Writing certificate content without using safe_append_certificate()
+        This covers issue #21 and prevents a new append that can give a malformed
+        PEM file. The test finds two patterns:
+        - An open in append mode for a certificate file or a bundle file.
+        - A write of certificate content without safe_append_certificate().
         """
         import os
         import re
 
-        # Read the source file
         test_dir = os.path.dirname(os.path.abspath(__file__))
         fumitm_path = os.path.join(os.path.dirname(test_dir), "fumitm.py")
 
         with open(fumitm_path, 'r') as f:
             source = f.read()
 
-        # Pattern 1: Direct append mode opens for bundle/cert files
-        # This catches: with open(some_bundle, 'a') as f:
+        # Pattern 1: an open in append mode for a bundle file or a certificate
+        # file. This finds: with open(some_bundle, 'a') as f:
         unsafe_append_pattern = re.compile(
             r"with\s+open\s*\([^)]*(?:bundle|cert|ca)[^)]*['\"]a['\"]\s*\)\s*as",
             re.IGNORECASE
@@ -1457,8 +1380,8 @@ class TestCodeQuality:
             f"Use self.safe_append_certificate(cert_path, target_path) instead"
         )
 
-        # Pattern 2: Direct f.write() of certificate content to append
-        # This catches patterns like: f.write(cf.read()) where cf is a cert file
+        # Pattern 2: an f.write() of certificate content. This finds a pattern
+        # such as f.write(cf.read()), where cf is a certificate file.
         unsafe_write_pattern = re.compile(
             r"f\.write\s*\(\s*(?:cf|cert_file|CERT).*\.read\s*\(\s*\)\s*\)"
         )
@@ -1471,38 +1394,35 @@ class TestCodeQuality:
         )
 
     def test_no_unsafe_certificate_appends_in_fumitm_windows(self):
-        """Ensure fumitm_windows.py uses append_certificate_if_missing() for all appends.
+        """Confirm that fumitm_windows.py uses append_certificate_if_missing().
 
-        Same as test_no_unsafe_certificate_appends_in_fumitm but for Windows port.
+        This is the same test as test_no_unsafe_certificate_appends_in_fumitm, for
+        the Windows port.
         """
         import os
         import re
 
-        # Read the source file
         test_dir = os.path.dirname(os.path.abspath(__file__))
         fumitm_windows_path = os.path.join(os.path.dirname(test_dir), "fumitm_windows.py")
 
         with open(fumitm_windows_path, 'r') as f:
             source = f.read()
 
-        # Pattern 1: Direct append mode opens for bundle/cert files
-        # Exclude the append_certificate_if_missing implementation itself
+        # Pattern 1: an open in append mode for a bundle file or a certificate
+        # file. Do not include append_certificate_if_missing.
         lines = source.split('\n')
         in_append_method = False
         unsafe_lines = []
 
         for i, line in enumerate(lines, 1):
-            # Track when we're inside append_certificate_if_missing
             if 'def append_certificate_if_missing' in line:
                 in_append_method = True
             elif in_append_method and line.strip().startswith('def '):
                 in_append_method = False
 
-            # Skip the implementation of the safe method
             if in_append_method:
                 continue
 
-            # Check for unsafe patterns
             if (re.search(r"with\s+open\s*\([^)]*['\"]a['\"]\s*\)", line, re.IGNORECASE)
                     and ('bundle' in line.lower() or 'cert' in line.lower() or 'ca' in line.lower())):
                 unsafe_lines.append(f"Line {i}: {line.strip()}")
@@ -1514,10 +1434,9 @@ class TestCodeQuality:
         )
 
     def test_no_unused_globals_in_fumitm(self):
-        """Ensure no unused global variables exist in fumitm.py.
+        """Confirm that fumitm.py has no unused global variable.
 
-        Regression test to prevent unused globals like SHELL_MODIFIED and
-        CERT_FINGERPRINT from being introduced (or reintroduced).
+        This prevents an unused global such as SHELL_MODIFIED or CERT_FINGERPRINT.
         """
         import os
         import re
@@ -1528,28 +1447,25 @@ class TestCodeQuality:
         with open(fumitm_path, 'r') as f:
             source = f.read()
 
-        # Find module-level UPPER_CASE variable assignments (globals)
-        # Pattern: line starts with UPPER_CASE_NAME = (not inside class/function)
+        # Find the module-level UPPER_CASE assignments. The line starts with
+        # UPPER_CASE_NAME = and is not in a class or a function.
         global_pattern = re.compile(r'^([A-Z][A-Z0-9_]*)\s*=', re.MULTILINE)
 
-        # CERT_PATH is kept as a public constant for backward compatibility
-        # but is no longer used internally (replaced by self.cert_path).
+        # CERT_PATH stays as a public constant for compatibility. fumitm does not
+        # use it. self.cert_path replaced it.
         known_unused = {'CERT_PATH'}
 
         globals_found = set()
         for match in global_pattern.finditer(source):
             name = match.group(1)
-            # Skip dunder variables (like __version__)
             if name.startswith('__'):
                 continue
             globals_found.add(name)
 
-        # Check each global is used somewhere else in the code
         unused_globals = []
         for name in globals_found:
             if name in known_unused:
                 continue
-            # Count occurrences - should be more than 1 if used after definition
             pattern = re.compile(r'\b' + re.escape(name) + r'\b')
             matches = pattern.findall(source)
             if len(matches) <= 1:
@@ -1561,9 +1477,10 @@ class TestCodeQuality:
         )
 
     def test_no_unused_globals_in_fumitm_windows(self):
-        """Ensure no unused global variables exist in fumitm_windows.py.
+        """Confirm that fumitm_windows.py has no unused global variable.
 
-        Same check as test_no_unused_globals_in_fumitm but for Windows port.
+        This is the same test as test_no_unused_globals_in_fumitm, for the Windows
+        port.
         """
         import os
         import re
@@ -1574,11 +1491,10 @@ class TestCodeQuality:
         with open(fumitm_windows_path, 'r') as f:
             source = f.read()
 
-        # Known unused globals pending Windows refactoring
-        # See WINDOWS_REFACTORING_NOTES.md for cleanup plan
+        # Unused globals that the Windows work must remove. See
+        # WINDOWS_REFACTORING_NOTES.md.
         known_unused = {'ALT_CERT_NAMES', 'SHELL_MODIFIED', 'CERT_FINGERPRINT'}
 
-        # Find module-level UPPER_CASE variable assignments (globals)
         global_pattern = re.compile(r'^([A-Z][A-Z0-9_]*)\s*=', re.MULTILINE)
 
         globals_found = set()
@@ -1588,10 +1504,8 @@ class TestCodeQuality:
                 continue
             globals_found.add(name)
 
-        # Check each global is used somewhere else in the code
         unused_globals = []
         for name in globals_found:
-            # Skip known unused globals (tracked for future cleanup)
             if name in known_unused:
                 continue
             pattern = re.compile(r'\b' + re.escape(name) + r'\b')
@@ -1605,11 +1519,10 @@ class TestCodeQuality:
         )
 
     def test_consistent_setup_messaging_in_fumitm(self):
-        """Ensure setup functions use consistent messaging patterns.
+        """Confirm that each setup function uses the same message.
 
-        All setup functions should use "Configuring <tool> certificate..."
-        instead of the inconsistent "Setting up <tool> certificate..." pattern.
-        This ensures a consistent user experience across all tools.
+        Each setup function must use "Configuring <tool> certificate..." and not
+        "Setting up <tool> certificate...".
         """
         import os
         import re
@@ -1620,7 +1533,6 @@ class TestCodeQuality:
         with open(fumitm_path, 'r') as f:
             source = f.read()
 
-        # Find "Setting up" patterns which should be "Configuring"
         setting_up_pattern = re.compile(r'Setting up.*certificate', re.IGNORECASE)
 
         matches = setting_up_pattern.findall(source)
@@ -1631,12 +1543,10 @@ class TestCodeQuality:
         )
 
     def test_no_bare_except_clauses_in_fumitm(self):
-        """Ensure no bare 'except:' clauses exist in fumitm.py.
+        """Confirm that fumitm.py has no bare 'except:' clause.
 
-        Bare except clauses catch all exceptions including SystemExit and
-        KeyboardInterrupt, which is rarely what's intended. They should be
-        replaced with specific exception types like 'except Exception:' or
-        more specific exceptions.
+        A bare except catches each exception, and this includes SystemExit and
+        KeyboardInterrupt. Use 'except Exception:' or a more specific type.
         """
         import os
         import re
@@ -1647,7 +1557,6 @@ class TestCodeQuality:
         with open(fumitm_path, 'r') as f:
             lines = f.readlines()
 
-        # Find bare except clauses (except: without an exception type)
         bare_excepts = []
         for i, line in enumerate(lines, 1):
             # Match 'except:' but not 'except SomeException:' or 'except (A, B):'
@@ -1661,16 +1570,16 @@ class TestCodeQuality:
         )
 
     def test_no_raw_cert_comparisons_in_fumitm(self):
-        """Ensure setup functions use certificate_exists_in_file() not raw string comparison.
+        """Confirm that a setup function calls certificate_exists_in_file().
 
-        Regression test for issue #35 - Status checks use certificate_exists_in_file()
-        which does normalized base64 comparison, but setup functions were using raw
-        string comparison like 'cert_content in file_content'. This caused --fix to
-        silently skip tools that status correctly identified as needing fixes.
+        This covers issue #35. A status check calls certificate_exists_in_file(),
+        which compares normalized base64. But a setup function used a raw string
+        comparison such as 'cert_content in file_content'. Thus --fix did not
+        correct a tool that status reported as incorrect.
 
-        All certificate existence checks in setup functions should use:
+        Each check for a certificate must use:
         - self.certificate_exists_in_file(CERT_PATH, target_file)
-        Not:
+        It must not use:
         - cert_content in file_content
         - cert_content not in file_content
         """
@@ -1683,12 +1592,10 @@ class TestCodeQuality:
         with open(fumitm_path, 'r') as f:
             source = f.read()
 
-        # Find raw certificate content comparisons in setup functions
-        # These patterns indicate raw string comparison instead of certificate_exists_in_file()
+        # Find a raw comparison of certificate content in a setup function. Such a
+        # function must call certificate_exists_in_file().
         unsafe_patterns = [
-            # Pattern: cert_content in file_content or similar
             (r'cert_content\s+(?:not\s+)?in\s+file_content', 'cert_content in/not in file_content'),
-            # Pattern: file_content containing cert check
             (r'file_content.*cert_content|cert_content.*file_content', 'raw content comparison'),
         ]
 
@@ -1708,12 +1615,11 @@ class TestCodeQuality:
         )
 
     def test_no_raw_makedirs_in_setup_functions(self):
-        """Ensure setup functions use _safe_makedirs() instead of raw os.makedirs().
+        """Confirm that a setup function calls _safe_makedirs() and not os.makedirs().
 
-        Running ``os.makedirs()`` under sudo creates root-owned directories in
-        the user's home directory. All setup functions must use the ownership-
-        correcting ``_safe_makedirs()`` wrapper instead. The only permitted raw
-        call is inside ``_safe_makedirs`` itself.
+        Under sudo, ``os.makedirs()`` makes a directory in the home directory of the
+        user that belongs to root. Each setup function must call ``_safe_makedirs()``,
+        which corrects the ownership. Only ``_safe_makedirs`` can call os.makedirs.
         """
         import os
         import re
@@ -1724,8 +1630,8 @@ class TestCodeQuality:
         with open(fumitm_path, 'r') as f:
             lines = f.readlines()
 
-        # Methods that legitimately use raw os.makedirs (log dirs are system
-        # paths like /var/log/fumitm that should stay root-owned)
+        # Methods that can call os.makedirs directly. A log directory such as
+        # /var/log/fumitm is a system path and must stay with root.
         allowed_methods = {'_safe_makedirs', '_open_log_files'}
         in_allowed = False
         violations = []
@@ -1733,7 +1639,6 @@ class TestCodeQuality:
         for i, line in enumerate(lines, 1):
             stripped = line.strip()
 
-            # Track when we're inside an allowed method
             if any(f'def {m}' in line for m in allowed_methods):
                 in_allowed = True
             elif in_allowed and re.match(r'^\s{4}def ', line):
@@ -1845,13 +1750,12 @@ class TestOwnershipProtection(FumitmTestCase):
         cert = tmp_path / "cert.pem"
         cert.touch()
 
-        # Build a stat wrapper that only overrides st_uid for the target file
-        # while preserving all other stat fields (st_mode, etc.)
+        # A stat wrapper that changes st_uid for the target file only. Each other
+        # field, such as st_mode, does not change.
         original_stat = os.stat
         def mock_stat(path, *args, **kwargs):
             result = original_stat(path, *args, **kwargs)
             if str(path) == str(cert):
-                # Return a copy with st_uid patched to 0 (root)
                 return os.stat_result((
                     result.st_mode, result.st_ino, result.st_dev, result.st_nlink,
                     0,  # st_uid = root
@@ -1871,28 +1775,26 @@ class TestOwnershipProtection(FumitmTestCase):
         instance.cert_path = str(tmp_path / "cert.pem")
         instance.bundle_dir = str(tmp_path / "bundle")
 
-        # No files exist — nothing to flag
+        # No file is present. There is nothing to report.
         with patch('os.getuid', return_value=1000):
             result = instance.check_ownership_sanity()
             assert result is False
 
 
 class TestPerformance(FumitmTestCase):
-    """Tests for performance and subprocess call limits.
+    """Tests for performance and the number of subprocess calls.
 
-    These tests ensure that certificate checking operations don't spawn
-    excessive subprocess calls, which was identified as a performance issue.
-    The goal is to use pure Python string matching instead of openssl calls
-    for duplicate detection.
+    These tests confirm that a certificate check does not make many subprocess
+    calls. The code must use pure-Python string matching and not openssl to find
+    a duplicate.
     """
 
     def test_certificate_likely_exists_uses_no_subprocess(self, tmp_path):
-        """Verify certificate_likely_exists_in_file uses zero subprocess calls.
+        """Confirm that certificate_likely_exists_in_file makes no subprocess call.
 
-        This is a regression test to ensure the fast path stays fast.
-        The function should use pure Python string matching, not openssl.
+        The function must use pure-Python string matching and not openssl, thus it
+        stays fast.
         """
-        # Create test certificate files
         cert_file = tmp_path / "cert.pem"
         cert_file.write_text(mock_data.MOCK_CERTIFICATE)
 
@@ -1902,16 +1804,13 @@ class TestPerformance(FumitmTestCase):
         with patch('platform.system', return_value='Darwin'):
             instance = fumitm.FumitmPython(mode='status')
 
-        # Count subprocess calls
         with patch('subprocess.run') as mock_subprocess:
             result = instance.certificate_likely_exists_in_file(
                 str(cert_file), str(bundle_file)
             )
 
-            # Should find the certificate
             assert result is True
 
-            # Should NOT call subprocess at all - pure Python only
             assert mock_subprocess.call_count == 0, (
                 f"certificate_likely_exists_in_file called subprocess {mock_subprocess.call_count} times. "
                 f"Expected 0 calls (pure Python string matching)."
@@ -1922,7 +1821,6 @@ class TestPerformance(FumitmTestCase):
         cert_file = tmp_path / "cert.pem"
         cert_file.write_text(mock_data.MOCK_CERTIFICATE)
 
-        # Bundle that doesn't contain the certificate
         bundle_file = tmp_path / "bundle.pem"
         bundle_file.write_text(mock_data.SAMPLE_CA_BUNDLE)
 
@@ -1934,25 +1832,22 @@ class TestPerformance(FumitmTestCase):
                 str(cert_file), str(bundle_file)
             )
 
-            # Should NOT find the certificate
             assert result is False
 
-            # Should NOT call subprocess at all
             assert mock_subprocess.call_count == 0, (
                 f"certificate_likely_exists_in_file called subprocess {mock_subprocess.call_count} times "
                 f"even when certificate not found. Expected 0 calls."
             )
 
     def test_safe_append_uses_fast_check(self, tmp_path):
-        """Verify safe_append_certificate uses fast check, not fingerprint comparison.
+        """Confirm that safe_append_certificate uses the fast check.
 
-        Even in install mode, duplicate detection should use fast string matching
-        rather than spawning openssl for each certificate in the bundle.
+        Also in install mode, the search for a duplicate must use string matching. It
+        must not start openssl for each certificate in the bundle.
         """
         cert_file = tmp_path / "cert.pem"
         cert_file.write_text(mock_data.MOCK_CERTIFICATE)
 
-        # Bundle that already contains the certificate
         bundle_file = tmp_path / "bundle.pem"
         bundle_file.write_text(mock_data.SAMPLE_CA_BUNDLE + mock_data.MOCK_CERTIFICATE)
 
@@ -1960,15 +1855,14 @@ class TestPerformance(FumitmTestCase):
             instance = fumitm.FumitmPython(mode='install')
 
         with patch('subprocess.run') as mock_subprocess:
-            # This should detect the certificate already exists and skip
             result = instance.safe_append_certificate(
                 str(cert_file), str(bundle_file)
             )
 
             assert result is True
 
-            # Should use minimal subprocess calls (ideally 0 for duplicate detection)
-            # Allow some slack for now, but the key is NOT O(n) calls where n=certs in bundle
+            # The number of subprocess calls must be small. It must not increase with
+            # the number of certificates in the bundle.
             assert mock_subprocess.call_count <= 1, (
                 f"safe_append_certificate made {mock_subprocess.call_count} subprocess calls. "
                 f"Expected at most 1 (for initial validation). "
@@ -1976,19 +1870,18 @@ class TestPerformance(FumitmTestCase):
             )
 
     def test_no_subprocess_explosion_for_large_bundles(self, tmp_path):
-        """Ensure subprocess calls don't scale with bundle size.
+        """Confirm that the number of subprocess calls does not follow the bundle size.
 
-        This is a critical regression test. With a bundle containing N certificates,
-        we should NOT make O(N) subprocess calls to check for duplicates.
+        With a bundle of N certificates, fumitm must not make N subprocess calls to
+        find a duplicate.
         """
         cert_file = tmp_path / "cert.pem"
         cert_file.write_text(mock_data.MOCK_CERTIFICATE)
 
-        # Create a bundle with many certificates (simulating a real CA bundle)
-        # Real bundles have 100-150 certs; we'll use 10 for speed
+        # A bundle with many certificates. A real bundle has 100 to 150
+        # certificates. This test uses 10, because it is faster.
         bundle_content = ""
         for i in range(10):
-            # Generate slightly different certs by modifying the base64
             modified_cert = mock_data.SAMPLE_CA_BUNDLE.replace(
                 "MIIDSjCCAjKgAwIBAgIQRK",
                 f"MIIDSjCCAjKgAwIBAgIQR{i}"
@@ -2002,13 +1895,12 @@ class TestPerformance(FumitmTestCase):
             instance = fumitm.FumitmPython(mode='install')
 
         with patch('subprocess.run') as mock_subprocess:
-            # Check if certificate exists in bundle
             instance.certificate_likely_exists_in_file(
                 str(cert_file), str(bundle_file)
             )
 
-            # The result doesn't matter - what matters is call count
-            # Should be O(1), not O(N) where N is number of certs in bundle
+            # The result is not important. The number of calls must not increase with
+            # the number of certificates in the bundle.
             assert mock_subprocess.call_count <= 1, (
                 f"Checking certificate existence made {mock_subprocess.call_count} subprocess calls "
                 f"for a bundle with 10 certificates. This suggests O(N) complexity. "
@@ -2023,7 +1915,6 @@ class TestPerformance(FumitmTestCase):
         with patch('platform.system', return_value='Darwin'):
             instance = fumitm.FumitmPython(mode='install')
 
-        # Mock the CERT_PATH to our test file
         with patch.object(fumitm, 'CERT_PATH', str(cert_file)), \
                 patch('subprocess.run') as mock_subprocess:
                 mock_subprocess.return_value = MagicMock(
@@ -2031,14 +1922,12 @@ class TestPerformance(FumitmTestCase):
                     stdout="SHA256 Fingerprint=AA:BB:CC:DD"
                 )
 
-                # Call get_cert_fingerprint multiple times
                 instance.get_cert_fingerprint(str(cert_file))
                 instance.get_cert_fingerprint(str(cert_file))
                 instance.get_cert_fingerprint(str(cert_file))
 
-                # Should only call subprocess once (cached after first call)
-                # Note: current implementation caches only for CERT_PATH
-                # This test documents expected behavior after optimization
+                # One subprocess call only. The result is cached after the first call.
+                # fumitm caches for CERT_PATH only. This test gives the wanted operation.
                 assert mock_subprocess.call_count <= 3, (
                     f"get_cert_fingerprint called subprocess {mock_subprocess.call_count} times "
                     f"for 3 calls. Expected caching to reduce this."
@@ -2046,10 +1935,10 @@ class TestPerformance(FumitmTestCase):
 
 
 class TestCertificateContentMatching(FumitmTestCase):
-    """Tests for pure Python certificate content matching.
+    """Tests for the pure-Python match of certificate content.
 
-    These tests verify that certificate duplicate detection works correctly
-    using string matching without requiring openssl subprocess calls.
+    These tests confirm that fumitm finds a duplicate certificate with string
+    matching and makes no openssl subprocess call.
     """
 
     def test_extracts_cert_unique_portion(self, tmp_path):
@@ -2060,8 +1949,7 @@ class TestCertificateContentMatching(FumitmTestCase):
         with patch('platform.system', return_value='Darwin'):
             instance = fumitm.FumitmPython(mode='status')
 
-        # The function should be able to extract a unique portion
-        # This tests the internal helper if it exists
+        # The function must give a unique part of the certificate.
         if hasattr(instance, 'get_cert_unique_portion'):
             unique = instance.get_cert_unique_portion(str(cert_file))
             assert unique is not None
@@ -2072,7 +1960,6 @@ class TestCertificateContentMatching(FumitmTestCase):
         cert_file = tmp_path / "cert.pem"
         cert_file.write_text(mock_data.MOCK_CERTIFICATE)
 
-        # Bundle containing the certificate
         bundle_file = tmp_path / "bundle.pem"
         bundle_file.write_text(mock_data.SAMPLE_CA_BUNDLE + "\n" + mock_data.MOCK_CERTIFICATE)
 
@@ -2090,7 +1977,6 @@ class TestCertificateContentMatching(FumitmTestCase):
         cert_file = tmp_path / "cert.pem"
         cert_file.write_text(mock_data.MOCK_CERTIFICATE)
 
-        # Bundle NOT containing the certificate
         bundle_file = tmp_path / "bundle.pem"
         bundle_file.write_text(mock_data.SAMPLE_CA_BUNDLE)
 
@@ -2108,7 +1994,6 @@ class TestCertificateContentMatching(FumitmTestCase):
         cert_file = tmp_path / "cert.pem"
         cert_file.write_text(mock_data.MOCK_CERTIFICATE)
 
-        # Bundle with extra whitespace around the certificate
         cert_with_spaces = mock_data.MOCK_CERTIFICATE.replace('\n', '\n\n')
         bundle_file = tmp_path / "bundle.pem"
         bundle_file.write_text(mock_data.SAMPLE_CA_BUNDLE + "\n\n\n" + cert_with_spaces)
@@ -2120,7 +2005,6 @@ class TestCertificateContentMatching(FumitmTestCase):
             str(cert_file), str(bundle_file)
         )
 
-        # Should still find the certificate despite whitespace differences
         assert result is True, "Failed to find certificate with whitespace variations"
 
 
@@ -2143,10 +2027,8 @@ class TestUpdateCheck(FumitmTestCase):
 
             instance.check_for_updates()
 
-            # Verify urlopen was called with context parameter
             call_kwargs = mock_urlopen.call_args
             assert call_kwargs is not None
-            # The context should be passed as a keyword argument
             assert 'context' in call_kwargs.kwargs or len(call_kwargs.args) >= 2
 
     def test_check_for_updates_handles_network_error(self, tmp_path):
@@ -2159,7 +2041,6 @@ class TestUpdateCheck(FumitmTestCase):
 
             result = instance.check_for_updates()
 
-            # Should return False on error, not raise
             assert result is False
 
 
@@ -2237,10 +2118,11 @@ class TestGcloudVerification(FumitmTestCase):
             assert result == "NOT_INSTALLED"
 
     def test_check_gcloud_status_working_no_custom_ca(self, tmp_path):
-        """gcloud status flags missing core/custom_ca_certs_file even when basic HTTPS works.
+        """gcloud status reports an absent core/custom_ca_certs_file.
 
-        IAP tunnel reads core/custom_ca_certs_file explicitly and ignores the
-        system trust store, so a working `gcloud projects list` is not enough.
+        It does this also when HTTPS operates. The IAP tunnel reads
+        core/custom_ca_certs_file and ignores the system trust store. Thus a
+        successful `gcloud projects list` is not sufficient.
         """
         cert_file = tmp_path / "cert.pem"
         cert_file.write_text(mock_data.MOCK_CERTIFICATE)
@@ -2340,7 +2222,6 @@ class TestCalVerVersion(FumitmTestCase):
     def test_version_comparison_equal(self):
         """Test version comparison with equal versions."""
         assert fumitm.parse_calver("2025.12.18") == fumitm.parse_calver("2025.12.18")
-        # Note: (2025, 12, 18, 0) should equal (2025, 12, 18, 0)
         assert fumitm.parse_calver("2025.12.18") == (2025, 12, 18, 0)
 
 
@@ -2352,11 +2233,10 @@ class TestUpdateCheckCalVer(FumitmTestCase):
         with patch('platform.system', return_value='Darwin'):
             instance = fumitm.FumitmPython(mode='status')
 
-        # Mock remote file with a version far in the future
         remote_content = b'__version__ = "2099.12.31"\n# rest of file...'
 
-        # Simulate a non-dev environment (main branch, clean tree) so the
-        # update warning is not suppressed by the working-copy check.
+        # A host that is not a working copy: the main branch and no local change.
+        # Thus the working-copy check does not remove the update warning.
         non_dev_version_info = {**fumitm.VERSION_INFO, 'branch': 'main', 'dirty': False}
 
         with patch('urllib.request.urlopen') as mock_urlopen, \
@@ -2376,7 +2256,6 @@ class TestUpdateCheckCalVer(FumitmTestCase):
         with patch('platform.system', return_value='Darwin'):
             instance = fumitm.FumitmPython(mode='status')
 
-        # Mock remote file with same version as local
         remote_content = f'__version__ = "{fumitm.__version__}"\n# rest...'.encode()
 
         with patch('urllib.request.urlopen') as mock_urlopen:
@@ -2426,11 +2305,11 @@ class TestUpdateCheckCalVer(FumitmTestCase):
 
 
 class TestProviderMigration(FumitmTestCase):
-    """Tests for provider migration detection and path correction.
+    """Tests for the detection of a provider change and the correction of a path.
 
-    When a user switches MITM proxy providers (e.g. WARP to Netskope), tool
-    configs may still reference the old provider's bundle_dir. These tests
-    verify that fumitm detects the mismatch and migrates paths accordingly.
+    When a user changes the MITM proxy provider, for example from WARP to
+    Netskope, a tool config can still name the bundle directory of the old
+    provider. These tests confirm that fumitm finds this and moves the paths.
     """
 
     def test_path_belongs_to_other_provider_cross_provider(self):
@@ -2936,13 +2815,12 @@ class TestToolResultAccuracy(FumitmTestCase):
             assert 'VM install failed' in result.message
 
     def test_rancher_installs_via_rdctl_when_docker_absent(self):
-        """Regression: rdctl present + VM running + docker absent must not
-        touch _install_cert_in_docker_vm or _check_cert_in_docker_vm.
+        """With rdctl, a running VM, and no docker, fumitm must not use the Docker path.
 
-        Before the fix, setup_rancher_cert delegated to the shared Docker
-        nsenter helpers, which require the docker CLI. When rdctl was
-        available but docker was not, the VM install path failed even
-        though rdctl shell would have worked.
+        It must not call _install_cert_in_docker_vm or _check_cert_in_docker_vm.
+        Before the correction, setup_rancher_cert called the shared Docker nsenter
+        methods, which need the docker CLI. With rdctl and no docker, the install
+        failed although rdctl shell would operate.
         """
         instance = self.create_fumitm_instance(mode='install')
         instance.cert_path = '/tmp/fake-cert.pem'
@@ -2981,7 +2859,6 @@ class TestToolResultAccuracy(FumitmTestCase):
              patch('os.path.exists', return_value=True), \
              patch.object(instance, 'certificate_likely_exists_in_file', return_value=True), \
              patch('subprocess.run') as mock_run:
-            # podman machine list shows not running
             mock_run.return_value = MagicMock(returncode=0, stdout='no machines')
             result = instance.setup_podman_cert()
             assert result.status == 'already_ok'
@@ -3002,7 +2879,6 @@ class TestToolResultAccuracy(FumitmTestCase):
              patch('os.path.exists', return_value=True), \
              patch.object(instance, 'certificate_likely_exists_in_file', return_value=True), \
              patch('subprocess.run') as mock_run:
-            # colima status shows not running
             mock_run.return_value = MagicMock(returncode=1)
             result = instance.setup_colima_cert()
             assert result.status == 'already_ok'
@@ -3025,13 +2901,12 @@ class TestToolResultAccuracy(FumitmTestCase):
             assert 'VM install failed' in result.message
 
     def test_colima_installs_via_ssh_when_docker_absent(self):
-        """Regression: colima present + VM running + docker absent must not
-        touch _install_cert_in_docker_vm or _check_cert_in_docker_vm.
+        """With colima, a running VM, and no docker, fumitm must not use the Docker path.
 
-        Before the fix, setup_colima_cert delegated to the shared Docker
-        nsenter helpers, which require the docker CLI. When colima was
-        available but docker was not, the VM install path failed even
-        though colima ssh would have worked.
+        It must not call _install_cert_in_docker_vm or _check_cert_in_docker_vm.
+        Before the correction, setup_colima_cert called the shared Docker nsenter
+        methods, which need the docker CLI. With colima and no docker, the install
+        failed although colima ssh would operate.
         """
         instance = self.create_fumitm_instance(mode='install')
         instance.cert_path = '/tmp/fake-cert.pem'
@@ -3210,11 +3085,11 @@ class TestBareReturnsFixed(FumitmTestCase):
             assert result.status == 'already_ok'
 
     def test_gcloud_iap_regression_configures_when_https_works_but_ca_unset(self):
-        """IAP regression: even if basic HTTPS works, missing core/custom_ca_certs_file must be configured.
+        """fumitm must set core/custom_ca_certs_file also when HTTPS operates.
 
-        IAP tunnel (`gcloud compute ssh --tunnel-through-iap`) reads ca_certs
-        explicitly from core/custom_ca_certs_file and ignores system trust /
-        SSL_CERT_FILE, so we must always set the property.
+        The IAP tunnel (`gcloud compute ssh --tunnel-through-iap`) reads ca_certs
+        from core/custom_ca_certs_file. It ignores the system trust store and
+        SSL_CERT_FILE. Thus fumitm must always set the property.
         """
         instance = self.create_fumitm_instance(mode='install')
         gcloud_managed = os.path.expanduser("~/.config/gcloud/certs/combined-ca-bundle.pem")
@@ -3323,8 +3198,8 @@ class TestBareReturnsFixed(FumitmTestCase):
              patch.object(instance, 'add_to_shell_config') as mock_shell:
             result = instance.setup_python_cert()
             assert result.status == 'configured'
-            # assert_any_call (not assert_called_with): the Aikido/vendor-var
-            # post-pass may append further trust-var calls after this one.
+            # Use assert_any_call and not assert_called_with. The vendor-variable
+            # pass can add more trust-variable calls after this call.
             mock_shell.assert_any_call('SSL_CERT_FILE', bundle_path, '/tmp/.zshrc')
 
     def test_gcloud_pre_bootstrap_without_gcloud_returns_configured(self):
@@ -3891,7 +3766,7 @@ class TestAwsSetup(FumitmTestCase):
 
             instance.setup_aws_cert()
 
-            # Should NOT create a new bundle — needs manual investigation
+            # Do not make a new bundle. A person must examine this condition.
             mock_create.assert_not_called()
 
     def test_aws_bundle_missing_cert_install_mode_fixes(self):
@@ -4086,12 +3961,11 @@ class TestGitTlsBackend(FumitmTestCase):
 
 
 class TestShellConfigIdempotency(FumitmTestCase):
-    """add_to_shell_config writes values to the sourced env file and maintains a
-    trailing source stub in each startup file, re-running as a no-op.
+    """add_to_shell_config writes to the env file and keeps a stub in each file.
 
-    The stub is last, so the env file's exports win by last-export-wins; a user's
-    earlier export is preserved verbatim but overridden — never commented out,
-    never prompted.
+    The stub is last, thus the exports of the env file win. An earlier export of
+    the user stays without a change and does not win. fumitm never makes it a
+    comment and never asks the user about it.
     """
 
     def test_idempotent_when_already_correct(self, tmp_path):
@@ -4121,8 +3995,8 @@ class TestShellConfigIdempotency(FumitmTestCase):
         assert instance.shell_modified is False
 
     def test_migrates_legacy_inline_block(self, tmp_path):
-        # An inline export block written by an older fumitm is hoisted into the
-        # env file and replaced in place by the stub, so the two never conflict.
+        # An inline export block from an older fumitm goes into the env file. The
+        # stub replaces it. Thus the two never conflict.
         instance = self.create_fumitm_instance(mode='install')
         rc = tmp_path / '.zshrc'
         rc.write_text(
@@ -4143,16 +4017,16 @@ class TestShellConfigIdempotency(FumitmTestCase):
         assert 'export NODE_EXTRA_CA_CERTS=' not in content
         assert content.count(instance._FUMITM_BLOCK_BEGIN) == 1
         assert 'export PATH="/usr/local/bin:$PATH"' in content, "user line preserved"
-        # The unrelated legacy var carried over; the requested one was updated.
+        # The other legacy variable stays. fumitm changed the given variable.
         assert 'export NODE_EXTRA_CA_CERTS="/legacy/node.pem"' in env
         assert 'export SSL_CERT_FILE="/new/bundle.pem"' in env
         assert '/legacy/bundle.pem' not in env
 
     def test_legacy_value_survives_when_already_correct(self, tmp_path):
-        # Regression: when a legacy inline block already held the requested
-        # value, an "already correct" short-circuit skipped writing the env file
-        # while the stub still replaced that block — silently dropping the
-        # export. The merged set must always be written back.
+        # Regression: a legacy inline block already had the given value. An
+        # "already correct" test stopped the write of the env file, and the stub
+        # still replaced that block. Thus fumitm removed the export. fumitm must
+        # always write the merged set.
         instance = self.create_fumitm_instance(mode='install')
         rc = tmp_path / '.zshrc'
         bundle = '/Users/test/.python-ca-bundle.pem'
@@ -4186,8 +4060,8 @@ class TestShellConfigIdempotency(FumitmTestCase):
 
         new_content = rc.read_text()
         assert prompt.call_count == 0, "the env file is authoritative; no prompt"
-        # The user's earlier line is preserved (never commented), and the stub at
-        # EOF sources the new value, winning by last-export-wins.
+        # The earlier line of the user stays and is not a comment. The stub at
+        # the end of the file sources the new value, which wins.
         assert 'export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE="/old/path.pem"' in new_content
         assert '#export' not in new_content
         assert new_content.rstrip().endswith(instance._FUMITM_BLOCK_END)
@@ -4211,7 +4085,7 @@ class TestShellConfigIdempotency(FumitmTestCase):
 
         content = rc.read_text()
         assert prompt.call_count == 0, "commented-out lines should not trigger a prompt"
-        # The startup file carries only the stub; the value lives in the env file.
+        # The startup file has only the stub. The value is in the env file.
         begin = content.index(instance._FUMITM_BLOCK_BEGIN)
         source = content.index(instance._FUMITM_ENV_FILE_SHELL)
         end = content.index(instance._FUMITM_BLOCK_END)
@@ -4221,8 +4095,8 @@ class TestShellConfigIdempotency(FumitmTestCase):
         assert instance.shell_modified is True
 
     def test_plain_user_export_preserved_and_overridden(self, tmp_path):
-        # A pre-existing unquoted user export is foreign content: preserved
-        # verbatim, with a managed block appended that overrides it.
+        # An export of the user with no quotes is other content. It stays without
+        # a change. The managed block comes after it and replaces its value.
         instance = self.create_fumitm_instance(mode='install')
         rc = tmp_path / '.zshrc'
         original = 'export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE=/Users/test/bundle.pem\n'
@@ -4258,7 +4132,7 @@ class TestShellConfigManagedBlock(FumitmTestCase):
         instance = self.create_fumitm_instance(mode='install')
         rc = tmp_path / '.zshrc'
         aikido = self._aikido_block()
-        # An earlier fumitm export followed by Aikido's block, which currently wins.
+        # An earlier fumitm export, then the Aikido block, which wins now.
         rc.write_text(
             'export SSL_CERT_FILE="/fumitm/bundle.pem"\n\n' + aikido
         )
@@ -4268,8 +4142,8 @@ class TestShellConfigManagedBlock(FumitmTestCase):
 
         content = rc.read_text()
         env = Path(instance._env_file_path()).read_text()
-        # Aikido's block is preserved verbatim, and the fumitm stub sits after it,
-        # so sourcing the env file happens last and its exports win.
+        # The Aikido block stays without a change. The fumitm stub is after it,
+        # thus the env file is sourced last and its exports win.
         assert aikido.strip() in content
         assert content.index(instance._FUMITM_BLOCK_BEGIN) > content.index('aikido-endpoint end')
         assert content.index(instance._FUMITM_ENV_FILE_SHELL) \
@@ -4342,7 +4216,7 @@ class TestShellConfigManagedBlock(FumitmTestCase):
         assert content.startswith(instance._FUMITM_BLOCK_BEGIN)
         assert content.endswith(instance._FUMITM_BLOCK_END + '\n')
         assert not (tmp_path / '.zshrc.bak').exists()
-        # A second var in the same run must not back up the intermediate file.
+        # A second variable in the same run must not back up the middle file.
         instance.add_to_shell_config('REQUESTS_CA_BUNDLE', '/b.pem', str(rc))
         assert not (tmp_path / '.zshrc.bak').exists()
 
@@ -4370,8 +4244,8 @@ class TestShellConfigManagedBlock(FumitmTestCase):
         assert content.rstrip().endswith(instance._FUMITM_BLOCK_END)
 
     def test_stale_begin_then_fresh_block(self, tmp_path):
-        # A stale unmatched begin marker followed by a valid fresh block: the
-        # fresh block's end must not be read as closing the stale begin.
+        # An old begin marker with no pair, then a valid new block. The end of
+        # the new block must not close the old begin marker.
         instance = self.create_fumitm_instance(mode='install')
         rc = tmp_path / '.zshrc'
         rc.write_text(
@@ -4387,8 +4261,8 @@ class TestShellConfigManagedBlock(FumitmTestCase):
 
         content = rc.read_text()
         env = Path(instance._env_file_path()).read_text()
-        # The fresh block became the stub; the stale begin + its line stay as
-        # foreign content, and the old value did not survive the migration.
+        # The new block is now the stub. The old begin marker and its line stay
+        # as other content. The old value is gone.
         assert 'export STALE_LEFTOVER="x"' in content
         assert 'export SSL_CERT_FILE="/old.pem"' not in content
         assert 'export SSL_CERT_FILE="/new.pem"' in env
@@ -4396,12 +4270,13 @@ class TestShellConfigManagedBlock(FumitmTestCase):
 
 
 class TestShellStartupFileCoverage(FumitmTestCase):
-    """Every startup file the shell reads gets the stub, so the exports apply in
-    interactive, non-interactive and login shells alike.
+    """Each startup file that the shell reads gets the stub.
 
-    Regression cover for exports landing only in .zshrc: a non-interactive login
-    shell (`zsh -lc`, used by many tool launchers) reads .zprofile and skips
-    .zshrc entirely, so a vendor block in .zprofile silently won.
+    Thus the exports apply in an interactive shell, a non-interactive shell, and
+    a login shell. This covers the condition where the exports went only into
+    .zshrc. A non-interactive login shell such as `zsh -lc`, which many tool
+    launchers use, reads .zprofile and not .zshrc. A vendor block in .zprofile
+    then won.
     """
 
     def _install(self, home, shell):
@@ -4413,8 +4288,9 @@ class TestShellStartupFileCoverage(FumitmTestCase):
     def test_zsh_targets_cover_every_shell_mode(self, isolate_home):
         inst = self.create_fumitm_instance(mode='install')
         targets = [os.path.basename(p) for p in inst.get_shell_configs('zsh')]
-        # .zshenv: non-login non-interactive. .zshrc: interactive.
-        # .zlogin: login, and read after .zprofile so a vendor block there loses.
+        # .zshenv is for a non-login non-interactive shell. .zshrc is for an
+        # interactive shell. .zlogin is for a login shell and comes after
+        # .zprofile, thus a vendor block in .zprofile does not win.
         assert targets == ['.zshenv', '.zshrc', '.zlogin']
 
     def test_zprofile_is_never_written(self, isolate_home):
@@ -4444,8 +4320,9 @@ class TestShellStartupFileCoverage(FumitmTestCase):
 
         targets = [os.path.basename(p) for p in inst.get_shell_configs('bash')]
 
-        # .bashrc for interactive non-login; .profile is the first existing
-        # login file, so bash reads it rather than creating .bash_profile.
+        # .bashrc is for an interactive non-login shell. .profile is the first
+        # login file that is present, thus bash reads it and does not make
+        # .bash_profile.
         assert targets == ['.bashrc', '.profile']
 
     def test_bash_creates_bash_profile_when_no_login_file_exists(self, isolate_home):
@@ -4461,7 +4338,7 @@ class TestShellStartupFileCoverage(FumitmTestCase):
              patch.object(inst, 'get_shell_config', return_value=str(config)):
             inst.add_to_shell_config('SSL_CERT_FILE', '/new/bundle.pem')
 
-        # fish cannot source POSIX-sh syntax, so it keeps the inline block.
+        # fish cannot read POSIX sh syntax, thus it keeps the inline block.
         assert 'export SSL_CERT_FILE="/new/bundle.pem"' in config.read_text()
         assert not Path(inst._env_file_path()).exists()
 
@@ -4478,9 +4355,9 @@ class TestShellStartupFileCoverage(FumitmTestCase):
         assert inst.shell_modified is False
 
     def test_dry_run_reports_each_file_once_across_vars(self, isolate_home):
-        # Nothing persists in a dry run, so every var re-detects the same
-        # pending file changes; without dedup a multi-var setup floods the
-        # output with identical "Would update" lines per file.
+        # A dry run writes nothing, thus each variable finds the same pending
+        # changes. Without a filter, a setup with several variables gives the
+        # same "Would update" line many times for each file.
         inst = self.create_fumitm_instance(mode='status')
 
         with patch.object(inst, 'detect_shell', return_value='zsh'), \
@@ -4492,7 +4369,8 @@ class TestShellStartupFileCoverage(FumitmTestCase):
                         if c.args[0].startswith('Would update')]
         assert len(would_update) == len(set(would_update)), \
             f'duplicate dry-run lines: {would_update}'
-        # env file + three startup files, once each; one export line per var.
+        # The env file and three startup files, one time each. One export line
+        # for each variable.
         assert len(would_update) == 4
         exports = [c.args[0] for c in action.call_args_list
                    if c.args[0].startswith('export ')]
@@ -4510,9 +4388,9 @@ class TestShellStartupFileCoverage(FumitmTestCase):
 
     def test_zdotdir_overrides_home_for_zsh_targets(
             self, isolate_home, monkeypatch, tmp_path):
-        # zsh reads its per-user startup files from $ZDOTDIR when set, not
-        # $HOME. Writing to HOME files a custom-dotdir zsh never reads would
-        # recreate the exact non-interactive-login gap this scheme fixes.
+        # zsh reads its startup files from $ZDOTDIR when it is set, and not from
+        # HOME. A write to a HOME file that such a zsh never reads would give the
+        # same non-interactive login problem that this design corrects.
         zdot = tmp_path / 'zdot'
         zdot.mkdir()
         monkeypatch.setenv('ZDOTDIR', str(zdot))
@@ -4529,8 +4407,8 @@ class TestShellStartupFileCoverage(FumitmTestCase):
             assert inst._FUMITM_ENV_FILE_SHELL in (zdot / name).read_text(), \
                 f'{name} missing stub under ZDOTDIR'
             assert not (isolate_home / name).exists(), \
-                f'HOME {name} written despite ZDOTDIR — zsh never reads it'
-        # The env file itself is not a zsh startup file; it stays under HOME.
+                f'HOME {name} written although ZDOTDIR is set. zsh never reads it.'
+        # The env file is not a zsh startup file. It stays under HOME.
         assert Path(inst._env_file_path()).exists()
 
     def test_zdotdir_unset_or_empty_falls_back_to_home(
@@ -4545,10 +4423,10 @@ class TestShellStartupFileCoverage(FumitmTestCase):
 
     def test_real_zsh_login_shell_with_zdotdir_gets_fumitm_value(
             self, isolate_home, monkeypatch, tmp_path):
-        # End-to-end reproduction of the review finding on PR #99: vendor
-        # export in $ZDOTDIR/.zprofile, fumitm configured, then every zsh
-        # invocation mode must resolve fumitm's bundle - including the
-        # non-interactive login shell that reads .zprofile but not .zshrc.
+        # The condition from the review of PR #99. There is a vendor export in
+        # $ZDOTDIR/.zprofile and fumitm is configured. Each zsh mode must then
+        # give the bundle of fumitm. This includes the non-interactive login
+        # shell, which reads .zprofile and not .zshrc.
         zdot = tmp_path / 'zdot'
         zdot.mkdir()
         (zdot / '.zprofile').write_text(
@@ -4572,9 +4450,9 @@ class TestShellStartupFileCoverage(FumitmTestCase):
 
     def test_real_zsh_shell_local_zdotdir_gets_fumitm_value(
             self, isolate_home, monkeypatch, tmp_path):
-        # ZDOTDIR is a shell parameter and need not be exported. In that case
-        # Python cannot see it in os.environ, but zsh still uses the value from
-        # HOME/.zshenv for every later startup file.
+        # ZDOTDIR is a shell parameter and zsh does not export it. Python then
+        # cannot read it in os.environ, but zsh uses the value from HOME/.zshenv
+        # for each later startup file.
         zdot = tmp_path / 'shell-local-zdot'
         zdot.mkdir()
         (isolate_home / '.zshenv').write_text(f'ZDOTDIR="{zdot}"\n')
