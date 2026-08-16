@@ -14,7 +14,7 @@ import contextlib
 import os
 import stat
 from pathlib import Path
-from unittest.mock import MagicMock, mock_open, patch
+from unittest.mock import MagicMock, call, mock_open, patch
 
 import mock_data
 from helpers import FumitmTestCase
@@ -196,6 +196,56 @@ class TestAikidoBundleAssembly(FumitmTestCase):
         names = dict(inst._all_container_certs())
         assert names['cloudflare-warp'] == inst.cert_path
         assert names['aikido'] == str(aikido)
+
+    def test_colima_installer_writes_primary_and_aikido_roots(self, tmp_path):
+        """The native Colima path installs every root into the selected profile."""
+        primary = tmp_path / 'netskope.pem'
+        primary.write_text(mock_data.MOCK_CERTIFICATE)
+        aikido = tmp_path / 'aikido.pem'
+        aikido.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
+
+        inst = self.create_fumitm_instance(provider='netskope', no_aikido=True)
+        inst.cert_path = str(primary)
+        inst.extra_roots = [{
+            'container_cert_name': 'aikido',
+            'path': str(aikido),
+        }]
+
+        with patch('subprocess.run', return_value=MagicMock(returncode=0)) as mock_run:
+            success, message = inst._install_cert_via_colima_ssh('team-dev')
+
+        assert success is True
+        assert message == 'Certificate installed in Colima VM'
+        assert mock_run.call_args_list == [
+            call(
+                [
+                    'colima', '--profile', 'team-dev', 'ssh', '--', 'sudo', 'tee',
+                    '/usr/local/share/ca-certificates/netskope.crt',
+                ],
+                input=mock_data.MOCK_CERTIFICATE,
+                text=True,
+                capture_output=True,
+                check=False,
+            ),
+            call(
+                [
+                    'colima', '--profile', 'team-dev', 'ssh', '--', 'sudo', 'tee',
+                    '/usr/local/share/ca-certificates/aikido.crt',
+                ],
+                input=mock_data.MOCK_AIKIDO_ROOT_CERT,
+                text=True,
+                capture_output=True,
+                check=False,
+            ),
+            call(
+                [
+                    'colima', '--profile', 'team-dev', 'ssh', '--', 'sudo',
+                    'update-ca-certificates',
+                ],
+                capture_output=True,
+                check=False,
+            ),
+        ]
 
 
 class TestAikidoIdempotency(FumitmTestCase):
