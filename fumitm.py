@@ -620,16 +620,14 @@ class FumitmPython:
     def _detect_aikido(self):
         """Return True if Aikido Endpoint Protection is present.
 
-        One of these is sufficient: the AikidoSecurity directory is present, the
-        combined PEM is present, or the System Keychain holds a certificate with the
-        Aikido root CA prefix in its label. fumitm ignores the suffix of the label.
+        One of these is sufficient: the AikidoSecurity directory is present, or the
+        System Keychain holds a certificate with the Aikido root CA prefix in its
+        label. fumitm ignores the suffix of the label. The root and combined PEMs
+        are children of the support directory, so separate file checks are
+        redundant.
         """
         descriptor = SUPPLEMENTAL_ROOTS['aikido']
         if os.path.isdir(descriptor['support_dir']):
-            return True
-        if os.path.exists(descriptor['root_pem']):
-            return True
-        if os.path.exists(descriptor['combined_pem']):
             return True
 
         if platform.system() == 'Darwin':
@@ -3247,7 +3245,7 @@ class FumitmPython:
             )
             if result.returncode != 0:
                 return None
-            stdout = result.stdout.decode() if isinstance(result.stdout, bytes) else result.stdout
+            stdout = result.stdout
             if not stdout or '-----BEGIN CERTIFICATE-----' not in stdout:
                 return None
             return set(self._pem_fingerprints(stdout, keystore))
@@ -3284,11 +3282,20 @@ class FumitmPython:
         )
         try:
             for alias, cert_path in alias_pairs:
-                desired = self._cert_fingerprints(cert_path)
-                desired_fingerprint = desired[0] if desired else None
-                if (keystore_fingerprints is not None and desired_fingerprint
-                        in keystore_fingerprints):
-                    continue
+                desired_fingerprint = None
+                if keystore_fingerprints is not None:
+                    if self._keystore_has_cert_path(
+                        keystore_fingerprints, cert_path
+                    ):
+                        continue
+                    desired = self._cert_fingerprints(cert_path)
+                    if not desired:
+                        self.print_warn(
+                            f"    ✗ {label}: Could not identify {alias} certificate"
+                        )
+                        failed = True
+                        continue
+                    desired_fingerprint = desired[0]
                 alias_present = self._keytool_alias_present(
                     keytool_bin, keystore, alias, storetype=storetype
                 )
@@ -3300,8 +3307,42 @@ class FumitmPython:
                     self.print_warn(
                         f"    ✗ {label}: {alias} exists with a different certificate"
                     )
-                    failed = True
-                    continue
+                    if not self.is_install_mode():
+                        self.print_action(
+                            f"    Would replace {alias} in: {keystore}"
+                        )
+                        imported = True
+                        continue
+                    delete_cmd = [
+                        keytool_bin, '-delete', '-alias', alias,
+                        '-keystore', keystore, '-storepass', 'changeit'
+                    ]
+                    if storetype:
+                        delete_cmd.extend(['-storetype', storetype])
+                    delete_result = subprocess.run(
+                        delete_cmd, capture_output=True, text=True, check=False
+                    )
+                    if delete_result.returncode != 0:
+                        self.print_warn(
+                            f"    ✗ {label}: Failed to remove outdated {alias}"
+                        )
+                        self.print_info("      Fix with:")
+                        command = (
+                            f"        sudo {keytool_bin} -delete -alias {alias}"
+                            f" -keystore {keystore} -storepass changeit"
+                        )
+                        if storetype:
+                            command += f" -storetype {storetype}"
+                        print(command)
+                        if delete_result.stdout:
+                            self.print_warn(
+                                f"      Keytool response: {delete_result.stdout}"
+                            )
+                        failed = True
+                        continue
+                    self.print_info(
+                        f"    ✓ {label}: outdated {alias} removed"
+                    )
                 if not self.is_install_mode():
                     self.print_action(f"    Would import {alias} certificate to: {keystore}")
                     imported = True
@@ -3339,7 +3380,7 @@ class FumitmPython:
                     os.unlink(path)
                 except OSError:
                     pass
-        if failed and not imported:
+        if failed:
             return 'failed'
         if imported:
             return 'configured'

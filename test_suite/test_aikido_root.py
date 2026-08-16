@@ -33,21 +33,6 @@ class TestAikidoDetection(FumitmTestCase):
         with patch('fumitm.os.path.isdir', return_value=True):
             assert inst._detect_aikido() is True
 
-    def test_detected_via_combined_pem(self):
-        inst = self._instance()
-        with patch('fumitm.os.path.isdir', return_value=False), \
-             patch('fumitm.os.path.exists',
-                   side_effect=lambda p: p == mock_data.AIKIDO_COMBINED_PEM):
-            assert inst._detect_aikido() is True
-
-    def test_detected_via_dedicated_root_pem(self):
-        inst = self._instance()
-        import fumitm
-        root_pem = fumitm.SUPPLEMENTAL_ROOTS['aikido']['root_pem']
-        with patch('fumitm.os.path.isdir', return_value=False), \
-             patch('fumitm.os.path.exists', side_effect=lambda p: p == root_pem):
-            assert inst._detect_aikido() is True
-
     def test_detected_via_keychain(self):
         inst = self._instance()
         hit = MagicMock(returncode=0, stdout='cert')

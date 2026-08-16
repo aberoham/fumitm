@@ -3525,8 +3525,8 @@ class TestBareReturnsFixed(FumitmTestCase):
             check=False,
         )
 
-    def test_keystore_alias_collision_does_not_report_already_ok(self, tmp_path):
-        """A managed alias holding a different certificate is not healthy."""
+    def test_keystore_alias_collision_replaces_rotated_certificate(self, tmp_path):
+        """A managed alias holding an old root is replaced with the current one."""
         instance = self.create_fumitm_instance(mode='install')
         aikido_root = tmp_path / 'aikido-root.pem'
         aikido_root.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
@@ -3537,8 +3537,10 @@ class TestBareReturnsFixed(FumitmTestCase):
                     returncode=0,
                     stdout=mock_data.MOCK_CERTIFICATE,
                 )
-            if '-alias' in cmd:
+            if '-list' in cmd and '-alias' in cmd:
                 return MagicMock(returncode=0, stdout=b'aikido-root')
+            if '-delete' in cmd or '-import' in cmd:
+                return MagicMock(returncode=0, stdout='ok')
             raise AssertionError(f'Unexpected keytool command: {cmd}')
 
         with patch('subprocess.run', side_effect=run_side_effect) as mock_run:
@@ -3547,9 +3549,56 @@ class TestBareReturnsFixed(FumitmTestCase):
                 alias_pairs=[('aikido-root', str(aikido_root))],
             )
 
+        assert result == 'configured'
+        commands = [mock_call.args[0] for mock_call in mock_run.call_args_list]
+        delete_index = next(
+            index for index, command in enumerate(commands)
+            if command[:2] == ['keytool', '-delete']
+        )
+        import_index = next(
+            index for index, command in enumerate(commands)
+            if command[:2] == ['keytool', '-import']
+        )
+        assert delete_index < import_index
+
+    def test_keystore_collision_failure_wins_over_other_import(self, tmp_path):
+        """A successful second root cannot hide a failed alias replacement."""
+        instance = self.create_fumitm_instance(mode='install')
+        current_root = tmp_path / 'current-root.pem'
+        current_root.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
+
+        def run_side_effect(cmd, **kwargs):
+            if '-rfc' in cmd:
+                return MagicMock(returncode=0, stdout=mock_data.MOCK_CERTIFICATE)
+            if '-list' in cmd and '-alias' in cmd:
+                alias = cmd[cmd.index('-alias') + 1]
+                return MagicMock(
+                    returncode=0 if alias == 'rotated-root' else 1,
+                    stdout=alias.encode(),
+                )
+            if '-delete' in cmd:
+                return MagicMock(returncode=1, stdout='delete denied')
+            if '-import' in cmd:
+                return MagicMock(returncode=0, stdout='Certificate was added')
+            raise AssertionError(f'Unexpected keytool command: {cmd}')
+
+        with patch('subprocess.run', side_effect=run_side_effect) as mock_run:
+            result = instance._ensure_roots_in_keystore(
+                'keytool', '/fake/cacerts', 'test JDK',
+                alias_pairs=[
+                    ('rotated-root', str(current_root)),
+                    ('new-root', str(current_root)),
+                ],
+            )
+
         assert result == 'failed'
         commands = [mock_call.args[0] for mock_call in mock_run.call_args_list]
-        assert not any(command[:2] == ['keytool', '-import'] for command in commands)
+        assert any(command[:2] == ['keytool', '-delete'] for command in commands)
+        assert any(
+            command[:2] == ['keytool', '-import']
+            and command[command.index('-alias') + 1] == 'new-root'
+            for command in commands
+        )
 
 
 class TestAwsVerification(FumitmTestCase):
