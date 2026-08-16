@@ -3917,16 +3917,64 @@ class TestBareReturnsFixed(FumitmTestCase):
                 'keytool', '/fake/cacerts'
             ) is True
 
-    def test_gradle_property_parser_tolerates_unreadable_file(self, tmp_path):
-        """A permissions race while reading gradle.properties is non-fatal."""
-        instance = self.create_fumitm_instance()
-        gradle_props = tmp_path / 'gradle.properties'
+    def test_gradle_unreadable_properties_fail_closed(
+            self, tmp_path, monkeypatch, capsys):
+        """An unreadable override is not treated as an absent, healthy file."""
+        gradle_home = tmp_path / '.gradle'
+        gradle_home.mkdir()
+        monkeypatch.setenv('GRADLE_USER_HOME', str(gradle_home))
+        gradle_props = gradle_home / 'gradle.properties'
         gradle_props.write_text('org.gradle.daemon=true\n')
+        instance = self.create_fumitm_instance(
+            mode='install', no_aikido=False, with_aikido=True
+        )
 
-        with patch('builtins.open', side_effect=PermissionError('denied')):
+        with patch('builtins.open', side_effect=PermissionError('denied')), \
+             patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, '_ensure_roots_in_keystore') as mock_ensure:
             assert instance._property_lines_with_vendor_scope(
                 str(gradle_props)
-            ) == []
+            ) is None
+            result = instance.setup_gradle_cert()
+            assert instance.check_gradle_status('/unused/provider.pem') is True
+
+        assert result.status == 'failed'
+        assert 'existing override preserved' in result.message
+        assert 'Could not read Gradle properties' in capsys.readouterr().out
+        mock_ensure.assert_not_called()
+
+    def test_gradle_absent_properties_remain_an_empty_configuration(self, tmp_path):
+        """A missing Gradle properties file remains distinct from a read fault."""
+        instance = self.create_fumitm_instance()
+
+        assert instance._property_lines_with_vendor_scope(
+            str(tmp_path / 'missing.properties')
+        ) == []
+
+    def test_gradle_stale_pinned_java_home_names_the_path(
+            self, tmp_path, monkeypatch, capsys):
+        """A stale Gradle JDK pin fails with an actionable path."""
+        gradle_home = tmp_path / '.gradle'
+        gradle_home.mkdir()
+        monkeypatch.setenv('GRADLE_USER_HOME', str(gradle_home))
+        (gradle_home / 'gradle.properties').write_text(
+            'org.gradle.java.home=/stale/jdk\n'
+        )
+        instance = self.create_fumitm_instance(
+            mode='install', no_aikido=False, with_aikido=True
+        )
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'find_java_cacerts', return_value='') as mock_find:
+            result = instance.setup_gradle_cert()
+            assert instance.check_gradle_status('/unused/provider.pem') is True
+
+        assert result.status == 'failed'
+        assert 'org.gradle.java.home' in result.message
+        assert '/stale/jdk' in result.message
+        output = capsys.readouterr().out
+        assert 'org.gradle.java.home has no Java cacerts file: /stale/jdk' in output
+        assert mock_find.call_args_list == [call('/stale/jdk'), call('/stale/jdk')]
 
     def test_gradle_rewrites_without_editing_vendor_override_block(self, tmp_path):
         """setup_gradle_cert appends a final managed block without changing vendor markers."""

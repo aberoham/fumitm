@@ -2102,10 +2102,16 @@ class FumitmPython:
         return True
 
     def _property_lines_with_vendor_scope(self, path):
-        """Return property-file lines with parsed assignments and vendor scope."""
+        """Return parsed property lines, [] when absent, or None when unreadable."""
         text = self._read_text_or_none(path)
         if text is None:
-            return []
+            try:
+                os.lstat(path)
+            except FileNotFoundError:
+                return []
+            except OSError as e:
+                self.print_debug(f"Could not inspect {path}: {e}")
+            return None
         raw_lines = text.splitlines(keepends=True)
 
         parsed = []
@@ -2135,10 +2141,8 @@ class FumitmPython:
         )
 
     def _remove_property_values_outside_vendor_blocks(
-            self, path, expected, desc, parsed=None):
+            self, path, expected, desc, parsed):
         """Remove matching non-vendor properties and preserve vendor blocks."""
-        if parsed is None:
-            parsed = self._property_lines_with_vendor_scope(path)
         kept = []
         changed = False
         for raw_line, in_vendor, key, value in parsed:
@@ -2169,16 +2173,23 @@ class FumitmPython:
             'systemProp.https.protocols': 'TLSv1.2',
         }
 
+    @staticmethod
+    def _gradle_pinned_java_home(parsed):
+        """Return the final org.gradle.java.home value, if one is present."""
+        gradle_java_home = None
+        for _, _, key, value in parsed or []:
+            if key == 'org.gradle.java.home':
+                gradle_java_home = value
+        return os.path.expanduser(gradle_java_home) if gradle_java_home else None
+
     def _gradle_java_cacerts(self, gradle_props, parsed=None):
         """Return cacerts for Gradle's pinned JDK, or the active JDK."""
         if parsed is None:
             parsed = self._property_lines_with_vendor_scope(gradle_props)
-        gradle_java_home = None
-        for _, _, key, value in parsed:
-            if key == 'org.gradle.java.home':
-                gradle_java_home = value
+        if parsed is None:
+            return ''
+        gradle_java_home = self._gradle_pinned_java_home(parsed)
         if gradle_java_home:
-            gradle_java_home = os.path.expanduser(gradle_java_home)
             self.print_debug(
                 f"Gradle selects Java home from org.gradle.java.home: {gradle_java_home}"
             )
@@ -2506,7 +2517,8 @@ class FumitmPython:
 
         A successful os.path.exists() does not show that the open will succeed. The
         path can be a dangling symlink, be unreadable, or be removed in the
-        interval. A caller reads None as "no content" and does not stop the run.
+        interval. Callers decide whether None is harmless absence or a fault that
+        must fail closed.
         """
         try:
             with open(path, 'r') as f:
@@ -5484,9 +5496,23 @@ class FumitmPython:
             return ToolResult('gradle', 'skipped', 'gradle not found in PATH')
 
         parsed = self._property_lines_with_vendor_scope(gradle_props)
+        if parsed is None:
+            self.print_error(f"Could not read Gradle properties at {gradle_props}")
+            return ToolResult(
+                'gradle', 'failed',
+                'Could not read Gradle properties; existing override preserved'
+            )
+        pinned_java_home = self._gradle_pinned_java_home(parsed)
         if self._aikido_active:
             cacerts = self._gradle_java_cacerts(gradle_props, parsed=parsed)
             if not cacerts:
+                if pinned_java_home:
+                    message = (
+                        'org.gradle.java.home has no Java cacerts file: '
+                        f'{pinned_java_home}'
+                    )
+                    self.print_error(message)
+                    return ToolResult('gradle', 'failed', message)
                 self.print_error("Could not find Java cacerts file for Gradle")
                 return ToolResult('gradle', 'skipped', 'Java cacerts file not found')
             java_status = self._ensure_roots_in_keystore(
@@ -5540,6 +5566,13 @@ class FumitmPython:
 
         cacerts = self._gradle_java_cacerts(gradle_props, parsed=parsed)
         if not cacerts:
+            if pinned_java_home:
+                message = (
+                    'org.gradle.java.home has no Java cacerts file: '
+                    f'{pinned_java_home}'
+                )
+                self.print_error(message)
+                return ToolResult('gradle', 'failed', message)
             self.print_error("Could not find Java cacerts file for Gradle")
             return ToolResult('gradle', 'skipped', 'Java cacerts file not found')
 
@@ -7223,8 +7256,14 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         has_issues = False
         gradle_props = self.get_gradle_properties_path()
         if self.command_exists('gradle') or os.path.exists(gradle_props):
+            parsed = self._property_lines_with_vendor_scope(gradle_props)
+            if parsed is None:
+                self.print_warn(
+                    f"  ✗ Could not read Gradle properties at {gradle_props}"
+                )
+                return True
             if self._aikido_active:
-                parsed = self._property_lines_with_vendor_scope(gradle_props)
+                pinned_java_home = self._gradle_pinned_java_home(parsed)
                 managed = self._gradle_fumitm_truststore_properties()
                 truststore_override = {
                     'systemProp.javax.net.ssl.trustStore':
@@ -7240,6 +7279,12 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     return True
                 cacerts = self._gradle_java_cacerts(gradle_props, parsed=parsed)
                 if not cacerts:
+                    if pinned_java_home:
+                        self.print_warn(
+                            "  ✗ org.gradle.java.home has no Java cacerts file: "
+                            f"{pinned_java_home}"
+                        )
+                        return True
                     self.print_warn("  ✗ Could not find Java cacerts for Gradle")
                     return True
                 if not self._keystore_has_expected_roots(
@@ -7253,7 +7298,11 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 self.print_info("  ✓ Gradle uses Aikido/JDK trust configuration")
                 return False
             if os.path.exists(gradle_props):
-                current_props = self.read_properties_file(gradle_props)
+                current_props = {
+                    key: value
+                    for _, _, key, value in parsed
+                    if key is not None
+                }
                 gradle_cacerts = self.get_gradle_custom_cacerts_path()
                 expected = {
                     'systemProp.javax.net.ssl.trustStore': gradle_cacerts,
