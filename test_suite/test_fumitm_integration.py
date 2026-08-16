@@ -3951,6 +3951,16 @@ class TestBareReturnsFixed(FumitmTestCase):
             str(tmp_path / 'missing.properties')
         ) == []
 
+    def test_gradle_dangling_properties_symlink_is_absent(self, tmp_path):
+        """Gradle treats an unresolvable properties symlink as an absent file."""
+        instance = self.create_fumitm_instance()
+        gradle_props = tmp_path / 'gradle.properties'
+        gradle_props.symlink_to(tmp_path / 'missing.properties')
+
+        assert os.path.lexists(gradle_props)
+        assert not gradle_props.exists()
+        assert instance._property_lines_with_vendor_scope(str(gradle_props)) == []
+
     def test_gradle_stale_pinned_java_home_names_the_path(
             self, tmp_path, monkeypatch, capsys):
         """A stale Gradle JDK pin fails with an actionable path."""
@@ -3975,6 +3985,66 @@ class TestBareReturnsFixed(FumitmTestCase):
         output = capsys.readouterr().out
         assert 'org.gradle.java.home has no Java cacerts file: /stale/jdk' in output
         assert mock_find.call_args_list == [call('/stale/jdk'), call('/stale/jdk')]
+
+    def test_gradle_non_aikido_status_flags_stale_pinned_java_home(
+            self, tmp_path, monkeypatch, capsys):
+        """Non-Aikido status and fix agree that a stale JDK pin is unhealthy."""
+        gradle_home = tmp_path / '.gradle'
+        gradle_home.mkdir()
+        monkeypatch.setenv('GRADLE_USER_HOME', str(gradle_home))
+        gradle_props = gradle_home / 'gradle.properties'
+        gradle_props.write_text(
+            'org.gradle.java.home=/stale/jdk\n'
+            f'systemProp.javax.net.ssl.trustStore={gradle_home / "custom-cacerts"}\n'
+            'systemProp.javax.net.ssl.trustStorePassword=changeit\n'
+            'systemProp.javax.net.ssl.trustStoreType=PKCS12\n'
+            'systemProp.https.protocols=TLSv1.2\n'
+        )
+        instance = self.create_fumitm_instance(mode='status', no_aikido=True)
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'find_java_cacerts', return_value='') as mock_find, \
+             patch.object(
+                 instance, '_gradle_custom_truststore_has_roots', return_value=True
+             ):
+            assert instance.check_gradle_status('/unused/provider.pem') is True
+
+        assert 'org.gradle.java.home has no Java cacerts file: /stale/jdk' in (
+            capsys.readouterr().out
+        )
+        mock_find.assert_called_once_with('/stale/jdk')
+
+    def test_gradle_spaced_properties_are_already_configured(
+            self, tmp_path, monkeypatch):
+        """Whitespace around '=' does not cause an endless Gradle rewrite."""
+        gradle_home = tmp_path / '.gradle'
+        gradle_home.mkdir()
+        monkeypatch.setenv('GRADLE_USER_HOME', str(gradle_home))
+        gradle_props = gradle_home / 'gradle.properties'
+        original = (
+            f'systemProp.javax.net.ssl.trustStore = {gradle_home / "custom-cacerts"}\n'
+            'systemProp.javax.net.ssl.trustStorePassword = changeit\n'
+            'systemProp.javax.net.ssl.trustStoreType = PKCS12\n'
+            'systemProp.https.protocols = TLSv1.2\n'
+        )
+        gradle_props.write_text(original)
+        instance = self.create_fumitm_instance(mode='install', no_aikido=True)
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'find_java_cacerts', return_value='/fake/cacerts'), \
+             patch.object(
+                 instance, 'ensure_gradle_custom_truststore', return_value='already_ok'
+             ):
+            result = instance.setup_gradle_cert()
+
+        assert result.status == 'already_ok'
+        assert gradle_props.read_text() == original
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(
+                 instance, '_gradle_custom_truststore_has_roots', return_value=True
+             ):
+            assert instance.check_gradle_status('/unused/provider.pem') is False
 
     def test_gradle_rewrites_without_editing_vendor_override_block(self, tmp_path):
         """setup_gradle_cert appends a final managed block without changing vendor markers."""

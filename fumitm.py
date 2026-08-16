@@ -2054,7 +2054,7 @@ class FumitmPython:
                 in_vendor_block = False
                 continue
             if '=' in line and not line.startswith('#'):
-                key, val = line.split('=', 1)
+                key, val = (part.strip() for part in line.split('=', 1))
                 current_props[key] = val
                 if key in key_counts and not in_vendor_block:
                     key_counts[key] += 1
@@ -2078,8 +2078,10 @@ class FumitmPython:
                 in_vendor_block = False
                 updated_lines.append(line)
                 continue
-            if (not in_vendor_block
-                    and any(stripped.startswith(key + '=') for key in managed_keys)):
+            line_key = None
+            if '=' in stripped and not stripped.startswith('#'):
+                line_key = stripped.split('=', 1)[0].strip()
+            if not in_vendor_block and line_key in managed_keys:
                 continue
             updated_lines.append(line)
 
@@ -2102,11 +2104,13 @@ class FumitmPython:
         return True
 
     def _property_lines_with_vendor_scope(self, path):
-        """Return parsed property lines, [] when absent, or None when unreadable."""
+        """Return parsed lines, [] when absent/dangling, or None when unreadable."""
         text = self._read_text_or_none(path)
         if text is None:
             try:
-                os.lstat(path)
+                # Follow symlinks: Gradle treats an unresolvable properties link
+                # like an absent file, while a readable link is parsed normally.
+                os.stat(path)
             except FileNotFoundError:
                 return []
             except OSError as e:
@@ -7262,8 +7266,8 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     f"  ✗ Could not read Gradle properties at {gradle_props}"
                 )
                 return True
+            pinned_java_home = self._gradle_pinned_java_home(parsed)
             if self._aikido_active:
-                pinned_java_home = self._gradle_pinned_java_home(parsed)
                 managed = self._gradle_fumitm_truststore_properties()
                 truststore_override = {
                     'systemProp.javax.net.ssl.trustStore':
@@ -7298,6 +7302,15 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 self.print_info("  ✓ Gradle uses Aikido/JDK trust configuration")
                 return False
             if os.path.exists(gradle_props):
+                if (
+                    pinned_java_home
+                    and not self.find_java_cacerts(pinned_java_home)
+                ):
+                    self.print_warn(
+                        "  ✗ org.gradle.java.home has no Java cacerts file: "
+                        f"{pinned_java_home}"
+                    )
+                    return True
                 current_props = {
                     key: value
                     for _, _, key, value in parsed
