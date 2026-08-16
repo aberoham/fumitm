@@ -225,6 +225,7 @@ class TestAikidoBundleAssembly(FumitmTestCase):
                 input=mock_data.MOCK_CERTIFICATE,
                 text=True,
                 capture_output=True,
+                timeout=60,
                 check=False,
             ),
             call(
@@ -235,6 +236,7 @@ class TestAikidoBundleAssembly(FumitmTestCase):
                 input=mock_data.MOCK_AIKIDO_ROOT_CERT,
                 text=True,
                 capture_output=True,
+                timeout=60,
                 check=False,
             ),
             call(
@@ -243,6 +245,7 @@ class TestAikidoBundleAssembly(FumitmTestCase):
                     'update-ca-certificates',
                 ],
                 capture_output=True,
+                timeout=60,
                 check=False,
             ),
         ]

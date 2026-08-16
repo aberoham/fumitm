@@ -148,7 +148,7 @@ The script follows a modular architecture with these key components:
    - Handle permission issues by suggesting user-writable alternatives
    - Support for: Homebrew CA Certificates, Node.js/npm, Python, gcloud, Git, curl, Java/JVM, jenv, Gradle, DBeaver, wget, Docker (any backend), Podman, Rancher, Colima, Android Emulator
    - Tools can be selectively processed using `--tools` option with keys or tags
-   - Docker resolves its effective endpoint with `DOCKER_HOST` taking precedence over the current context. A matching Colima socket uses native `colima ssh`; unknown backends use the generic nsenter path.
+   - Docker resolves its effective endpoint with `DOCKER_HOST` taking precedence over the current context. A matching Colima socket uses bounded native `colima ssh`; unknown backends use the generic nsenter path. The explicit Colima tool uses that selected profile, or the sole running named profile when Docker does not select one.
 
 5. **Certificate Helpers**:
    - `create_bundle_with_system_certs(path)`: Creates a CA bundle initialized with system certificates from `/etc/ssl/cert.pem` (macOS) or `/etc/ssl/certs/ca-certificates.crt` (Linux)
@@ -160,7 +160,7 @@ The script follows a modular architecture with these key components:
    - `_install_cert_in_docker_vm()`: Installs the CA cert into the Docker VM's OS trust store via nsenter. Works with any Docker backend (OrbStack, Colima, Docker Desktop, Lima, etc.). Auto-detects Debian-style (`/usr/local/share/ca-certificates/` + `update-ca-certificates`) vs Fedora-style (`/etc/pki/ca-trust/source/anchors/` + `update-ca-trust`) cert paths inside the VM.
    - `_check_cert_in_docker_vm()`: Checks whether the cert exists in the VM (both Debian and Fedora paths).
    - `_effective_docker_endpoint()` / `_active_colima_profile_for_docker()`: Resolve the daemon selected by the Docker CLI and identify default or named Colima profiles from their socket path.
-   - `_restart_docker_in_vm()`: Restarts the Docker daemon for unknown backends, detecting the framework for the appropriate restart command (`orb restart docker`, `colima ssh -- sudo systemctl restart docker`, or generic nsenter fallback). Active Colima backends use `_restart_docker_in_colima()` so another installed runtime cannot be restarted by mistake.
+   - `_restart_docker_in_vm()`: Restarts the Docker daemon for unknown backends, detecting the framework for the appropriate restart command (`orb restart docker`, `colima ssh -- sudo systemctl restart docker`, or generic nsenter fallback). Active Colima backends and the explicit Colima tool use `_restart_docker_in_colima()` so another installed runtime cannot be restarted by mistake. Native Colima installation does not fall back to nsenter: that could target a different runtime and could need the registry trust being repaired.
    - `_print_docker_build_hint()`: Prints Dockerfile guidance for build-time trust. Docker build containers use the base image's CA store (not the VM's), so users must inject the cert in their Dockerfile. Printed once after all container tools, not per-tool.
    - Podman keeps its own `podman machine ssh` fallback since Podman VMs don't always have Docker available.
 

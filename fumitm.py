@@ -5684,11 +5684,14 @@ class FumitmPython:
                         profile, 'ssh', '--', 'test', '-f',
                         f'/usr/local/share/ca-certificates/{cert_name}.crt'
                     ),
-                    capture_output=True, check=False
+                    capture_output=True, timeout=30, check=False
                 )
                 if result.returncode != 0:
                     return False
             return True
+        except subprocess.TimeoutExpired:
+            self.print_debug(f"Timed out checking Colima profile {profile}")
+            return False
         except Exception:
             return False
 
@@ -5707,7 +5710,8 @@ class FumitmPython:
                         profile, 'ssh', '--', 'sudo', 'tee',
                         f'/usr/local/share/ca-certificates/{cert_name}.crt'
                     ),
-                    input=cert_content, text=True, capture_output=True, check=False
+                    input=cert_content, text=True, capture_output=True,
+                    timeout=60, check=False
                 )
                 if result.returncode != 0:
                     return False, 'Failed to copy certificate into VM'
@@ -5716,11 +5720,13 @@ class FumitmPython:
                 self._colima_cmd(
                     profile, 'ssh', '--', 'sudo', 'update-ca-certificates'
                 ),
-                capture_output=True, check=False
+                capture_output=True, timeout=60, check=False
             )
             if result.returncode == 0:
                 return True, 'Certificate installed in Colima VM'
             return False, 'Certificate copied but update-ca-certificates failed'
+        except subprocess.TimeoutExpired:
+            return False, 'colima ssh timed out'
         except Exception as e:
             return False, str(e)
 
@@ -5728,8 +5734,9 @@ class FumitmPython:
         """Configure the certificate for Colima.
 
         fumitm keeps persistent copies in ~/.docker/certs.d/ and installs the roots
-        into the VM with colima ssh. If that fails, it uses Docker nsenter. It then
-        starts Docker in the VM again.
+        into the selected VM with colima ssh. The native route is authoritative:
+        falling back to Docker nsenter could target a different installed runtime
+        and could require the registry access that this repair is meant to restore.
         """
         if not self.command_exists('colima'):
             return ToolResult('colima', 'skipped', 'Colima not installed')
@@ -5739,13 +5746,17 @@ class FumitmPython:
 
         persistent_installed = self._container_certs_present(docker_certs_dir)
 
+        profile = self._colima_profile_for_tool()
         vm_is_running = False
         vm_needs_cert = False
         try:
-            status_result = subprocess.run(['colima', 'status'], capture_output=True, check=False)
+            status_result = subprocess.run(
+                self._colima_cmd(profile, 'status'),
+                capture_output=True, timeout=10, check=False
+            )
             vm_is_running = (status_result.returncode == 0)
             if vm_is_running:
-                vm_needs_cert = not self._check_cert_in_colima_vm()
+                vm_needs_cert = not self._check_cert_in_colima_vm(profile)
         except Exception:
             pass
 
@@ -5762,7 +5773,9 @@ class FumitmPython:
                 self.print_action("Would install certificate into Colima VM")
         else:
             persistent_changed = False
+            vm_changed = False
             vm_failed = False
+            vm_failure_message = None
 
             if not persistent_installed:
                 self._install_container_certs(docker_certs_dir)
@@ -5770,27 +5783,33 @@ class FumitmPython:
 
             if vm_is_running and vm_needs_cert:
                 self.print_info("Installing certificate into Colima VM...")
-                # Use native colima ssh, fall back to Docker nsenter
-                success, msg = self._install_cert_via_colima_ssh()
-                if not success and self.command_exists('docker'):
-                    self.print_debug(f"colima ssh failed ({msg}), trying nsenter")
-                    success, msg = self._install_cert_in_docker_vm()
+                success, msg = self._install_cert_via_colima_ssh(profile)
                 if success:
                     self.print_info(msg)
-                    self._restart_docker_in_vm()
+                    vm_changed = True
+                    if not self._restart_docker_in_colima(profile):
+                        vm_failed = True
+                        vm_failure_message = (
+                            'VM certificate installed but Docker engine restart failed'
+                        )
                 else:
                     self.print_warn(f"Failed to install certificate into VM: {msg}")
                     vm_failed = True
+                    vm_failure_message = f'VM install failed: {msg}'
             elif vm_is_running and not vm_needs_cert:
                 self.print_info("Certificate already installed in VM")
             elif not vm_is_running:
                 self.print_info("Colima is not running - certificate will be applied on next start")
 
-            if vm_failed and not persistent_changed:
-                return ToolResult('colima', 'failed', 'Failed to install certificate into VM')
             if vm_failed:
-                return ToolResult('colima', 'configured', 'Persistent cert installed but VM install failed')
-            if persistent_changed:
+                if persistent_changed:
+                    message = f'Persistent cert installed; {vm_failure_message}'
+                else:
+                    message = vm_failure_message
+                return ToolResult(
+                    'colima', 'failed', message, persistent_changed or vm_changed
+                )
+            if persistent_changed or vm_changed:
                 return ToolResult('colima', 'configured', 'Certificate installed')
             return ToolResult('colima', 'already_ok', 'Certificate already installed')
 
@@ -5852,6 +5871,45 @@ class FumitmPython:
         if not self.command_exists('colima'):
             return None
         return self._colima_profile_from_endpoint(self._effective_docker_endpoint())
+
+    def _colima_profile_for_tool(self):
+        """Choose the Colima profile used by the explicit Colima tool.
+
+        Prefer the profile selected by Docker. If Docker does not identify one,
+        use the sole running profile from ``colima list``. Ambiguous or unavailable
+        state falls back to Colima's default profile.
+        """
+        profile = self._active_colima_profile_for_docker()
+        if profile:
+            return profile
+
+        try:
+            result = subprocess.run(
+                ['colima', 'list', '--json'],
+                capture_output=True, text=True, timeout=10, check=False
+            )
+            if result.returncode == 0:
+                running = []
+                for line in result.stdout.splitlines():
+                    try:
+                        entry = json.loads(line)
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    name = entry.get('name')
+                    status = entry.get('status')
+                    if (
+                        isinstance(name, str)
+                        and re.fullmatch(r'[A-Za-z0-9._-]+', name)
+                        and isinstance(status, str)
+                        and status.lower() == 'running'
+                    ):
+                        running.append(name)
+                if len(running) == 1:
+                    self.print_debug(f"Using the only running Colima profile: {running[0]}")
+                    return running[0]
+        except Exception as e:
+            self.print_debug(f"Could not list Colima profiles: {e}")
+        return 'default'
 
     def _find_nsenter_image(self):
         """Find a local Docker image that has nsenter.
@@ -6118,7 +6176,7 @@ class FumitmPython:
                 return ToolResult(
                     'docker', 'failed', message, persistent_changed or vm_changed
                 )
-            if persistent_changed:
+            if persistent_changed or vm_changed:
                 return ToolResult('docker', 'configured', 'Certificate installed')
             return ToolResult('docker', 'already_ok', 'Certificate already installed')
 
@@ -7084,6 +7142,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         """
         has_issues = False
         if self.command_exists('colima'):
+            profile = self._colima_profile_for_tool()
             # Check persistent certificate location first (primary)
             docker_certs_dir = os.path.expanduser("~/.docker/certs.d")
             cert_path = os.path.join(docker_certs_dir, f"{self.provider['container_cert_name']}.crt")
@@ -7099,9 +7158,12 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 has_issues = True
 
             try:
-                status_result = subprocess.run(['colima', 'status'], capture_output=True, check=False)
+                status_result = subprocess.run(
+                    self._colima_cmd(profile, 'status'),
+                    capture_output=True, timeout=10, check=False
+                )
                 if status_result.returncode == 0:
-                    if self._check_cert_in_colima_vm():
+                    if self._check_cert_in_colima_vm(profile):
                         self.print_info("  ✓ Certificate installed in running VM")
                     else:
                         self.print_info("  - Certificate not in VM (will be applied on restart)")
