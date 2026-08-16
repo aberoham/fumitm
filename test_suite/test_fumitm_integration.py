@@ -3621,6 +3621,431 @@ class TestBareReturnsFixed(FumitmTestCase):
             assert result.status == 'already_ok'
             assert result.tool == 'gradle'
 
+    def test_gradle_aikido_removes_only_fumitm_truststore_override(
+            self, tmp_path, monkeypatch):
+        """Aikido owns Gradle/JDK trust, so fumitm removes its final override."""
+        gradle_home = tmp_path / '.gradle'
+        gradle_home.mkdir()
+        monkeypatch.setenv('GRADLE_USER_HOME', str(gradle_home))
+        gradle_props = gradle_home / 'gradle.properties'
+        fumitm_store = gradle_home / 'custom-cacerts'
+        vendor_block = (
+            '# aikido-endpoint-java-gradle-cert-config-start\n'
+            'systemProp.javax.net.ssl.trustStore=/vendor/custom-cacerts\n'
+            'systemProp.javax.net.ssl.trustStorePassword=changeit\n'
+            'systemProp.javax.net.ssl.trustStoreType=PKCS12\n'
+            '# aikido-endpoint-java-gradle-cert-config-end\n'
+        )
+        gradle_props.write_text(
+            'org.gradle.daemon=true\n'
+            + vendor_block
+            + f'systemProp.javax.net.ssl.trustStore={fumitm_store}\n'
+            + 'systemProp.javax.net.ssl.trustStorePassword=changeit\n'
+            + 'systemProp.javax.net.ssl.trustStoreType=PKCS12\n'
+            + 'systemProp.https.protocols=TLSv1.2\n'
+        )
+        instance = self.create_fumitm_instance(
+            mode='install', no_aikido=False, with_aikido=True
+        )
+        # Model root retrieval failure. Detection state must survive even when
+        # _prepare_extra_roots removes the unresolved descriptor.
+        instance.extra_roots = []
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(
+                 instance, 'find_java_cacerts', return_value='/fake/cacerts'
+             ) as mock_find_java, \
+             patch.object(
+                 instance, '_ensure_roots_in_keystore', return_value='already_ok'
+             ) as mock_java_store, \
+             patch.object(
+                 instance, '_keystore_has_expected_roots', return_value=True
+             ) as mock_verify, \
+             patch.object(instance, 'ensure_gradle_custom_truststore') as mock_store:
+            result = instance.setup_gradle_cert()
+
+        assert instance._aikido_active is True
+        assert result.status == 'configured'
+        content = gradle_props.read_text()
+        assert str(fumitm_store) not in content
+        assert vendor_block in content
+        assert 'org.gradle.daemon=true\n' in content
+        assert 'systemProp.https.protocols=TLSv1.2\n' not in content
+        mock_find_java.assert_called_once()
+        mock_java_store.assert_called_once_with(
+            'keytool', '/fake/cacerts', 'Gradle Java truststore'
+        )
+        mock_verify.assert_called_once_with('keytool', '/fake/cacerts')
+        mock_store.assert_not_called()
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'find_java_cacerts', return_value='/fake/cacerts'), \
+             patch.object(
+                 instance, '_ensure_roots_in_keystore', return_value='already_ok'
+             ), \
+             patch.object(
+                 instance, '_keystore_has_expected_roots', return_value=True
+             ):
+            assert instance.setup_gradle_cert().status == 'already_ok'
+
+    def test_gradle_aikido_dry_run_reports_without_writing(
+            self, tmp_path, monkeypatch):
+        """Status mode reports the pending removal and keeps the file unchanged."""
+        gradle_home = tmp_path / '.gradle'
+        gradle_home.mkdir()
+        monkeypatch.setenv('GRADLE_USER_HOME', str(gradle_home))
+        gradle_props = gradle_home / 'gradle.properties'
+        original = (
+            f'systemProp.javax.net.ssl.trustStore={gradle_home / "custom-cacerts"}\n'
+            'systemProp.javax.net.ssl.trustStorePassword=changeit\n'
+            'systemProp.javax.net.ssl.trustStoreType=PKCS12\n'
+        )
+        gradle_props.write_text(original)
+        instance = self.create_fumitm_instance(
+            mode='status', no_aikido=False, with_aikido=True
+        )
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'find_java_cacerts', return_value='/fake/cacerts'), \
+             patch.object(
+                 instance, '_ensure_roots_in_keystore', return_value='already_ok'
+             ):
+            result = instance.setup_gradle_cert()
+
+        assert result.status == 'skipped'
+        assert gradle_props.read_text() == original
+
+    def test_gradle_aikido_preserves_user_truststore(self, tmp_path, monkeypatch):
+        """A non-fumitm truststore is user configuration and stays untouched."""
+        gradle_home = tmp_path / '.gradle'
+        gradle_home.mkdir()
+        monkeypatch.setenv('GRADLE_USER_HOME', str(gradle_home))
+        gradle_props = gradle_home / 'gradle.properties'
+        original = (
+            'systemProp.javax.net.ssl.trustStore=/user/custom-cacerts\n'
+            'systemProp.javax.net.ssl.trustStorePassword=changeit\n'
+            'systemProp.https.protocols=TLSv1.2\n'
+        )
+        gradle_props.write_text(original)
+        instance = self.create_fumitm_instance(
+            mode='install', no_aikido=False, with_aikido=True
+        )
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'find_java_cacerts', return_value='/fake/cacerts'), \
+             patch.object(
+                 instance, '_ensure_roots_in_keystore', return_value='already_ok'
+             ), \
+             patch.object(
+                 instance, '_keystore_has_expected_roots', return_value=True
+             ):
+            result = instance.setup_gradle_cert()
+
+        assert result.status == 'already_ok'
+        assert gradle_props.read_text() == original
+
+    def test_gradle_aikido_keeps_override_when_java_trust_fails(
+            self, tmp_path, monkeypatch):
+        """Do not remove the fallback before the JDK truststore is ready."""
+        gradle_home = tmp_path / '.gradle'
+        gradle_home.mkdir()
+        monkeypatch.setenv('GRADLE_USER_HOME', str(gradle_home))
+        gradle_props = gradle_home / 'gradle.properties'
+        original = (
+            f'systemProp.javax.net.ssl.trustStore={gradle_home / "custom-cacerts"}\n'
+            'systemProp.javax.net.ssl.trustStorePassword=changeit\n'
+            'systemProp.javax.net.ssl.trustStoreType=PKCS12\n'
+        )
+        gradle_props.write_text(original)
+        instance = self.create_fumitm_instance(
+            mode='install', no_aikido=False, with_aikido=True
+        )
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'find_java_cacerts', return_value='/fake/cacerts'), \
+             patch.object(
+                 instance, '_ensure_roots_in_keystore', return_value='failed'
+             ):
+            result = instance.setup_gradle_cert()
+
+        assert result.status == 'failed'
+        assert gradle_props.read_text() == original
+
+    def test_gradle_aikido_keeps_override_when_java_trust_is_unverified(
+            self, tmp_path, monkeypatch):
+        """A successful helper result is not enough without fingerprint proof."""
+        gradle_home = tmp_path / '.gradle'
+        gradle_home.mkdir()
+        monkeypatch.setenv('GRADLE_USER_HOME', str(gradle_home))
+        gradle_props = gradle_home / 'gradle.properties'
+        original = (
+            f'systemProp.javax.net.ssl.trustStore={gradle_home / "custom-cacerts"}\n'
+            'systemProp.javax.net.ssl.trustStorePassword=changeit\n'
+            'systemProp.javax.net.ssl.trustStoreType=PKCS12\n'
+        )
+        gradle_props.write_text(original)
+        instance = self.create_fumitm_instance(
+            mode='install', no_aikido=False, with_aikido=True
+        )
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'find_java_cacerts', return_value='/fake/cacerts'), \
+             patch.object(
+                 instance, '_ensure_roots_in_keystore', return_value='configured'
+             ), \
+             patch.object(
+                 instance, '_keystore_has_expected_roots', return_value=False
+             ):
+            result = instance.setup_gradle_cert()
+
+        assert result.status == 'failed'
+        assert gradle_props.read_text() == original
+
+    def test_gradle_aikido_honors_pinned_java_home(
+            self, tmp_path, monkeypatch):
+        """Fix and status inspect the JDK selected by org.gradle.java.home."""
+        gradle_home = tmp_path / '.gradle'
+        gradle_home.mkdir()
+        monkeypatch.setenv('GRADLE_USER_HOME', str(gradle_home))
+        gradle_props = gradle_home / 'gradle.properties'
+        gradle_props.write_text(
+            'org.gradle.java.home=/opt/jdk17\n'
+            f'systemProp.javax.net.ssl.trustStore={gradle_home / "custom-cacerts"}\n'
+        )
+        instance = self.create_fumitm_instance(
+            mode='install', no_aikido=False, with_aikido=True
+        )
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(
+                 instance, 'find_java_cacerts', return_value='/opt/jdk17/cacerts'
+             ) as mock_find, \
+             patch.object(
+                 instance, '_ensure_roots_in_keystore', return_value='already_ok'
+             ), \
+             patch.object(
+                 instance, '_keystore_has_expected_roots', return_value=True
+             ):
+            result = instance.setup_gradle_cert()
+
+        assert result.status == 'configured'
+        mock_find.assert_called_once_with('/opt/jdk17')
+        assert 'org.gradle.java.home=/opt/jdk17\n' in gradle_props.read_text()
+
+        instance.mode = 'status'
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(
+                 instance, 'find_java_cacerts', return_value='/opt/jdk17/cacerts'
+             ) as mock_status_find, \
+             patch.object(
+                 instance, '_keystore_has_expected_roots', return_value=True
+             ) as mock_verify:
+            assert instance.check_gradle_status('/unused/provider.pem') is False
+
+        mock_status_find.assert_called_once_with('/opt/jdk17')
+        mock_verify.assert_called_once_with(
+            'keytool', '/opt/jdk17/cacerts',
+            primary_cert_path='/unused/provider.pem',
+        )
+
+    def test_gradle_aikido_status_flags_fumitm_override(
+            self, tmp_path, monkeypatch):
+        """Aikido status is unhealthy only while fumitm's override remains."""
+        gradle_home = tmp_path / '.gradle'
+        gradle_home.mkdir()
+        monkeypatch.setenv('GRADLE_USER_HOME', str(gradle_home))
+        gradle_props = gradle_home / 'gradle.properties'
+        gradle_props.write_text(
+            f'systemProp.javax.net.ssl.trustStore={gradle_home / "custom-cacerts"}\n'
+        )
+        instance = self.create_fumitm_instance(
+            mode='status', no_aikido=False, with_aikido=True
+        )
+
+        with patch.object(instance, 'command_exists', return_value=True):
+            assert instance.check_gradle_status('/unused/provider.pem') is True
+
+        gradle_props.write_text('org.gradle.daemon=true\n')
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'find_java_cacerts', return_value='/fake/cacerts'), \
+             patch.object(instance, '_keystore_has_expected_roots', return_value=True):
+            assert instance.check_gradle_status('/unused/provider.pem') is False
+
+    def test_gradle_aikido_status_requires_provider_root_in_jdk(
+            self, tmp_path, monkeypatch):
+        """No override is healthy only when Gradle's JDK trusts every root."""
+        gradle_home = tmp_path / '.gradle'
+        gradle_home.mkdir()
+        monkeypatch.setenv('GRADLE_USER_HOME', str(gradle_home))
+        (gradle_home / 'gradle.properties').write_text('org.gradle.daemon=true\n')
+        instance = self.create_fumitm_instance(
+            mode='status', no_aikido=False, with_aikido=True
+        )
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'find_java_cacerts', return_value='/fake/cacerts'), \
+             patch.object(instance, '_keystore_has_expected_roots', return_value=False):
+            assert instance.check_gradle_status('/unused/provider.pem') is True
+
+    def test_keystore_expected_roots_requires_provider_and_aikido(self, tmp_path):
+        """The Gradle safety predicate checks every available proxy root."""
+        provider = tmp_path / 'provider.pem'
+        provider.write_text(mock_data.MOCK_CERTIFICATE)
+        aikido = tmp_path / 'aikido.pem'
+        aikido.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
+        instance = self.create_fumitm_instance(mode='status', no_aikido=True)
+        instance.cert_path = str(provider)
+        instance.extra_roots = [{
+            'keytool_alias': 'aikido-root',
+            'path': str(aikido),
+        }]
+        provider_fp = instance._cert_fingerprints(str(provider))[0]
+        aikido_fp = instance._cert_fingerprints(str(aikido))[0]
+
+        with patch.object(
+            instance, '_keytool_keystore_fingerprints', return_value={provider_fp}
+        ):
+            assert instance._keystore_has_expected_roots(
+                'keytool', '/fake/cacerts'
+            ) is False
+
+        with patch.object(
+            instance, '_keytool_keystore_fingerprints',
+            return_value={provider_fp, aikido_fp},
+        ):
+            assert instance._keystore_has_expected_roots(
+                'keytool', '/fake/cacerts'
+            ) is True
+
+    def test_gradle_unreadable_properties_fail_closed(
+            self, tmp_path, monkeypatch, capsys):
+        """An unreadable override is not treated as an absent, healthy file."""
+        gradle_home = tmp_path / '.gradle'
+        gradle_home.mkdir()
+        monkeypatch.setenv('GRADLE_USER_HOME', str(gradle_home))
+        gradle_props = gradle_home / 'gradle.properties'
+        gradle_props.write_text('org.gradle.daemon=true\n')
+        instance = self.create_fumitm_instance(
+            mode='install', no_aikido=False, with_aikido=True
+        )
+
+        with patch('builtins.open', side_effect=PermissionError('denied')), \
+             patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, '_ensure_roots_in_keystore') as mock_ensure:
+            assert instance._property_lines_with_vendor_scope(
+                str(gradle_props)
+            ) is None
+            result = instance.setup_gradle_cert()
+            assert instance.check_gradle_status('/unused/provider.pem') is True
+
+        assert result.status == 'failed'
+        assert 'existing override preserved' in result.message
+        assert 'Could not read Gradle properties' in capsys.readouterr().out
+        mock_ensure.assert_not_called()
+
+    def test_gradle_absent_properties_remain_an_empty_configuration(self, tmp_path):
+        """A missing Gradle properties file remains distinct from a read fault."""
+        instance = self.create_fumitm_instance()
+
+        assert instance._property_lines_with_vendor_scope(
+            str(tmp_path / 'missing.properties')
+        ) == []
+
+    def test_gradle_dangling_properties_symlink_is_absent(self, tmp_path):
+        """Gradle treats an unresolvable properties symlink as an absent file."""
+        instance = self.create_fumitm_instance()
+        gradle_props = tmp_path / 'gradle.properties'
+        gradle_props.symlink_to(tmp_path / 'missing.properties')
+
+        assert os.path.lexists(gradle_props)
+        assert not gradle_props.exists()
+        assert instance._property_lines_with_vendor_scope(str(gradle_props)) == []
+
+    def test_gradle_stale_pinned_java_home_names_the_path(
+            self, tmp_path, monkeypatch, capsys):
+        """A stale Gradle JDK pin fails with an actionable path."""
+        gradle_home = tmp_path / '.gradle'
+        gradle_home.mkdir()
+        monkeypatch.setenv('GRADLE_USER_HOME', str(gradle_home))
+        (gradle_home / 'gradle.properties').write_text(
+            'org.gradle.java.home=/stale/jdk\n'
+        )
+        instance = self.create_fumitm_instance(
+            mode='install', no_aikido=False, with_aikido=True
+        )
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'find_java_cacerts', return_value='') as mock_find:
+            result = instance.setup_gradle_cert()
+            assert instance.check_gradle_status('/unused/provider.pem') is True
+
+        assert result.status == 'failed'
+        assert 'org.gradle.java.home' in result.message
+        assert '/stale/jdk' in result.message
+        output = capsys.readouterr().out
+        assert 'org.gradle.java.home has no Java cacerts file: /stale/jdk' in output
+        assert mock_find.call_args_list == [call('/stale/jdk'), call('/stale/jdk')]
+
+    def test_gradle_non_aikido_status_flags_stale_pinned_java_home(
+            self, tmp_path, monkeypatch, capsys):
+        """Non-Aikido status and fix agree that a stale JDK pin is unhealthy."""
+        gradle_home = tmp_path / '.gradle'
+        gradle_home.mkdir()
+        monkeypatch.setenv('GRADLE_USER_HOME', str(gradle_home))
+        gradle_props = gradle_home / 'gradle.properties'
+        gradle_props.write_text(
+            'org.gradle.java.home=/stale/jdk\n'
+            f'systemProp.javax.net.ssl.trustStore={gradle_home / "custom-cacerts"}\n'
+            'systemProp.javax.net.ssl.trustStorePassword=changeit\n'
+            'systemProp.javax.net.ssl.trustStoreType=PKCS12\n'
+            'systemProp.https.protocols=TLSv1.2\n'
+        )
+        instance = self.create_fumitm_instance(mode='status', no_aikido=True)
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'find_java_cacerts', return_value='') as mock_find, \
+             patch.object(
+                 instance, '_gradle_custom_truststore_has_roots', return_value=True
+             ):
+            assert instance.check_gradle_status('/unused/provider.pem') is True
+
+        assert 'org.gradle.java.home has no Java cacerts file: /stale/jdk' in (
+            capsys.readouterr().out
+        )
+        mock_find.assert_called_once_with('/stale/jdk')
+
+    def test_gradle_spaced_properties_are_already_configured(
+            self, tmp_path, monkeypatch):
+        """Whitespace around '=' does not cause an endless Gradle rewrite."""
+        gradle_home = tmp_path / '.gradle'
+        gradle_home.mkdir()
+        monkeypatch.setenv('GRADLE_USER_HOME', str(gradle_home))
+        gradle_props = gradle_home / 'gradle.properties'
+        original = (
+            f'systemProp.javax.net.ssl.trustStore = {gradle_home / "custom-cacerts"}\n'
+            'systemProp.javax.net.ssl.trustStorePassword = changeit\n'
+            'systemProp.javax.net.ssl.trustStoreType = PKCS12\n'
+            'systemProp.https.protocols = TLSv1.2\n'
+        )
+        gradle_props.write_text(original)
+        instance = self.create_fumitm_instance(mode='install', no_aikido=True)
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'find_java_cacerts', return_value='/fake/cacerts'), \
+             patch.object(
+                 instance, 'ensure_gradle_custom_truststore', return_value='already_ok'
+             ):
+            result = instance.setup_gradle_cert()
+
+        assert result.status == 'already_ok'
+        assert gradle_props.read_text() == original
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(
+                 instance, '_gradle_custom_truststore_has_roots', return_value=True
+             ):
+            assert instance.check_gradle_status('/unused/provider.pem') is False
+
     def test_gradle_rewrites_without_editing_vendor_override_block(self, tmp_path):
         """setup_gradle_cert appends a final managed block without changing vendor markers."""
         instance = self.create_fumitm_instance(mode='install')
