@@ -199,6 +199,12 @@ SUPPLEMENTAL_ROOTS = {
         'run_dir': (
             '/Library/Application Support/AikidoSecurity/EndpointProtection/run'
         ),
+        # The agent writes its root alone here. Prefer this direct source over a
+        # keychain search or extraction from a large per-tool bundle.
+        'root_pem': (
+            '/Library/Application Support/AikidoSecurity/EndpointProtection/'
+            'run/endpoint-protection-proxy-ca-crt.pem'
+        ),
         'combined_pem': (
             '/Library/Application Support/AikidoSecurity/'
             'EndpointProtection/run/endpoint-protection-pip-combined-ca.pem'
@@ -614,14 +620,14 @@ class FumitmPython:
     def _detect_aikido(self):
         """Return True if Aikido Endpoint Protection is present.
 
-        One of these is sufficient: the AikidoSecurity directory is present, the
-        combined PEM is present, or the System Keychain holds a certificate with the
-        Aikido root CA prefix in its label. fumitm ignores the suffix of the label.
+        One of these is sufficient: the AikidoSecurity directory is present, or the
+        System Keychain holds a certificate with the Aikido root CA prefix in its
+        label. fumitm ignores the suffix of the label. The root and combined PEMs
+        are children of the support directory, so separate file checks are
+        redundant.
         """
         descriptor = SUPPLEMENTAL_ROOTS['aikido']
         if os.path.isdir(descriptor['support_dir']):
-            return True
-        if os.path.exists(descriptor['combined_pem']):
             return True
 
         if platform.system() == 'Darwin':
@@ -643,12 +649,13 @@ class FumitmPython:
         """Get the Aikido root CA certificates as PEM text.
 
         fumitm tries these sources in this sequence: a file that the operator gives
-        with ``--aikido-cert``, the macOS System Keychain, the combined PEM, and a
-        root that an earlier run kept. The first source and the last source let
-        ``--with-aikido`` succeed on a host with no Aikido agent, such as a CI
-        image. fumitm keeps only the certificates whose subject CN starts with the
-        Aikido root prefix. This removes the interception intermediate, which has a
-        hexadecimal CN and a short life.
+        with ``--aikido-cert``, the dedicated root PEM of the agent, the macOS
+        System Keychain, a maintained combined PEM, and a root that an earlier run
+        kept. The first source and the last source let ``--with-aikido`` succeed on
+        a host with no Aikido agent, such as a CI image. fumitm keeps only the
+        certificates whose subject CN starts with the Aikido root prefix. This
+        removes the interception intermediate, which has a hexadecimal CN and a
+        short life.
 
         Returns:
             str or None: PEM text with the Aikido roots, or None.
@@ -667,7 +674,13 @@ class FumitmPython:
                 return pem
             self.print_warn(f"No Aikido root CA found in {cert_path}")
 
-        # Source 2: macOS System Keychain, all matching certs by label prefix.
+        # Source 2: the dedicated single-certificate file of the live agent.
+        pem = self._read_aikido_root_from_file(descriptor['root_pem'], prefix)
+        if pem:
+            self.print_info(f"Using Aikido root CA from {descriptor['root_pem']}")
+            return pem
+
+        # Source 3: macOS System Keychain, all matching certs by label prefix.
         if platform.system() == 'Darwin':
             try:
                 result = subprocess.run(
@@ -683,13 +696,13 @@ class FumitmPython:
             except Exception as e:
                 self.print_debug(f"Aikido keychain extraction failed: {e}")
 
-        # Source 3: maintained combined PEM written by the live Aikido agent.
+        # Source 4: maintained combined PEM written by the live Aikido agent.
         pem = self._read_aikido_root_from_file(descriptor['combined_pem'], prefix)
         if pem:
             self.print_info(f"Using Aikido root CA from {descriptor['combined_pem']}")
             return pem
 
-        # Source 4: a root that an earlier fumitm run kept. This keeps
+        # Source 5: a root that an earlier fumitm run kept. This keeps
         # --with-aikido usable after the agent is removed.
         persisted = os.path.expanduser(descriptor['cert_path'])
         pem = self._read_aikido_root_from_file(persisted, prefix)
@@ -756,14 +769,18 @@ class FumitmPython:
         text = self._read_text_or_none(path)
         if text is None:
             return []
+        return self._pem_fingerprints(text, path)
+
+    def _pem_fingerprints(self, text, source):
+        """Return SHA-256 fingerprints for the certificate blocks in PEM text."""
         fingerprints = []
-        for block in self._pem_blocks(text):
+        for block in self._pem_blocks(text or ''):
             body = ''.join(block.split('-----BEGIN CERTIFICATE-----')[1]
                                 .split('-----END CERTIFICATE-----')[0].split())
             try:
                 fingerprints.append(hashlib.sha256(base64.b64decode(body)).hexdigest())
             except Exception as e:
-                self.print_debug(f"Could not fingerprint a block of {path}: {e}")
+                self.print_debug(f"Could not fingerprint a block of {source}: {e}")
         return fingerprints
 
     def _aikido_has_adopted(self, cert_path):
@@ -3211,6 +3228,41 @@ class FumitmPython:
         except Exception:
             return False
 
+    def _keytool_keystore_fingerprints(self, keytool_bin, keystore, storetype=None):
+        """Return certificate fingerprints in a keystore, or None on uncertainty.
+
+        ``keytool -list -rfc`` emits each trusted certificate as PEM. Certificate
+        identity is independent of its alias, so this also finds roots installed
+        by another product under a vendor-specific name.
+        """
+        try:
+            cmd = [keytool_bin, '-list', '-rfc', '-keystore', keystore,
+                   '-storepass', 'changeit']
+            if storetype:
+                cmd.extend(['-storetype', storetype])
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, check=False
+            )
+            if result.returncode != 0:
+                return None
+            stdout = result.stdout
+            if not stdout or '-----BEGIN CERTIFICATE-----' not in stdout:
+                return None
+            return set(self._pem_fingerprints(stdout, keystore))
+        except Exception as e:
+            self.print_debug(f"Could not list certificate identities in {keystore}: {e}")
+            return None
+
+    def _keystore_has_cert_path(self, fingerprints, cert_path):
+        """Return whether a keystore fingerprint set contains cert_path's entry.
+
+        Java's historical non-split import uses the first certificate from a PEM
+        chain for one trusted-certificate alias. Split-chain callers materialize
+        one certificate per file, so the same rule applies to both forms.
+        """
+        desired = self._cert_fingerprints(cert_path)
+        return bool(desired and desired[0] in fingerprints)
+
     def _ensure_roots_in_keystore(self, keytool_bin, keystore, label, storetype=None,
                                   alias_pairs=None, split_chains=False):
         """Import the primary root and each supplemental root into a Java keystore.
@@ -3225,10 +3277,72 @@ class FumitmPython:
         alias_pairs, temp_paths = self._materialize_alias_pairs(
             alias_pairs, split_chains=split_chains
         )
+        keystore_fingerprints = self._keytool_keystore_fingerprints(
+            keytool_bin, keystore, storetype=storetype
+        )
         try:
             for alias, cert_path in alias_pairs:
-                if self._keytool_alias_present(keytool_bin, keystore, alias, storetype=storetype):
+                desired_fingerprint = None
+                if keystore_fingerprints is not None:
+                    if self._keystore_has_cert_path(
+                        keystore_fingerprints, cert_path
+                    ):
+                        continue
+                    desired = self._cert_fingerprints(cert_path)
+                    if not desired:
+                        self.print_warn(
+                            f"    ✗ {label}: Could not identify {alias} certificate"
+                        )
+                        failed = True
+                        continue
+                    desired_fingerprint = desired[0]
+                alias_present = self._keytool_alias_present(
+                    keytool_bin, keystore, alias, storetype=storetype
+                )
+                if keystore_fingerprints is None and alias_present:
+                    # Preserve the old idempotency check when keytool cannot give
+                    # a parseable RFC listing. The result is uncertain, not absent.
                     continue
+                if keystore_fingerprints is not None and alias_present:
+                    self.print_warn(
+                        f"    ✗ {label}: {alias} exists with a different certificate"
+                    )
+                    if not self.is_install_mode():
+                        self.print_action(
+                            f"    Would replace {alias} in: {keystore}"
+                        )
+                        imported = True
+                        continue
+                    delete_cmd = [
+                        keytool_bin, '-delete', '-alias', alias,
+                        '-keystore', keystore, '-storepass', 'changeit'
+                    ]
+                    if storetype:
+                        delete_cmd.extend(['-storetype', storetype])
+                    delete_result = subprocess.run(
+                        delete_cmd, capture_output=True, text=True, check=False
+                    )
+                    if delete_result.returncode != 0:
+                        self.print_warn(
+                            f"    ✗ {label}: Failed to remove outdated {alias}"
+                        )
+                        self.print_info("      Fix with:")
+                        command = (
+                            f"        sudo {keytool_bin} -delete -alias {alias}"
+                            f" -keystore {keystore} -storepass changeit"
+                        )
+                        if storetype:
+                            command += f" -storetype {storetype}"
+                        print(command)
+                        if delete_result.stdout:
+                            self.print_warn(
+                                f"      Keytool response: {delete_result.stdout}"
+                            )
+                        failed = True
+                        continue
+                    self.print_info(
+                        f"    ✓ {label}: outdated {alias} removed"
+                    )
                 if not self.is_install_mode():
                     self.print_action(f"    Would import {alias} certificate to: {keystore}")
                     imported = True
@@ -3245,6 +3359,8 @@ class FumitmPython:
                 if result.returncode == 0:
                     self.print_info(f"    ✓ {label}: {alias} added successfully")
                     imported = True
+                    if keystore_fingerprints is not None and desired_fingerprint:
+                        keystore_fingerprints.add(desired_fingerprint)
                 else:
                     self.print_warn(f"    ✗ {label}: Failed to add {alias} (may require sudo)")
                     self.print_info("      Fix with:")
@@ -3264,7 +3380,7 @@ class FumitmPython:
                     os.unlink(path)
                 except OSError:
                     pass
-        if failed and not imported:
+        if failed:
             return 'failed'
         if imported:
             return 'configured'
@@ -3274,13 +3390,30 @@ class FumitmPython:
         """Return True if the managed Gradle truststore contains every proxy CA."""
         if not os.path.exists(gradle_cacerts):
             return False
-        alias_names = self._expanded_alias_names(self._all_root_aliases())
-        return all(
-            self._keytool_alias_present(
-                'keytool', gradle_cacerts, alias, storetype='PKCS12'
-            )
-            for alias in alias_names
+        alias_pairs, temp_paths = self._materialize_alias_pairs(
+            self._all_root_aliases(), split_chains=True
         )
+        try:
+            fingerprints = self._keytool_keystore_fingerprints(
+                'keytool', gradle_cacerts, storetype='PKCS12'
+            )
+            if fingerprints is not None:
+                return all(
+                    self._keystore_has_cert_path(fingerprints, cert_path)
+                    for _, cert_path in alias_pairs
+                )
+            return all(
+                self._keytool_alias_present(
+                    'keytool', gradle_cacerts, alias, storetype='PKCS12'
+                )
+                for alias, _ in alias_pairs
+            )
+        finally:
+            for path in temp_paths:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
     def ensure_gradle_custom_truststore(self, source_cacerts, gradle_cacerts):
         """Ensure Gradle's managed PKCS12 truststore exists and contains proxy roots."""

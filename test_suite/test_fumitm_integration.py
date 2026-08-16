@@ -2491,10 +2491,9 @@ class TestToolResultAccuracy(FumitmTestCase):
              patch.object(instance, 'find_java_cacerts', return_value='/fake/cacerts'), \
              patch('subprocess.run') as mock_run:
 
-            call_count = [0]
+            import_count = [0]
 
             def run_side_effect(*args, **kwargs):
-                call_count[0] += 1
                 result = MagicMock()
                 cmd = args[0]
                 if '-list' in cmd:
@@ -2502,8 +2501,9 @@ class TestToolResultAccuracy(FumitmTestCase):
                     result.returncode = 1
                     result.stdout = b''
                 elif '-import' in cmd:
+                    import_count[0] += 1
                     # First import succeeds, second fails
-                    if call_count[0] == 2:  # first -import
+                    if import_count[0] == 1:
                         result.returncode = 0
                         result.stdout = b'Certificate was added'
                     else:  # second -import
@@ -2648,17 +2648,17 @@ class TestToolResultAccuracy(FumitmTestCase):
              patch.object(instance, 'find_java_cacerts', return_value='/fake/cacerts'), \
              patch('subprocess.run') as mock_run:
 
-            call_count = [0]
+            import_count = [0]
 
             def run_side_effect(*args, **kwargs):
-                call_count[0] += 1
                 result = MagicMock()
                 cmd = args[0]
                 if '-list' in cmd:
                     result.returncode = 1
                     result.stdout = ''
                 elif '-import' in cmd:
-                    if call_count[0] == 2:
+                    import_count[0] += 1
+                    if import_count[0] == 1:
                         result.returncode = 0
                         result.stdout = 'Certificate was added'
                     else:
@@ -3438,6 +3438,28 @@ class TestBareReturnsFixed(FumitmTestCase):
             'aikido-root',
         ]
 
+    def test_gradle_truststore_accepts_matching_certificate_under_vendor_alias(
+            self, tmp_path):
+        """Gradle idempotency also uses certificate identity, not alias."""
+        instance = self.create_fumitm_instance(mode='install')
+        desired = tmp_path / 'aikido-root.pem'
+        desired.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
+        instance.cert_path = str(desired)
+        instance.extra_roots = []
+        listing = MagicMock(
+            returncode=0,
+            stdout=(
+                'Alias name: aikido-safechain-proxy-ca\n'
+                + mock_data.MOCK_AIKIDO_ROOT_CERT
+            ),
+        )
+
+        with patch('os.path.exists', return_value=True), \
+             patch('subprocess.run', return_value=listing):
+            assert instance._gradle_custom_truststore_has_roots(
+                '/fake/custom-cacerts'
+            ) is True
+
     def test_java_keystore_import_does_not_split_pem_chain(self, tmp_path):
         """setup_java_cert keeps the historical single-alias import behavior."""
         instance = self.create_fumitm_instance(mode='install')
@@ -3472,6 +3494,111 @@ class TestBareReturnsFixed(FumitmTestCase):
             if cmd[:2] == ['keytool', '-import']
         ]
         assert imported_aliases == ['cloudflare-zerotrust']
+
+    def test_keystore_identity_accepts_aikido_vendor_alias(self, tmp_path):
+        """The same root under Aikido's alias must not be imported again."""
+        instance = self.create_fumitm_instance(mode='install')
+        aikido_root = tmp_path / 'aikido-root.pem'
+        aikido_root.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
+        listing = MagicMock(
+            returncode=0,
+            stdout=(
+                'Alias name: aikido-safechain-proxy-ca\n'
+                + mock_data.MOCK_AIKIDO_ROOT_CERT
+            ),
+        )
+
+        with patch('subprocess.run', return_value=listing) as mock_run:
+            result = instance._ensure_roots_in_keystore(
+                'keytool', '/fake/cacerts', 'test JDK',
+                alias_pairs=[('aikido-root', str(aikido_root))],
+            )
+
+        assert result == 'already_ok'
+        mock_run.assert_called_once_with(
+            [
+                'keytool', '-list', '-rfc', '-keystore', '/fake/cacerts',
+                '-storepass', 'changeit',
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_keystore_alias_collision_replaces_rotated_certificate(self, tmp_path):
+        """A managed alias holding an old root is replaced with the current one."""
+        instance = self.create_fumitm_instance(mode='install')
+        aikido_root = tmp_path / 'aikido-root.pem'
+        aikido_root.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
+
+        def run_side_effect(cmd, **kwargs):
+            if '-rfc' in cmd:
+                return MagicMock(
+                    returncode=0,
+                    stdout=mock_data.MOCK_CERTIFICATE,
+                )
+            if '-list' in cmd and '-alias' in cmd:
+                return MagicMock(returncode=0, stdout=b'aikido-root')
+            if '-delete' in cmd or '-import' in cmd:
+                return MagicMock(returncode=0, stdout='ok')
+            raise AssertionError(f'Unexpected keytool command: {cmd}')
+
+        with patch('subprocess.run', side_effect=run_side_effect) as mock_run:
+            result = instance._ensure_roots_in_keystore(
+                'keytool', '/fake/cacerts', 'test JDK',
+                alias_pairs=[('aikido-root', str(aikido_root))],
+            )
+
+        assert result == 'configured'
+        commands = [mock_call.args[0] for mock_call in mock_run.call_args_list]
+        delete_index = next(
+            index for index, command in enumerate(commands)
+            if command[:2] == ['keytool', '-delete']
+        )
+        import_index = next(
+            index for index, command in enumerate(commands)
+            if command[:2] == ['keytool', '-import']
+        )
+        assert delete_index < import_index
+
+    def test_keystore_collision_failure_wins_over_other_import(self, tmp_path):
+        """A successful second root cannot hide a failed alias replacement."""
+        instance = self.create_fumitm_instance(mode='install')
+        current_root = tmp_path / 'current-root.pem'
+        current_root.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
+
+        def run_side_effect(cmd, **kwargs):
+            if '-rfc' in cmd:
+                return MagicMock(returncode=0, stdout=mock_data.MOCK_CERTIFICATE)
+            if '-list' in cmd and '-alias' in cmd:
+                alias = cmd[cmd.index('-alias') + 1]
+                return MagicMock(
+                    returncode=0 if alias == 'rotated-root' else 1,
+                    stdout=alias.encode(),
+                )
+            if '-delete' in cmd:
+                return MagicMock(returncode=1, stdout='delete denied')
+            if '-import' in cmd:
+                return MagicMock(returncode=0, stdout='Certificate was added')
+            raise AssertionError(f'Unexpected keytool command: {cmd}')
+
+        with patch('subprocess.run', side_effect=run_side_effect) as mock_run:
+            result = instance._ensure_roots_in_keystore(
+                'keytool', '/fake/cacerts', 'test JDK',
+                alias_pairs=[
+                    ('rotated-root', str(current_root)),
+                    ('new-root', str(current_root)),
+                ],
+            )
+
+        assert result == 'failed'
+        commands = [mock_call.args[0] for mock_call in mock_run.call_args_list]
+        assert any(command[:2] == ['keytool', '-delete'] for command in commands)
+        assert any(
+            command[:2] == ['keytool', '-import']
+            and command[command.index('-alias') + 1] == 'new-root'
+            for command in commands
+        )
 
 
 class TestAwsVerification(FumitmTestCase):
