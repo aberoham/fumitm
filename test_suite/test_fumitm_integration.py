@@ -3001,6 +3001,42 @@ class TestToolResultAccuracy(FumitmTestCase):
             capture_output=True, text=True, timeout=10, check=False,
         )
 
+    def test_colima_names_the_profiles_it_cannot_choose_between(self, capsys):
+        """Silence here would end the run on a false "Colima is not running"."""
+        instance = self.create_fumitm_instance()
+        profiles = (
+            '{"name":"team-a","status":"Running"}\n'
+            '{"name":"team-b","status":"Running"}'
+        )
+        with patch.object(
+            instance, '_active_colima_profile_for_docker', return_value=None
+        ), patch(
+            'subprocess.run',
+            return_value=MagicMock(returncode=0, stdout=profiles),
+        ):
+            assert instance._colima_profile_for_tool() == 'default'
+
+        output = capsys.readouterr().out
+        assert 'team-a, team-b' in output
+        assert 'DOCKER_HOST' in output
+
+    def test_colima_stays_quiet_when_the_default_profile_is_running(self, capsys):
+        """Choosing a running default is defensible and needs no warning."""
+        instance = self.create_fumitm_instance()
+        profiles = (
+            '{"name":"default","status":"Running"}\n'
+            '{"name":"team-b","status":"Running"}'
+        )
+        with patch.object(
+            instance, '_active_colima_profile_for_docker', return_value=None
+        ), patch(
+            'subprocess.run',
+            return_value=MagicMock(returncode=0, stdout=profiles),
+        ):
+            assert instance._colima_profile_for_tool() == 'default'
+
+        assert 'Several Colima profiles' not in capsys.readouterr().out
+
     def test_colima_ssh_operations_have_timeouts(self, tmp_path):
         """A wedged Colima VM cannot hold a headless run forever."""
         instance = self.create_fumitm_instance()

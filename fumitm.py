@@ -5878,6 +5878,12 @@ class FumitmPython:
         Prefer the profile selected by Docker. If Docker does not identify one,
         use the sole running profile from ``colima list``. Ambiguous or unavailable
         state falls back to Colima's default profile.
+
+        Several running profiles with no Docker selection is a state fumitm cannot
+        resolve on its own, and picking one arbitrarily would repair the wrong VM.
+        It says so instead: without the warning the default profile is not running
+        either, and the run ends on "Colima is not running" while the VMs the user
+        cares about are up and untrusted.
         """
         profile = self._active_colima_profile_for_docker()
         if profile:
@@ -5907,6 +5913,15 @@ class FumitmPython:
                 if len(running) == 1:
                     self.print_debug(f"Using the only running Colima profile: {running[0]}")
                     return running[0]
+                if len(running) > 1 and 'default' not in running:
+                    self.print_warn(
+                        "Several Colima profiles are running and Docker selects "
+                        f"none of them: {', '.join(sorted(running))}"
+                    )
+                    self.print_info(
+                        "Point DOCKER_HOST or the Docker context at the profile "
+                        "to repair, or run: colima --profile <name> start"
+                    )
         except Exception as e:
             self.print_debug(f"Could not list Colima profiles: {e}")
         return 'default'
