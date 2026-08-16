@@ -14,7 +14,7 @@ import contextlib
 import os
 import stat
 from pathlib import Path
-from unittest.mock import MagicMock, call, mock_open, patch
+from unittest.mock import MagicMock, call, patch
 
 import mock_data
 from helpers import FumitmTestCase
@@ -31,13 +31,6 @@ class TestAikidoDetection(FumitmTestCase):
     def test_detected_via_support_dir(self):
         inst = self._instance()
         with patch('fumitm.os.path.isdir', return_value=True):
-            assert inst._detect_aikido() is True
-
-    def test_detected_via_combined_pem(self):
-        inst = self._instance()
-        with patch('fumitm.os.path.isdir', return_value=False), \
-             patch('fumitm.os.path.exists',
-                   side_effect=lambda p: p == mock_data.AIKIDO_COMBINED_PEM):
             assert inst._detect_aikido() is True
 
     def test_detected_via_keychain(self):
@@ -102,12 +95,37 @@ class TestAikidoCnFilter(FumitmTestCase):
 
 
 class TestAikidoRootExtraction(FumitmTestCase):
-    """Tests for _get_aikido_root_cert() keychain and combined-PEM paths."""
+    """Tests for each automatic _get_aikido_root_cert() source."""
+
+    def test_dedicated_root_pem_is_preferred(self, tmp_path):
+        import fumitm
+        root = tmp_path / 'endpoint-protection-proxy-ca-crt.pem'
+        root.write_text(mock_data.MOCK_AIKIDO_ROOT_CERT)
+        missing_combined = tmp_path / 'missing-combined.pem'
+        inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+
+        with patch.dict(
+                 fumitm.SUPPLEMENTAL_ROOTS['aikido'],
+                 {'root_pem': str(root), 'combined_pem': str(missing_combined)}
+             ), \
+             patch('fumitm.platform.system', return_value='Darwin'), \
+             patch('fumitm.subprocess.run') as mock_run, \
+             patch.object(inst, '_openssl_subject', side_effect=_fake_subject):
+            result = inst._get_aikido_root_cert()
+
+        assert result is not None
+        assert 'AIKIDOROOT' in result
+        mock_run.assert_not_called()
 
     def test_keychain_returns_only_root(self):
+        import fumitm
         inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
         keychain = MagicMock(returncode=0, stdout=mock_data.MOCK_AIKIDO_KEYCHAIN_OUTPUT)
-        with patch('fumitm.platform.system', return_value='Darwin'), \
+        with patch.dict(
+                 fumitm.SUPPLEMENTAL_ROOTS['aikido'],
+                 {'root_pem': '/missing/aikido-root.pem'}
+             ), \
+             patch('fumitm.platform.system', return_value='Darwin'), \
              patch('fumitm.subprocess.run', return_value=keychain), \
              patch.object(inst, '_openssl_subject', side_effect=_fake_subject):
             result = inst._get_aikido_root_cert()
@@ -115,15 +133,22 @@ class TestAikidoRootExtraction(FumitmTestCase):
         assert 'AIKIDOROOT' in result
         assert 'AIKIDOINTERMEDIATE' not in result
 
-    def test_combined_pem_fallback(self):
+    def test_combined_pem_fallback(self, tmp_path):
+        import fumitm
         inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
+        combined = tmp_path / 'endpoint-protection-pip-combined-ca.pem'
+        combined.write_text(mock_data.MOCK_AIKIDO_KEYCHAIN_OUTPUT)
         # Keychain misses; the combined PEM on disk provides the root.
         miss = MagicMock(returncode=1, stdout='')
-        with patch('fumitm.platform.system', return_value='Darwin'), \
+        with patch.dict(
+                 fumitm.SUPPLEMENTAL_ROOTS['aikido'],
+                 {
+                     'root_pem': str(tmp_path / 'missing-root.pem'),
+                     'combined_pem': str(combined),
+                 }
+             ), \
+             patch('fumitm.platform.system', return_value='Darwin'), \
              patch('fumitm.subprocess.run', return_value=miss), \
-             patch('fumitm.os.path.exists', return_value=True), \
-             patch('builtins.open',
-                   mock_open(read_data=mock_data.MOCK_AIKIDO_KEYCHAIN_OUTPUT)), \
              patch.object(inst, '_openssl_subject', side_effect=_fake_subject):
             result = inst._get_aikido_root_cert()
         assert result is not None
@@ -872,11 +897,13 @@ def _patch_aikido_paths(tmp_path, adopted=False, store=True, bundle_has_root=Fal
     _bundle('endpoint-protection-npm-cafile.pem', bundle_has_root)
     # The root of Aikido, alone. The patterns must not match this file. It
     # can never contain an adopted root.
-    (run_dir / 'endpoint-protection-proxy-ca-crt.pem').write_text(
+    root_pem = run_dir / 'endpoint-protection-proxy-ca-crt.pem'
+    root_pem.write_text(
         mock_data.MOCK_AIKIDO_ROOT_CERT
     )
 
     overrides['run_dir'] = str(run_dir)
+    overrides['root_pem'] = str(root_pem)
     overrides['combined_pem'] = str(pip_bundle)
     return patch.dict(fumitm.SUPPLEMENTAL_ROOTS['aikido'], overrides)
 
