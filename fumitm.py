@@ -7080,8 +7080,8 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
     def check_docker_status(self, temp_warp_cert):
         """Report the status of the Docker configuration with any backend.
 
-        Examines the permanent ~/.docker/certs.d/ location. When Docker operates, it
-        also examines the CA store of the VM with nsenter.
+        Examines the permanent ~/.docker/certs.d/ location. When Docker operates,
+        it also examines the VM CA store through the active backend.
         """
         has_issues = False
         if self.command_exists('docker'):
@@ -7111,6 +7111,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     self.print_info("  ✓ Certificate installed in Docker VM")
                 else:
                     self.print_info("  - Certificate not in VM (run fumitm --fix to install)")
+                    has_issues = True
             else:
                 self.print_info("  - Docker is not running")
         else:

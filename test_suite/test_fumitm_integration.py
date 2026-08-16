@@ -3165,6 +3165,23 @@ class TestToolResultAccuracy(FumitmTestCase):
         assert '"configured": 1' in summary
         assert '"changes_made": true' in summary
 
+    def test_docker_status_missing_vm_cert_needs_attention(self, capsys):
+        """Status must not call a broken running Docker VM healthy."""
+        instance = self.create_fumitm_instance()
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch('os.path.exists', return_value=True), \
+             patch.object(instance, '_status_container_certs_present', return_value=True), \
+             patch.object(instance, '_docker_is_running', return_value=True), \
+             patch.object(
+                 instance, '_active_colima_profile_for_docker', return_value='default'
+             ), \
+             patch.object(instance, '_check_cert_in_colima_vm', return_value=False):
+            has_issues = instance.check_docker_status('/tmp/proxy.pem')
+
+        assert has_issues is True
+        assert 'Certificate not in VM' in capsys.readouterr().out
+
     def test_docker_colima_restart_failure_is_partial(self, capsys):
         """A VM certificate change is partial until Docker restarts."""
         instance = self.create_fumitm_instance(mode='install')
