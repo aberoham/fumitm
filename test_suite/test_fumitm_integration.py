@@ -2876,6 +2876,7 @@ class TestToolResultAccuracy(FumitmTestCase):
         """setup_colima_cert returns already_ok when cert already installed."""
         instance = self.create_fumitm_instance(mode='install')
         with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, '_colima_profile_for_tool', return_value='default'), \
              patch('os.path.exists', return_value=True), \
              patch.object(instance, 'certificate_likely_exists_in_file', return_value=True), \
              patch('subprocess.run') as mock_run:
@@ -2883,11 +2884,12 @@ class TestToolResultAccuracy(FumitmTestCase):
             result = instance.setup_colima_cert()
             assert result.status == 'already_ok'
 
-    def test_colima_vm_install_fails_persistent_ok(self):
-        """setup_colima_cert returns configured when persistent ok but VM fails."""
+    def test_colima_vm_install_failure_is_partial(self, capsys):
+        """A persistent copy must not hide a failed repair of a running VM."""
         instance = self.create_fumitm_instance(mode='install')
         instance.cert_path = '/tmp/fake-cert.pem'
         with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, '_colima_profile_for_tool', return_value='default'), \
              patch('os.path.exists', return_value=False), \
              patch.object(instance, 'certificate_likely_exists_in_file', return_value=False), \
              patch.object(instance, '_safe_makedirs'), \
@@ -2895,10 +2897,20 @@ class TestToolResultAccuracy(FumitmTestCase):
              patch.object(instance, '_fix_ownership'), \
              patch('subprocess.run', return_value=MagicMock(returncode=0)), \
              patch.object(instance, '_check_cert_in_colima_vm', return_value=False), \
-             patch.object(instance, '_install_cert_via_colima_ssh', return_value=(False, 'test error')):
+             patch.object(
+                 instance, '_install_cert_via_colima_ssh', return_value=(False, 'test error')
+             ), \
+             patch.object(instance, '_install_cert_in_docker_vm') as mock_nsenter:
             result = instance.setup_colima_cert()
-            assert result.status == 'configured'
+            assert result.status == 'failed'
+            assert result.changed is True
             assert 'VM install failed' in result.message
+            mock_nsenter.assert_not_called()
+
+        assert instance._print_summary([result]) == 3
+        summary = capsys.readouterr().out
+        assert '"changes_made": true' in summary
+        assert '"partial": 1' in summary
 
     def test_colima_installs_via_ssh_when_docker_absent(self):
         """With colima, a running VM, and no docker, fumitm must not use the Docker path.
@@ -2915,6 +2927,7 @@ class TestToolResultAccuracy(FumitmTestCase):
             return cmd in ('colima',)  # docker is absent
 
         with patch.object(instance, 'command_exists', side_effect=selective_command_exists), \
+             patch.object(instance, '_colima_profile_for_tool', return_value='default'), \
              patch('os.path.exists', return_value=False), \
              patch.object(instance, 'certificate_likely_exists_in_file', return_value=False), \
              patch.object(instance, '_safe_makedirs'), \
@@ -2924,11 +2937,126 @@ class TestToolResultAccuracy(FumitmTestCase):
              patch.object(instance, '_check_cert_in_colima_vm', return_value=False), \
              patch.object(instance, '_install_cert_via_colima_ssh', return_value=(True, 'ok')) as mock_ssh, \
              patch.object(instance, '_install_cert_in_docker_vm') as mock_nsenter, \
-             patch.object(instance, '_restart_docker_in_vm'):
+             patch.object(
+                 instance, '_restart_docker_in_colima', return_value=True
+             ) as mock_restart, \
+             patch.object(instance, '_restart_docker_in_vm') as mock_generic_restart:
             result = instance.setup_colima_cert()
             assert result.status == 'configured'
-            mock_ssh.assert_called_once()
+            mock_ssh.assert_called_once_with('default')
             mock_nsenter.assert_not_called()
+            mock_restart.assert_called_once_with('default')
+            mock_generic_restart.assert_not_called()
+
+    def test_colima_uses_named_profile_and_reports_vm_change(self, capsys):
+        """The explicit tool repairs and restarts the selected named profile."""
+        instance = self.create_fumitm_instance(mode='install')
+        endpoint = 'unix:///Users/example/.colima/team-dev/docker.sock'
+
+        with patch.dict(os.environ, {'DOCKER_HOST': endpoint}), \
+             patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, '_container_certs_present', return_value=True), \
+             patch('subprocess.run', return_value=MagicMock(returncode=0)) as mock_run, \
+             patch.object(
+                 instance, '_check_cert_in_colima_vm', return_value=False
+             ) as mock_check, \
+             patch.object(
+                 instance, '_install_cert_via_colima_ssh', return_value=(True, 'ok')
+             ) as mock_install, \
+             patch.object(
+                 instance, '_restart_docker_in_colima', return_value=True
+             ) as mock_restart, \
+             patch.object(instance, '_restart_docker_in_vm') as mock_generic_restart:
+            result = instance.setup_colima_cert()
+
+        assert result.status == 'configured'
+        assert instance._print_summary([result]) == 0
+        assert '"changes_made": true' in capsys.readouterr().out
+        assert call(
+            ['colima', '--profile', 'team-dev', 'status'],
+            capture_output=True, timeout=10, check=False,
+        ) in mock_run.call_args_list
+        mock_check.assert_called_once_with('team-dev')
+        mock_install.assert_called_once_with('team-dev')
+        mock_restart.assert_called_once_with('team-dev')
+        mock_generic_restart.assert_not_called()
+
+    def test_colima_uses_sole_running_profile_without_docker_selection(self):
+        """A lone running named profile replaces the hard-wired default."""
+        instance = self.create_fumitm_instance()
+        profiles = (
+            '{"name":"default","status":"Stopped"}\n'
+            '{"name":"team-dev","status":"Running"}'
+        )
+        with patch.object(
+            instance, '_active_colima_profile_for_docker', return_value=None
+        ), patch(
+            'subprocess.run',
+            return_value=MagicMock(returncode=0, stdout=profiles),
+        ) as mock_run:
+            assert instance._colima_profile_for_tool() == 'team-dev'
+
+        mock_run.assert_called_once_with(
+            ['colima', 'list', '--json'],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+
+    def test_colima_names_the_profiles_it_cannot_choose_between(self, capsys):
+        """Silence here would end the run on a false "Colima is not running"."""
+        instance = self.create_fumitm_instance()
+        profiles = (
+            '{"name":"team-a","status":"Running"}\n'
+            '{"name":"team-b","status":"Running"}'
+        )
+        with patch.object(
+            instance, '_active_colima_profile_for_docker', return_value=None
+        ), patch(
+            'subprocess.run',
+            return_value=MagicMock(returncode=0, stdout=profiles),
+        ):
+            assert instance._colima_profile_for_tool() == 'default'
+
+        output = capsys.readouterr().out
+        assert 'team-a, team-b' in output
+        assert 'DOCKER_HOST' in output
+
+    def test_colima_stays_quiet_when_the_default_profile_is_running(self, capsys):
+        """Choosing a running default is defensible and needs no warning."""
+        instance = self.create_fumitm_instance()
+        profiles = (
+            '{"name":"default","status":"Running"}\n'
+            '{"name":"team-b","status":"Running"}'
+        )
+        with patch.object(
+            instance, '_active_colima_profile_for_docker', return_value=None
+        ), patch(
+            'subprocess.run',
+            return_value=MagicMock(returncode=0, stdout=profiles),
+        ):
+            assert instance._colima_profile_for_tool() == 'default'
+
+        assert 'Several Colima profiles' not in capsys.readouterr().out
+
+    def test_colima_ssh_operations_have_timeouts(self, tmp_path):
+        """A wedged Colima VM cannot hold a headless run forever."""
+        instance = self.create_fumitm_instance()
+        cert = tmp_path / 'proxy.pem'
+        cert.write_text(mock_data.MOCK_CERTIFICATE)
+        instance.cert_path = str(cert)
+
+        with patch(
+            'subprocess.run', side_effect=subprocess.TimeoutExpired('colima', 30)
+        ) as mock_check:
+            assert instance._check_cert_in_colima_vm('team-dev') is False
+        assert mock_check.call_args.kwargs['timeout'] == 30
+
+        with patch(
+            'subprocess.run', side_effect=subprocess.TimeoutExpired('colima', 60)
+        ) as mock_install:
+            success, message = instance._install_cert_via_colima_ssh('team-dev')
+        assert success is False
+        assert message == 'colima ssh timed out'
+        assert mock_install.call_args.kwargs['timeout'] == 60
 
     # --- Docker (generic) ---
 
@@ -2949,8 +3077,8 @@ class TestToolResultAccuracy(FumitmTestCase):
             result = instance.setup_docker_cert()
             assert result.status == 'already_ok'
 
-    def test_docker_vm_install_fails_persistent_ok(self):
-        """setup_docker_cert returns configured when persistent ok but VM fails."""
+    def test_docker_vm_install_failure_is_partial(self, capsys):
+        """A host-side copy must not hide a failed repair of a running VM."""
         instance = self.create_fumitm_instance(mode='install')
         instance.cert_path = '/tmp/fake-cert.pem'
         with patch.object(instance, 'command_exists', return_value=True), \
@@ -2960,11 +3088,158 @@ class TestToolResultAccuracy(FumitmTestCase):
              patch('shutil.copy'), \
              patch.object(instance, '_fix_ownership'), \
              patch.object(instance, '_docker_is_running', return_value=True), \
-             patch.object(instance, '_check_cert_in_docker_vm', return_value=False), \
-             patch.object(instance, '_install_cert_in_docker_vm', return_value=(False, 'test error')):
+             patch.object(
+                 instance, '_active_colima_profile_for_docker', return_value='default'
+             ), \
+             patch.object(instance, '_check_cert_in_colima_vm', return_value=False), \
+             patch.object(
+                 instance, '_install_cert_via_colima_ssh', return_value=(False, 'test error')
+             ), \
+             patch.object(instance, '_install_cert_in_docker_vm') as mock_nsenter:
             result = instance.setup_docker_cert()
-            assert result.status == 'configured'
+            assert result.status == 'failed'
+            assert result.changed is True
             assert 'VM install failed' in result.message
+            mock_nsenter.assert_not_called()
+
+        assert instance._print_summary([result]) == 3
+        summary = capsys.readouterr().out
+        assert '"partial": 1' in summary
+        assert '"exit_code": 3' in summary
+
+    def test_effective_docker_endpoint_prefers_docker_host(self):
+        """DOCKER_HOST wins over the selected Docker context."""
+        instance = self.create_fumitm_instance()
+        endpoint = 'unix:///Users/example/.colima/work/docker.sock'
+        with patch.dict(os.environ, {'DOCKER_HOST': endpoint}), \
+             patch('subprocess.run') as mock_run:
+            assert instance._effective_docker_endpoint() == endpoint
+            mock_run.assert_not_called()
+
+    def test_effective_docker_endpoint_uses_current_context(self):
+        """The current context supplies the endpoint when DOCKER_HOST is absent."""
+        instance = self.create_fumitm_instance()
+        context_endpoint = 'unix:///Users/example/.colima/default/docker.sock'
+        context_result = MagicMock(returncode=0, stdout=f'{context_endpoint}\n')
+        with patch.dict(os.environ, {}, clear=True), \
+             patch('subprocess.run', return_value=context_result) as mock_run:
+            assert instance._effective_docker_endpoint() == context_endpoint
+            mock_run.assert_called_once_with(
+                [
+                    'docker', 'context', 'inspect', '--format',
+                    '{{.Endpoints.docker.Host}}'
+                ],
+                capture_output=True, text=True, timeout=10, check=False
+            )
+
+    @pytest.mark.parametrize(
+        ('endpoint', 'profile'),
+        [
+            ('unix:///Users/example/.colima/default/docker.sock', 'default'),
+            ('unix:///Users/example/.colima/team-dev/docker.sock', 'team-dev'),
+            ('unix:///var/run/docker.sock', None),
+            ('tcp://127.0.0.1:2375', None),
+            ('unix:///Users/example/.colima/bad profile/docker.sock', None),
+        ],
+    )
+    def test_colima_profile_from_docker_endpoint(self, endpoint, profile):
+        """Only a valid Colima Unix socket selects the native backend."""
+        instance = self.create_fumitm_instance()
+        assert instance._colima_profile_from_endpoint(endpoint) == profile
+
+    def test_docker_uses_native_colima_backend_without_an_image(self):
+        """Docker selection repairs its active Colima VM without nsenter."""
+        instance = self.create_fumitm_instance(
+            mode='install', selected_tools=['docker']
+        )
+        endpoint = 'unix:///Users/example/.colima/team-dev/docker.sock'
+
+        assert instance.should_process_tool('docker') is True
+        assert instance.should_process_tool('colima') is False
+
+        with patch.dict(os.environ, {'DOCKER_HOST': endpoint}), \
+             patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, '_container_certs_present', return_value=False), \
+             patch.object(instance, '_install_container_certs'), \
+             patch.object(instance, '_docker_is_running', return_value=True), \
+             patch.object(instance, '_check_cert_in_colima_vm', return_value=False) as mock_check, \
+             patch.object(
+                 instance, '_install_cert_via_colima_ssh', return_value=(True, 'ok')
+             ) as mock_colima_install, \
+             patch.object(instance, '_install_cert_in_docker_vm') as mock_nsenter, \
+             patch.object(
+                 instance, '_restart_docker_in_colima', return_value=True
+             ) as mock_restart:
+            result = instance.setup_docker_cert()
+
+        assert result.status == 'configured'
+        mock_check.assert_called_once_with('team-dev')
+        mock_colima_install.assert_called_once_with('team-dev')
+        mock_nsenter.assert_not_called()
+        mock_restart.assert_called_once_with('team-dev')
+
+    def test_docker_vm_only_change_reports_configured(self, capsys):
+        """A successful VM-only repair must set changes_made for automation."""
+        instance = self.create_fumitm_instance(mode='install')
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, '_container_certs_present', return_value=True), \
+             patch.object(instance, '_docker_is_running', return_value=True), \
+             patch.object(
+                 instance, '_active_colima_profile_for_docker', return_value='default'
+             ), \
+             patch.object(instance, '_check_cert_in_colima_vm', return_value=False), \
+             patch.object(
+                 instance, '_install_cert_via_colima_ssh', return_value=(True, 'ok')
+             ), \
+             patch.object(instance, '_restart_docker_in_colima', return_value=True):
+            result = instance.setup_docker_cert()
+
+        assert result.status == 'configured'
+        assert instance._print_summary([result]) == 0
+        summary = capsys.readouterr().out
+        assert '"configured": 1' in summary
+        assert '"changes_made": true' in summary
+
+    def test_docker_status_missing_vm_cert_needs_attention(self, capsys):
+        """Status must not call a broken running Docker VM healthy."""
+        instance = self.create_fumitm_instance()
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch('os.path.exists', return_value=True), \
+             patch.object(instance, '_status_container_certs_present', return_value=True), \
+             patch.object(instance, '_docker_is_running', return_value=True), \
+             patch.object(
+                 instance, '_active_colima_profile_for_docker', return_value='default'
+             ), \
+             patch.object(instance, '_check_cert_in_colima_vm', return_value=False):
+            has_issues = instance.check_docker_status('/tmp/proxy.pem')
+
+        assert has_issues is True
+        assert 'Certificate not in VM' in capsys.readouterr().out
+
+    def test_docker_colima_restart_failure_is_partial(self, capsys):
+        """A VM certificate change is partial until Docker restarts."""
+        instance = self.create_fumitm_instance(mode='install')
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, '_container_certs_present', return_value=True), \
+             patch.object(instance, '_docker_is_running', return_value=True), \
+             patch.object(
+                 instance, '_active_colima_profile_for_docker', return_value='default'
+             ), \
+             patch.object(instance, '_check_cert_in_colima_vm', return_value=False), \
+             patch.object(
+                 instance, '_install_cert_via_colima_ssh', return_value=(True, 'ok')
+             ), \
+             patch.object(instance, '_restart_docker_in_colima', return_value=False):
+            result = instance.setup_docker_cert()
+
+        assert result.status == 'failed'
+        assert result.changed is True
+        assert 'restart failed' in result.message
+        assert instance._print_summary([result]) == 3
+        assert '"partial": 1' in capsys.readouterr().out
 
     def test_container_tool_keys_returns_tagged_tools(self):
         """_container_tool_keys includes all tools with 'container' tag."""
