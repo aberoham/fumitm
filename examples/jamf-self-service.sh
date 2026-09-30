@@ -59,6 +59,16 @@ err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $*" >&2; }
 bail() { err "$1"; exit "${2:-1}"; }
 
 # =============================================================================
+# Wrapper log
+# =============================================================================
+# Jamf does not always keep a script's output in the policy log, so a failure
+# before fumitm starts would otherwise leave no record on the Mac. Everything
+# this wrapper prints, including curl and Python errors, is copied to a file.
+/bin/mkdir -p "${LOG_DIR}"
+WRAPPER_LOG="${LOG_DIR}/selfservice-$(date '+%Y%m%d-%H%M%S').log"
+exec > >(/usr/bin/tee -a "${WRAPPER_LOG}") 2>&1
+
+# =============================================================================
 # Pre-flight: Python 3
 # =============================================================================
 if [[ ! -x "${PYTHON}" ]]; then
@@ -100,11 +110,6 @@ fi
 log "Console user: ${CONSOLE_USER} (home: ${CONSOLE_USER_HOME})"
 
 # =============================================================================
-# Pre-flight: Log directory
-# =============================================================================
-/bin/mkdir -p "${LOG_DIR}" 2>/dev/null
-
-# =============================================================================
 # Download / cache fumitm.py
 # =============================================================================
 download_fumitm() {
@@ -134,13 +139,13 @@ download_fumitm() {
     fi
 
     # Verify Python can parse it (syntax check only, no execution)
-    if ! "${PYTHON}" -c "import sys, py_compile; py_compile.compile(sys.argv[1], doraise=True)" "${tmp_file}" 2>/dev/null; then
+    if ! "${PYTHON}" -c "import ast, sys; ast.parse(open(sys.argv[1]).read())" "${tmp_file}"; then
         /bin/rm -f "${tmp_file}"
         bail "Downloaded file has Python syntax errors (integrity check failed)." 31
     fi
 
     local version
-    version=$(grep -m1 '__version__' "${tmp_file}" | sed 's/.*"\(.*\)".*/\1/' 2>/dev/null)
+    version=$(grep -m1 '__version__' "${tmp_file}" | sed 's/.*"\(.*\)".*/\1/' || true)
     log "Downloaded fumitm version: ${version:-unknown}"
 
     /bin/mkdir -p "$(/usr/bin/dirname "${dest}")" 2>/dev/null
@@ -176,7 +181,7 @@ needs_refresh() {
 if needs_refresh "${FUMITM_PATH}"; then
     download_fumitm "${FUMITM_PATH}"
 else
-    local_version=$(grep -m1 '__version__' "${FUMITM_PATH}" | sed 's/.*"\(.*\)".*/\1/' 2>/dev/null)
+    local_version=$(grep -m1 '__version__' "${FUMITM_PATH}" | sed 's/.*"\(.*\)".*/\1/' || true)
     log "Using cached fumitm.py (version: ${local_version:-unknown})"
 fi
 
@@ -194,6 +199,9 @@ log " Host:     $(/bin/hostname -s)"
 log " Provider: ${PROVIDER}"
 log "=============================="
 
+# Under set -e a non-zero exit here would end the script before the summary
+# below is printed, so the exit code is captured instead.
+EXIT_CODE=0
 "${PYTHON}" "${FUMITM_PATH}" \
     --fix \
     --yes \
@@ -201,24 +209,22 @@ log "=============================="
     --provider "${PROVIDER}" \
     --run-as-user "${CONSOLE_USER}" \
     --log-dir "${LOG_DIR}" \
-    --json-log-dir "${LOG_DIR}"
-
-EXIT_CODE=$?
+    --json-log-dir "${LOG_DIR}" || EXIT_CODE=$?
 
 # =============================================================================
 # Log cleanup — keep the last 30 log files of each type
 # =============================================================================
 "${PYTHON}" -c "
 import os, glob
-log_dir = os.environ.get('LOG_DIR', '${LOG_DIR}')
-for ext in ('log', 'jsonl'):
-    files = sorted(glob.glob(os.path.join(log_dir, f'fumitm-*.{ext}')), reverse=True)
+log_dir = '${LOG_DIR}'
+for pattern in ('fumitm-*.log', 'fumitm-*.jsonl', 'selfservice-*.log'):
+    files = sorted(glob.glob(os.path.join(log_dir, pattern)), reverse=True)
     for f in files[30:]:
         try:
             os.remove(f)
         except OSError:
             pass
-" 2>/dev/null
+" || true
 
 # =============================================================================
 # Report result
