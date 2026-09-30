@@ -69,6 +69,9 @@ bail() { err "$1"; exit "${2:-1}"; }
 # created, the script runs unlogged rather than failing.
 if [[ -z "${FUMITM_WRAPPER_LOGGED:-}" ]] && /bin/mkdir -p "${LOG_DIR}" 2>/dev/null; then
     WRAPPER_LOG="${LOG_DIR}/selfservice-$(date '+%Y%m%d-%H%M%S').log"
+    # errexit is off for the pipeline so that a tee failure cannot replace
+    # the inner script's exit status with its own.
+    set +e
     FUMITM_WRAPPER_LOGGED=1 /bin/bash "$0" "$@" 2>&1 | /usr/bin/tee -a "${WRAPPER_LOG}"
     exit "${PIPESTATUS[0]}"
 fi
