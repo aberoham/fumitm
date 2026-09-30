@@ -189,6 +189,7 @@ fi
 
 - Exit 0 = policy success in JAMF dashboard.
 - Exit 1/2/3 = policy failure. Admin checks `fumitm-latest.*` in `--log-dir` on the endpoint.
+- The example Self Service script also copies its own output to `/var/log/fumitm/selfservice-*.log`, which records failures that happen before fumitm starts, such as a failed download.
 - Exit 2 almost always means the JAMF script is misconfigured (missing `--yes` or `--cert-file`).
 
 ### Cleanup policy

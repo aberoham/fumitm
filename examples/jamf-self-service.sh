@@ -59,13 +59,49 @@ err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $*" >&2; }
 bail() { err "$1"; exit "${2:-1}"; }
 
 # =============================================================================
+# Wrapper log
+# =============================================================================
+# Jamf does not always keep a script's output in the policy log, so a failure
+# before fumitm starts would otherwise leave no record on the Mac. The script
+# therefore runs itself a second time with all output piped through tee. A
+# pipeline, unlike process substitution, waits for tee to finish, so the file
+# is complete when Jamf sees the exit code. If the log directory cannot be
+# created, the script runs unlogged rather than failing.
+if [[ -z "${FUMITM_WRAPPER_LOGGED:-}" ]] && /bin/mkdir -p "${LOG_DIR}" 2>/dev/null; then
+    WRAPPER_LOG="${LOG_DIR}/selfservice-$(date '+%Y%m%d-%H%M%S').log"
+    # errexit is off for the pipeline so that a tee failure cannot replace
+    # the inner script's exit status with its own.
+    set +e
+    FUMITM_WRAPPER_LOGGED=1 /bin/bash "$0" "$@" 2>&1 | /usr/bin/tee -a "${WRAPPER_LOG}"
+    exit "${PIPESTATUS[0]}"
+fi
+
+# =============================================================================
 # Pre-flight: Python 3
 # =============================================================================
-if [[ ! -x "${PYTHON}" ]]; then
-    PYTHON=$(command -v python3 2>/dev/null || true)
-    if [[ -z "${PYTHON}" ]]; then
-        bail "Python 3 is not installed. Install Xcode Command Line Tools or Homebrew Python." 20
+# /usr/bin/python3 is a stub that hands off to Xcode or the Command Line Tools.
+# On a Mac with Xcode installed whose licence has not been accepted, it exists
+# but refuses to run (exit 69), so each candidate is tried rather than assumed.
+# The Command Line Tools' own interpreter does not pass through that check.
+PYTHON_CANDIDATES=(
+    "${PYTHON}"
+    /Library/Developer/CommandLineTools/usr/bin/python3
+    /opt/homebrew/bin/python3
+    /usr/local/bin/python3
+)
+PYTHON=""
+for candidate in "${PYTHON_CANDIDATES[@]}"; do
+    if [[ ! -x "${candidate}" ]]; then
+        continue
     fi
+    if "${candidate}" -c "import sys" >/dev/null 2>&1; then
+        PYTHON="${candidate}"
+        break
+    fi
+    log "Skipping ${candidate}: $("${candidate}" -c "import sys" 2>&1 | head -1 || true)"
+done
+if [[ -z "${PYTHON}" ]]; then
+    bail "No working Python 3 found. Install the Xcode Command Line Tools, or accept the Xcode licence with 'sudo xcodebuild -license accept'." 20
 fi
 log "Using Python: ${PYTHON} ($("${PYTHON}" --version 2>&1))"
 
@@ -100,11 +136,6 @@ fi
 log "Console user: ${CONSOLE_USER} (home: ${CONSOLE_USER_HOME})"
 
 # =============================================================================
-# Pre-flight: Log directory
-# =============================================================================
-/bin/mkdir -p "${LOG_DIR}" 2>/dev/null
-
-# =============================================================================
 # Download / cache fumitm.py
 # =============================================================================
 download_fumitm() {
@@ -134,13 +165,13 @@ download_fumitm() {
     fi
 
     # Verify Python can parse it (syntax check only, no execution)
-    if ! "${PYTHON}" -c "import sys, py_compile; py_compile.compile(sys.argv[1], doraise=True)" "${tmp_file}" 2>/dev/null; then
+    if ! "${PYTHON}" -c "import sys; compile(open(sys.argv[1], 'rb').read(), sys.argv[1], 'exec')" "${tmp_file}"; then
         /bin/rm -f "${tmp_file}"
         bail "Downloaded file has Python syntax errors (integrity check failed)." 31
     fi
 
     local version
-    version=$(grep -m1 '__version__' "${tmp_file}" | sed 's/.*"\(.*\)".*/\1/' 2>/dev/null)
+    version=$(grep -m1 '__version__' "${tmp_file}" | sed 's/.*"\(.*\)".*/\1/' || true)
     log "Downloaded fumitm version: ${version:-unknown}"
 
     /bin/mkdir -p "$(/usr/bin/dirname "${dest}")" 2>/dev/null
@@ -176,7 +207,7 @@ needs_refresh() {
 if needs_refresh "${FUMITM_PATH}"; then
     download_fumitm "${FUMITM_PATH}"
 else
-    local_version=$(grep -m1 '__version__' "${FUMITM_PATH}" | sed 's/.*"\(.*\)".*/\1/' 2>/dev/null)
+    local_version=$(grep -m1 '__version__' "${FUMITM_PATH}" | sed 's/.*"\(.*\)".*/\1/' || true)
     log "Using cached fumitm.py (version: ${local_version:-unknown})"
 fi
 
@@ -194,6 +225,9 @@ log " Host:     $(/bin/hostname -s)"
 log " Provider: ${PROVIDER}"
 log "=============================="
 
+# Under set -e a non-zero exit here would end the script before the summary
+# below is printed, so the exit code is captured instead.
+EXIT_CODE=0
 "${PYTHON}" "${FUMITM_PATH}" \
     --fix \
     --yes \
@@ -201,24 +235,22 @@ log "=============================="
     --provider "${PROVIDER}" \
     --run-as-user "${CONSOLE_USER}" \
     --log-dir "${LOG_DIR}" \
-    --json-log-dir "${LOG_DIR}"
-
-EXIT_CODE=$?
+    --json-log-dir "${LOG_DIR}" || EXIT_CODE=$?
 
 # =============================================================================
 # Log cleanup — keep the last 30 log files of each type
 # =============================================================================
 "${PYTHON}" -c "
 import os, glob
-log_dir = os.environ.get('LOG_DIR', '${LOG_DIR}')
-for ext in ('log', 'jsonl'):
-    files = sorted(glob.glob(os.path.join(log_dir, f'fumitm-*.{ext}')), reverse=True)
+log_dir = '${LOG_DIR}'
+for pattern in ('fumitm-[0-9]*.log', 'fumitm-[0-9]*.jsonl', 'selfservice-*.log'):
+    files = sorted(glob.glob(os.path.join(log_dir, pattern)), reverse=True)
     for f in files[30:]:
         try:
             os.remove(f)
         except OSError:
             pass
-" 2>/dev/null
+" || true
 
 # =============================================================================
 # Report result
