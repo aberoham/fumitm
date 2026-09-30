@@ -79,11 +79,29 @@ fi
 # =============================================================================
 # Pre-flight: Python 3
 # =============================================================================
-if [[ ! -x "${PYTHON}" ]]; then
-    PYTHON=$(command -v python3 2>/dev/null || true)
-    if [[ -z "${PYTHON}" ]]; then
-        bail "Python 3 is not installed. Install Xcode Command Line Tools or Homebrew Python." 20
+# /usr/bin/python3 is a stub that hands off to Xcode or the Command Line Tools.
+# On a Mac with Xcode installed whose licence has not been accepted, it exists
+# but refuses to run (exit 69), so each candidate is tried rather than assumed.
+# The Command Line Tools' own interpreter does not pass through that check.
+PYTHON_CANDIDATES=(
+    "${PYTHON}"
+    /Library/Developer/CommandLineTools/usr/bin/python3
+    /opt/homebrew/bin/python3
+    /usr/local/bin/python3
+)
+PYTHON=""
+for candidate in "${PYTHON_CANDIDATES[@]}"; do
+    if [[ ! -x "${candidate}" ]]; then
+        continue
     fi
+    if "${candidate}" -c "import sys" >/dev/null 2>&1; then
+        PYTHON="${candidate}"
+        break
+    fi
+    log "Skipping ${candidate}: $("${candidate}" -c "import sys" 2>&1 | head -1 || true)"
+done
+if [[ -z "${PYTHON}" ]]; then
+    bail "No working Python 3 found. Install the Xcode Command Line Tools, or accept the Xcode licence with 'sudo xcodebuild -license accept'." 20
 fi
 log "Using Python: ${PYTHON} ($("${PYTHON}" --version 2>&1))"
 
