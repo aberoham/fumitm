@@ -62,11 +62,16 @@ bail() { err "$1"; exit "${2:-1}"; }
 # Wrapper log
 # =============================================================================
 # Jamf does not always keep a script's output in the policy log, so a failure
-# before fumitm starts would otherwise leave no record on the Mac. Everything
-# this wrapper prints, including curl and Python errors, is copied to a file.
-/bin/mkdir -p "${LOG_DIR}"
-WRAPPER_LOG="${LOG_DIR}/selfservice-$(date '+%Y%m%d-%H%M%S').log"
-exec > >(/usr/bin/tee -a "${WRAPPER_LOG}") 2>&1
+# before fumitm starts would otherwise leave no record on the Mac. The script
+# therefore runs itself a second time with all output piped through tee. A
+# pipeline, unlike process substitution, waits for tee to finish, so the file
+# is complete when Jamf sees the exit code. If the log directory cannot be
+# created, the script runs unlogged rather than failing.
+if [[ -z "${FUMITM_WRAPPER_LOGGED:-}" ]] && /bin/mkdir -p "${LOG_DIR}" 2>/dev/null; then
+    WRAPPER_LOG="${LOG_DIR}/selfservice-$(date '+%Y%m%d-%H%M%S').log"
+    FUMITM_WRAPPER_LOGGED=1 /bin/bash "$0" "$@" 2>&1 | /usr/bin/tee -a "${WRAPPER_LOG}"
+    exit "${PIPESTATUS[0]}"
+fi
 
 # =============================================================================
 # Pre-flight: Python 3
@@ -139,7 +144,7 @@ download_fumitm() {
     fi
 
     # Verify Python can parse it (syntax check only, no execution)
-    if ! "${PYTHON}" -c "import ast, sys; ast.parse(open(sys.argv[1]).read())" "${tmp_file}"; then
+    if ! "${PYTHON}" -c "import sys; compile(open(sys.argv[1], 'rb').read(), sys.argv[1], 'exec')" "${tmp_file}"; then
         /bin/rm -f "${tmp_file}"
         bail "Downloaded file has Python syntax errors (integrity check failed)." 31
     fi
@@ -217,7 +222,7 @@ EXIT_CODE=0
 "${PYTHON}" -c "
 import os, glob
 log_dir = '${LOG_DIR}'
-for pattern in ('fumitm-*.log', 'fumitm-*.jsonl', 'selfservice-*.log'):
+for pattern in ('fumitm-[0-9]*.log', 'fumitm-[0-9]*.jsonl', 'selfservice-*.log'):
     files = sorted(glob.glob(os.path.join(log_dir, pattern)), reverse=True)
     for f in files[30:]:
         try:
