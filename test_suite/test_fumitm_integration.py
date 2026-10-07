@@ -16,6 +16,7 @@ from helpers import (
     FumitmTestCase,
     MockBuilder,
     assert_subprocess_called_with,
+    gcloud_listing,
     mock_fumitm_environment,
 )
 
@@ -2134,10 +2135,10 @@ class TestGcloudVerification(FumitmTestCase):
              patch.object(instance, 'verify_connection', return_value="WORKING"), \
              patch('subprocess.run') as mock_run:
 
-            # gcloud config get-value returns empty (no custom CA)
+            # The configuration file sets no custom CA.
             mock_run.return_value = MagicMock(
                 returncode=0,
-                stdout='',
+                stdout=gcloud_listing(None),
                 stderr=''
             )
 
@@ -2159,7 +2160,7 @@ class TestGcloudVerification(FumitmTestCase):
 
             mock_run.return_value = MagicMock(
                 returncode=0,
-                stdout='',
+                stdout=gcloud_listing(None),
                 stderr=''
             )
 
@@ -3354,7 +3355,7 @@ class TestBareReturnsFixed(FumitmTestCase):
              patch('subprocess.run') as mock_run, \
              patch.object(instance, 'is_suspicious_full_bundle', return_value=(False, None)), \
              patch.object(instance, 'certificate_exists_in_file', return_value=True):
-            mock_run.return_value = MagicMock(returncode=0, stdout=existing_bundle)
+            mock_run.return_value = MagicMock(returncode=0, stdout=gcloud_listing(existing_bundle))
             with patch('os.path.exists', side_effect=lambda p: p == existing_bundle):
                 result = instance.setup_gcloud_cert()
             assert result.status == 'already_ok'
@@ -3370,17 +3371,16 @@ class TestBareReturnsFixed(FumitmTestCase):
         gcloud_managed = os.path.expanduser("~/.config/gcloud/certs/combined-ca-bundle.pem")
         with patch.object(instance, 'command_exists', return_value=True), \
              patch('os.path.exists', return_value=False), \
-             patch.object(instance, '_safe_makedirs'), \
-             patch.object(instance, 'create_bundle_with_system_certs'), \
-             patch.object(instance, 'safe_append_certificate'), \
+             patch.object(instance, '_build_gcloud_bundle', return_value=True), \
              patch.object(instance, 'is_devcontainer', return_value=True), \
              patch('subprocess.run') as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout='')
+            mock_run.return_value = MagicMock(returncode=0, stdout=gcloud_listing(None))
             result = instance.setup_gcloud_cert()
             assert result.status == 'configured'
             assert_subprocess_called_with(
                 mock_run,
-                ['gcloud', 'config', 'set', 'core/custom_ca_certs_file', gcloud_managed]
+                ['gcloud', '--configuration', 'default',
+                 'config', 'set', 'core/custom_ca_certs_file', gcloud_managed]
             )
 
     def test_curl_not_found_returns_skipped(self):

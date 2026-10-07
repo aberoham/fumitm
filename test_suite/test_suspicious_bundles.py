@@ -7,7 +7,7 @@ one WARP CA certificate.
 from unittest.mock import ANY, patch
 
 import mock_data
-from helpers import FumitmTestCase, MockBuilder, mock_fumitm_environment
+from helpers import FumitmTestCase, MockBuilder, gcloud_listing, mock_fumitm_environment
 
 
 class TestSuspiciousBundles(FumitmTestCase):
@@ -83,20 +83,26 @@ class TestSuspiciousBundles(FumitmTestCase):
             .with_tools('gcloud')
             .with_file(gcloud_current, mock_data.MOCK_CERTIFICATE)
             .with_file('/etc/ssl/cert.pem', mock_data.SAMPLE_CA_BUNDLE)
-            # gcloud config get
-            .with_subprocess_response(stdout=gcloud_current)
+            # gcloud config configurations list
+            .with_subprocess_response(stdout=gcloud_listing(gcloud_current))
             # gcloud config set
+            .with_subprocess_response(returncode=0)
+            # gcloud info --run-diagnostics
             .with_subprocess_response(returncode=0)
             .build()
         )
 
         with mock_fumitm_environment(mock_config) as mocks:
             instance = self.create_fumitm_instance(mode='install')
-            instance.setup_gcloud_cert()
+            # The bundle build itself is covered in test_gcloud_config.py; this
+            # test concerns only the repointing decision.
+            with patch.object(instance, '_build_gcloud_bundle', return_value=True):
+                instance.setup_gcloud_cert()
             from helpers import assert_subprocess_called_with
             assert_subprocess_called_with(
                 mocks['subprocess'],
-                ['gcloud', 'config', 'set', 'core/custom_ca_certs_file', gcloud_managed]
+                ['gcloud', '--configuration', 'default',
+                 'config', 'set', 'core/custom_ca_certs_file', gcloud_managed]
             )
 
     def test_git_setup_repoint_on_suspicious_existing(self):

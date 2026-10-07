@@ -40,6 +40,7 @@ jobs:
             - 'test_suite/test_netskope_provider.py'
             - 'test_suite/test_suspicious_bundles.py'
             - 'test_suite/test_aikido_root.py'
+            - 'test_suite/test_gcloud_config.py'
             - 'test_suite/test_curlrc.py'
             - 'test_suite/test_headless_mdm.py'
             - 'test_suite/helpers.py'
@@ -81,7 +82,7 @@ jobs:
       working-directory: test_suite
       run: |
         source .venv/bin/activate
-        python -m pytest test_fumitm_integration.py test_netskope_provider.py test_suspicious_bundles.py test_aikido_root.py test_curlrc.py test_headless_mdm.py -v --tb=short
+        python -m pytest test_fumitm_integration.py test_netskope_provider.py test_suspicious_bundles.py test_aikido_root.py test_gcloud_config.py test_curlrc.py test_headless_mdm.py -v --tb=short
 
   test-linux:
     runs-on: ubuntu-latest
@@ -117,7 +118,7 @@ jobs:
       working-directory: test_suite
       run: |
         source .venv/bin/activate
-        python -m pytest test_fumitm_integration.py test_netskope_provider.py test_suspicious_bundles.py test_aikido_root.py test_curlrc.py test_headless_mdm.py -v --tb=short
+        python -m pytest test_fumitm_integration.py test_netskope_provider.py test_suspicious_bundles.py test_aikido_root.py test_gcloud_config.py test_curlrc.py test_headless_mdm.py -v --tb=short
 
   test-windows:
     runs-on: windows-latest
