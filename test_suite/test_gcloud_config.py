@@ -9,7 +9,10 @@ pin the replacement: each configuration file is read on its own and repaired.
 
 import json
 import os
+from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 import mock_data
 from helpers import FumitmTestCase, gcloud_listing
@@ -23,6 +26,7 @@ GCLOUD_ENV_VAR = 'CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE'
 STALE_BUNDLE = (mock_data.SAMPLE_CA_BUNDLE + mock_data.MOCK_AIKIDO_ROOT_CERT
                 + mock_data.MOCK_AIKIDO_INTERMEDIATE_CERT)
 GOOD_BUNDLE = STALE_BUNDLE + mock_data.MOCK_CERTIFICATE
+ROTATED_ROOT = mock_data.MOCK_CERTIFICATE.replace('MI', 'AA', 1)
 
 
 def _listing(*configs):
@@ -45,6 +49,13 @@ class GcloudFake:
     def __call__(self, cmd, **kwargs):
         if cmd[:4] == ['gcloud', 'config', 'configurations', 'list']:
             return self.listing
+        if cmd == ['gcloud', 'config', 'get-value', 'core/custom_ca_certs_file']:
+            # Production no longer calls this. The fake answers as real gcloud
+            # does, with the effective value in which the export wins, so a
+            # revert to get-value fails the masking tests instead of passing
+            # them on an empty answer.
+            env = kwargs.get('env', os.environ)
+            return MagicMock(returncode=0, stdout=env.get(GCLOUD_ENV_VAR, ''), stderr='')
         if 'set' in cmd and 'core/custom_ca_certs_file' in cmd:
             name = cmd[cmd.index('--configuration') + 1] if '--configuration' in cmd else None
             self.sets.append((name, cmd[-1], kwargs.get('env')))
@@ -75,7 +86,10 @@ class GcloudConfigTestCase(FumitmTestCase):
         with patch.object(inst, 'command_exists', return_value=True), \
              patch.object(inst, 'is_devcontainer', return_value=True), \
              patch('fumitm.subprocess.run', side_effect=fake):
-            return inst.setup_gcloud_cert()
+            result = inst.setup_gcloud_cert()
+        assert inst._compute_changes_made([result]) is (
+            result.status == 'configured' or result.changed is True)
+        return result
 
 
 class TestGcloudConfigListing(GcloudConfigTestCase):
@@ -96,6 +110,11 @@ class TestGcloudConfigListing(GcloudConfigTestCase):
         monkeypatch.setenv(GCLOUD_ENV_VAR, '/exported.pem')
         _, run = self._configs(tmp_path, _listing(('default', True, '/a.pem')))
         assert GCLOUD_ENV_VAR not in run.call_args.kwargs['env']
+        assert os.environ[GCLOUD_ENV_VAR] == '/exported.pem'
+        assert run.call_args.args[0] == [
+            'gcloud', 'config', 'configurations', 'list',
+            '--format=json(name,is_active,properties.core.custom_ca_certs_file)',
+        ]
 
     def test_empty_listing_stands_in_the_active_configuration(self, tmp_path):
         configs, _ = self._configs(tmp_path, MagicMock(returncode=0, stdout='[]'))
@@ -137,6 +156,7 @@ class TestGcloudConfigSetup(GcloudConfigTestCase):
         assert result.status == 'configured'
         assert fake.sets == [('default', self.managed, fake.sets[0][2])]
         assert GCLOUD_ENV_VAR not in fake.sets[0][2]
+        assert os.environ[GCLOUD_ENV_VAR] == str(self.good)
         assert mock_data.MOCK_CERTIFICATE.strip() in open(self.managed).read()
 
     def test_only_stale_configurations_are_repointed(self, tmp_path):
@@ -251,6 +271,30 @@ class TestGcloudConfigSetup(GcloudConfigTestCase):
         assert open(self.managed).read() == GOOD_BUNDLE
         assert os.listdir(os.path.dirname(self.managed)) == ['combined-ca-bundle.pem']
 
+    @pytest.mark.parametrize('stage', ['create', 'append'])
+    @pytest.mark.parametrize('raises', [False, True])
+    def test_bundle_build_failure_cleans_staging(self, tmp_path, stage, raises):
+        inst = self._instance(tmp_path)
+        os.makedirs(os.path.dirname(self.managed))
+        Path(self.managed).write_text(GOOD_BUNDLE)
+        fake = GcloudFake(_listing(('in-use', True, self.managed), ('unset', False, None)))
+
+        def fail(path):
+            Path(path).write_text('partial bundle')
+            if raises:
+                raise OSError('write failed')
+            return False
+
+        method = ('create_bundle_with_system_certs' if stage == 'create'
+                  else '_append_all_proxy_roots')
+        with patch.object(inst, method, side_effect=fail):
+            result = self._setup(inst, fake)
+        assert result.status == 'failed'
+        assert result.changed is False
+        assert fake.sets == []
+        assert Path(self.managed).read_text() == GOOD_BUNDLE
+        assert os.listdir(os.path.dirname(self.managed)) == ['combined-ca-bundle.pem']
+
     def test_dry_run_changes_nothing(self, tmp_path):
         inst = self._instance(tmp_path, mode='status')
         fake = GcloudFake(_listing(('custom', True, str(self.stale)), ('unset', False, None)))
@@ -260,6 +304,30 @@ class TestGcloudConfigSetup(GcloudConfigTestCase):
         assert result.status == 'skipped'
         assert fake.sets == []
         assert not os.path.exists(self.managed)
+
+    @pytest.mark.parametrize('ca', ['custom', 'good', 'unset', 'missing', 'suspicious'])
+    @pytest.mark.parametrize('installed', [False, True])
+    def test_dry_run_with_pre_bootstrap_writes_nothing(self, tmp_path, ca, installed):
+        inst = self._instance(tmp_path, mode='status', auto_yes=False)
+        home = Path(os.path.expanduser('~'))
+        (home / '.python-ca-bundle.pem').write_text(GOOD_BUNDLE)
+        inst.extra_roots = [{'path': str(self.good)}]
+        paths = {'custom': str(self.stale), 'good': str(self.good), 'unset': None,
+                 'missing': str(tmp_path / 'gone.pem'), 'suspicious': inst.cert_path}
+        fake = GcloudFake(_listing(('default', True, paths[ca])))
+
+        def snapshot():
+            return {str(p.relative_to(home)): p.read_bytes() if p.is_file() else None
+                    for p in home.rglob('*')}
+
+        before = snapshot()
+        with patch.object(inst, 'command_exists', return_value=installed), \
+             patch.object(inst, '_prompt') as prompt, \
+             patch('fumitm.subprocess.run', side_effect=fake):
+            inst.setup_gcloud_cert()
+        prompt.assert_not_called()
+        assert fake.sets == []
+        assert snapshot() == before
 
 
 class TestGcloudConfigStatus(GcloudConfigTestCase):
@@ -285,6 +353,30 @@ class TestGcloudConfigStatus(GcloudConfigTestCase):
         inst = self._instance(tmp_path, mode='status')
         fake = GcloudFake(_listing(('a', True, str(self.good)), ('b', False, str(self.good))))
         assert self._status(inst, fake, 'WORKING') is False
+
+    @pytest.mark.parametrize('primary', ['same', 'rotated', 'missing'])
+    def test_status_uses_the_fresh_primary_root(self, tmp_path, primary):
+        inst = self._instance(tmp_path, mode='status')
+        fresh = tmp_path / 'fresh.pem'
+        fresh.write_text(mock_data.MOCK_CERTIFICATE)
+        if primary == 'rotated':
+            Path(inst.cert_path).write_text(ROTATED_ROOT)
+        elif primary == 'missing':
+            os.remove(inst.cert_path)
+        assert inst._status_roots_present(str(fresh), str(self.good)) is True
+        assert inst._all_roots_present_in_file(str(self.good)) is (primary == 'same')
+
+    def test_both_matchers_require_supplemental_roots(self, tmp_path):
+        inst = self._instance(tmp_path, mode='status')
+        extra = tmp_path / 'extra.pem'
+        extra.write_text(ROTATED_ROOT)
+        inst.extra_roots = [{'path': str(extra)}]
+        assert inst._status_roots_present(inst.cert_path, str(self.good)) is False
+        assert inst._all_roots_present_in_file(str(self.good)) is False
+        with self.good.open('a') as f:
+            f.write(ROTATED_ROOT)
+        assert inst._status_roots_present(inst.cert_path, str(self.good)) is True
+        assert inst._all_roots_present_in_file(str(self.good)) is True
 
     def test_unset_is_an_issue_when_verification_skipped(self, tmp_path):
         """Setup repairs an unset file whatever verification did; status agrees."""

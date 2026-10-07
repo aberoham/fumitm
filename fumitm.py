@@ -4914,13 +4914,21 @@ class FumitmPython:
         self._safe_makedirs(os.path.dirname(gcloud_bundle))
         self.print_info(f"Creating gcloud CA bundle at {gcloud_bundle}")
         staging = gcloud_bundle + '.fumitm-new'
-        self.create_bundle_with_system_certs(staging)
-        if not self._append_all_proxy_roots(staging):
-            os.remove(staging)
-            self.print_error(f"Could not add the proxy roots to {gcloud_bundle}; left it unchanged")
+        try:
+            if not self.create_bundle_with_system_certs(staging):
+                self.print_error(f"Could not copy system roots to {gcloud_bundle}; left it unchanged")
+                return False
+            if not self._append_all_proxy_roots(staging):
+                self.print_error(f"Could not add the proxy roots to {gcloud_bundle}; left it unchanged")
+                return False
+            os.replace(staging, gcloud_bundle)
+            return True
+        except OSError as e:
+            self.print_error(f"Could not build {gcloud_bundle}; left it unchanged: {e}")
             return False
-        os.replace(staging, gcloud_bundle)
-        return True
+        finally:
+            if os.path.exists(staging):
+                os.remove(staging)
 
     def _set_gcloud_ca(self, config, gcloud_bundle):
         """Point one configuration at gcloud_bundle; return an error string or None."""
