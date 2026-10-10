@@ -3,6 +3,7 @@
 This module gives the classes and the functions that make a test setup and an
 assertion easier to write.
 """
+import json
 from contextlib import contextmanager
 from unittest.mock import MagicMock, mock_open, patch
 
@@ -146,6 +147,21 @@ def mock_fumitm_environment(mock_config):
             'exists': mock_exists,
             'subprocess': mock_subprocess,
         }
+
+
+def gcloud_listing(*configs):
+    """Return the stdout of `gcloud config configurations list --format=json(...)`.
+
+    Each config is a (name, is_active, custom_ca_certs_file) tuple. A bare path
+    or None stands for one active configuration named 'default'.
+    """
+    if len(configs) == 1 and not isinstance(configs[0], tuple):
+        configs = (('default', True, configs[0]),)
+    return json.dumps([
+        {'name': name, 'is_active': active,
+         'properties': {'core': {'custom_ca_certs_file': ca_file}}}
+        for name, active, ca_file in configs
+    ])
 
 
 def assert_subprocess_called_with(mock_subprocess, command_parts):

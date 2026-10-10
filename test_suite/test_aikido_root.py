@@ -17,7 +17,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 import mock_data
-from helpers import FumitmTestCase
+from helpers import FumitmTestCase, gcloud_listing
 
 
 class TestAikidoDetection(FumitmTestCase):
@@ -675,14 +675,14 @@ class TestAikidoGcloudReauthTrust(FumitmTestCase):
 
         # gcloud already points at the bundle with both roots. The property needs
         # no change. Only the reauth variables need a correction.
-        get_value = MagicMock(returncode=0, stdout=str(python_bundle))
+        listing = MagicMock(returncode=0, stdout=gcloud_listing(str(python_bundle)))
         with patch.object(inst, 'command_exists', return_value=True), \
              patch.object(inst, '_ensure_gcloud_properties', return_value=False), \
              patch.object(inst, 'detect_shell', return_value='zsh'), \
              patch.object(inst, 'get_shell_config', return_value=str(shell_config)), \
              patch.object(inst, 'is_suspicious_full_bundle', return_value=(False, None)), \
              patch.object(inst, '_all_roots_present_in_file', return_value=True), \
-             patch('fumitm.subprocess.run', return_value=get_value):
+             patch('fumitm.subprocess.run', return_value=listing):
             result = inst.setup_gcloud_cert()
 
         env = Path(inst._env_file_path()).read_text()
@@ -706,14 +706,14 @@ class TestAikidoGcloudReauthTrust(FumitmTestCase):
         inst = self.create_fumitm_instance(provider='warp', no_aikido=True)
         inst.mode = 'install'
 
-        get_value = MagicMock(returncode=0, stdout=str(python_bundle))
+        listing = MagicMock(returncode=0, stdout=gcloud_listing(str(python_bundle)))
         with patch.object(inst, 'command_exists', return_value=True), \
              patch.object(inst, '_ensure_gcloud_properties', return_value=False), \
              patch.object(inst, 'detect_shell', return_value='zsh'), \
              patch.object(inst, 'get_shell_config', return_value=str(shell_config)), \
              patch.object(inst, 'is_suspicious_full_bundle', return_value=(False, None)), \
              patch.object(inst, '_all_roots_present_in_file', return_value=True), \
-             patch('fumitm.subprocess.run', return_value=get_value):
+             patch('fumitm.subprocess.run', return_value=listing):
             inst.setup_gcloud_cert()
 
         env = Path(inst._env_file_path()).read_text()

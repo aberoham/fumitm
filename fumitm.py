@@ -250,6 +250,20 @@ ToolResult = namedtuple(
     'ToolResult', ['tool', 'status', 'message', 'changed'], defaults=[None]
 )
 
+# One gcloud named configuration and the core/custom_ca_certs_file written in
+# its own file. A name of None stands for the active configuration when gcloud
+# could not list them.
+GcloudConfig = namedtuple('GcloudConfig', ['name', 'is_active', 'ca_file'])
+
+# Why a gcloud configuration's CA file cannot be trusted, keyed by the code
+# that _gcloud_ca_problem returns.
+GCLOUD_CA_PROBLEMS = {
+    'unset': 'is not set',
+    'missing': 'points at a missing file',
+    'suspicious': 'looks suspiciously small',
+    'no_root': 'lacks the proxy root',
+}
+
 
 class FumitmPython:
     # These markers enclose the block that fumitm manages in a shell startup
@@ -4693,31 +4707,41 @@ class FumitmPython:
                 changed = True
         return changed
 
+    def _gcloud_pre_bootstrap(self):
+        """Prepare gcloud trust that does not need gcloud installed.
+
+        Makes the gcloud properties file now, thus a later gcloud install can
+        start behind a MITM proxy, and sets the environment variables also.
+
+        Returns:
+            bool: True when anything changed, or would change in dry-run mode.
+        """
+        python_bundle = os.path.expanduser("~/.python-ca-bundle.pem")
+        if not os.path.exists(python_bundle):
+            return False
+        props_changed = self._ensure_gcloud_properties(python_bundle)
+        shell_type = self.detect_shell()
+        shell_config = self.get_shell_config(shell_type)
+        shell_changed = self.add_to_shell_config(
+            "CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE",
+            python_bundle,
+            shell_config,
+        )
+        reauth_changed = self._ensure_gcloud_reauth_trust(
+            python_bundle, shell_config
+        )
+        return props_changed or shell_changed or reauth_changed
+
     def setup_gcloud_cert(self):
         """Setup gcloud certificate."""
-        # Make the gcloud properties file now, thus a later gcloud install
-        # can start behind a MITM proxy. Set the environment variable also.
-        pre_bootstrap = False
-        python_bundle = os.path.expanduser("~/.python-ca-bundle.pem")
-        if os.path.exists(python_bundle):
-            props_changed = self._ensure_gcloud_properties(python_bundle)
-            shell_type = self.detect_shell()
-            shell_config = self.get_shell_config(shell_type)
-            shell_changed = self.add_to_shell_config(
-                "CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE",
-                python_bundle,
-                shell_config,
-            )
-            reauth_changed = self._ensure_gcloud_reauth_trust(
-                python_bundle, shell_config
-            )
-            pre_bootstrap = props_changed or shell_changed or reauth_changed
+        pre_bootstrap = self._gcloud_pre_bootstrap()
 
         if not self.command_exists('gcloud'):
             self.print_info("gcloud not found, skipping gcloud setup")
             if pre_bootstrap:
                 if self.is_install_mode():
-                    return ToolResult('gcloud', 'configured', 'Pre-created gcloud properties for future install')
+                    return ToolResult('gcloud', 'configured',
+                                      'Pre-created gcloud properties for future install')
                 return ToolResult('gcloud', 'skipped', 'Dry run')
             return ToolResult('gcloud', 'skipped', 'gcloud not found in PATH')
 
@@ -4725,102 +4749,246 @@ class FumitmPython:
         # path makes its own SSL context with the ca_certs path from
         # core/custom_ca_certs_file. It ignores the system trust store and
         # SSL_CERT_FILE. Thus always set the property to a bundle that
-        # contains the proxy CA.
-
-        gcloud_cert_dir = os.path.expanduser("~/.config/gcloud/certs")
-        gcloud_bundle = os.path.join(gcloud_cert_dir, "combined-ca-bundle.pem")
-        needs_setup = False
-
-        try:
-            result = subprocess.run(
-                ['gcloud', 'config', 'get-value', 'core/custom_ca_certs_file'],
-                capture_output=True, text=True, check=False
-            )
-            current_ca_file = result.stdout.strip() if result.returncode == 0 else ""
-        except Exception:
-            current_ca_file = ""
-        
-        if not current_ca_file:
-            needs_setup = True
-        elif os.path.exists(current_ca_file):
-            suspicious, reason = self.is_suspicious_full_bundle(current_ca_file, self.cert_path)
-            if suspicious:
-                self.print_info("Configuring gcloud certificate...")
-                self.print_warn(f"Existing gcloud CA file looks suspiciously small ({reason})")
-                if not self.is_install_mode():
-                    self.print_action(f"Would create gcloud CA bundle at {gcloud_bundle}")
-                    self.print_action(f"Would run: gcloud config set core/custom_ca_certs_file {gcloud_bundle}")
-                else:
-                    self._safe_makedirs(gcloud_cert_dir)
-                    self.create_bundle_with_system_certs(gcloud_bundle)
-                    self._append_all_proxy_roots(gcloud_bundle)
-                    subprocess.run(['gcloud', 'config', 'set', 'core/custom_ca_certs_file', gcloud_bundle], capture_output=True, timeout=30, check=False)
-                    self.print_info(f"Repointed gcloud custom CA file to managed bundle: {gcloud_bundle}")
-                    return ToolResult('gcloud', 'configured', 'Repointed suspicious gcloud CA file')
-                return ToolResult('gcloud', 'skipped', 'Dry run')
-
-            if not self._all_roots_present_in_file(current_ca_file):
-                needs_setup = True
-        else:
-            needs_setup = True
-
-        if not needs_setup:
+        # contains the proxy CA, in every named configuration.
+        gcloud_bundle = os.path.expanduser("~/.config/gcloud/certs/combined-ca-bundle.pem")
+        stale = self._stale_gcloud_configurations()
+        if not stale:
             if pre_bootstrap and self.is_install_mode():
                 return ToolResult('gcloud', 'configured', 'Configured gcloud trust environment')
             return ToolResult('gcloud', 'already_ok', 'gcloud certificate already configured')
 
         self.print_info("Configuring gcloud certificate...")
-        
-        if self.is_install_mode():
-            self._safe_makedirs(gcloud_cert_dir)
-        
-        if current_ca_file and current_ca_file != gcloud_bundle:
-            self.print_warn(f"gcloud is already configured with custom CA: {current_ca_file}")
-            
-            if os.path.exists(current_ca_file) and not self.is_writable(current_ca_file):
-                self.print_error(f"Cannot write to current gcloud CA file: {current_ca_file} (permission denied)")
-                self.print_warn(f"Will use alternative path: {gcloud_bundle}")
-                if not self.is_install_mode():
-                    self.print_action(f"Would create new gcloud CA bundle at {gcloud_bundle}")
-            else:
-                if not self.is_install_mode():
-                    self.print_action("Would ask to update gcloud CA configuration")
-                    return ToolResult('gcloud', 'skipped', 'Dry run')
-                else:
-                    response = self._prompt("Do you want to update it? (y/N) ")
-                    if response.lower() != 'y':
-                        return ToolResult('gcloud', 'skipped', 'User declined')
-        
+        for config, problem in stale:
+            self.print_warn(self._gcloud_problem_message(config, problem))
+        # A pre-bootstrap write has already happened, whatever the repair does.
+        prior_change = pre_bootstrap and self.is_install_mode()
+        to_repair = self._confirm_gcloud_repoint(stale, gcloud_bundle)
+        if not to_repair:
+            return ToolResult('gcloud', 'skipped', 'User declined', prior_change or None)
+        return self._repair_gcloud_configurations(to_repair, gcloud_bundle, prior_change)
+
+    @staticmethod
+    def _gcloud_subprocess_env():
+        """Return the environment for gcloud configuration commands.
+
+        An exported CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE overrides every
+        configuration file, and `gcloud config set` warns about it. Removing it
+        makes these commands act on the files that apply wherever the export is
+        absent: applications launched from the Dock, launchd jobs, and tools
+        that sanitise the environment, such as Homebrew.
+        """
+        env = dict(os.environ)
+        env.pop('CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE', None)
+        return env
+
+    def _gcloud_configurations(self):
+        """Return every gcloud named configuration with its own CA file setting.
+
+        `gcloud config configurations list` reads each configuration file with
+        only_file_contents=True, so neither the environment nor the
+        installation properties alter the value it reports. `gcloud config
+        get-value` reports the effective value instead, which fumitm's own export
+        of CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE masks.
+
+        Returns:
+            list[GcloudConfig] | None: The configurations, with the active one
+            standing in when none exist, or None when gcloud could not list them.
+        """
+        try:
+            result = subprocess.run(
+                ['gcloud', 'config', 'configurations', 'list',
+                 '--format=json(name,is_active,properties.core.custom_ca_certs_file)'],
+                capture_output=True, text=True, timeout=30, check=False,
+                env=self._gcloud_subprocess_env(),
+            )
+            entries = json.loads(result.stdout) if result.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+            self.print_debug(f"gcloud configurations list failed: {e}")
+            return None
+        if not isinstance(entries, list):
+            self.print_debug("gcloud configurations list returned no usable list")
+            return None
+
+        configs = []
+        for entry in entries:
+            if not isinstance(entry, dict) or not entry.get('name'):
+                continue
+            core = (entry.get('properties') or {}).get('core') or {}
+            configs.append(GcloudConfig(
+                entry['name'],
+                bool(entry.get('is_active')),
+                core.get('custom_ca_certs_file') or '',
+            ))
+        return configs or [GcloudConfig(None, True, '')]
+
+    def _stale_gcloud_configurations(self):
+        """Return (GcloudConfig, problem code) for each configuration needing repair.
+
+        When gcloud cannot list its configurations, the active one is checked
+        as unset, so that it is repaired as before rather than failing the run.
+        """
+        configs = self._gcloud_configurations()
+        if configs is None:
+            self.print_warn("Could not list gcloud configurations; repairing the active one only")
+            configs = [GcloudConfig(None, True, '')]
+        stale = []
+        for config in configs:
+            problem = self._gcloud_ca_problem(config.ca_file, self._all_roots_present_in_file)
+            if problem:
+                stale.append((config, problem))
+        return stale
+
+    def _gcloud_ca_problem(self, ca_file, roots_present):
+        """Return the GCLOUD_CA_PROBLEMS code for a CA file, or None if usable.
+
+        Args:
+            ca_file: The core/custom_ca_certs_file value, or '' when unset.
+            roots_present: A callable that answers whether a file holds every
+                proxy root. Setup and status supply different matchers.
+        """
+        if not ca_file:
+            return 'unset'
+        if not os.path.exists(ca_file):
+            return 'missing'
+        suspicious, _ = self.is_suspicious_full_bundle(ca_file, self.cert_path)
+        if suspicious:
+            return 'suspicious'
+        if not roots_present(ca_file):
+            return 'no_root'
+        return None
+
+    @staticmethod
+    def _gcloud_config_label(config):
+        if config.name is None:
+            return "active gcloud configuration"
+        return f"gcloud configuration '{config.name}'"
+
+    def _gcloud_problem_message(self, config, problem):
+        message = f"{self._gcloud_config_label(config)}: custom CA {GCLOUD_CA_PROBLEMS[problem]}"
+        if config.ca_file:
+            message += f" ({config.ca_file})"
+        return message
+
+    def _confirm_gcloud_repoint(self, stale, gcloud_bundle):
+        """Ask once before replacing CA files that the user chose.
+
+        A configuration that is unset, points at a missing file, or points at a
+        suspicious bundle is repaired without asking. One that points at a real
+        bundle lacking the proxy root reflects a deliberate choice, so the user
+        is asked; declining keeps those and still repairs the rest.
+
+        Returns:
+            list[GcloudConfig]: The configurations to repoint.
+        """
+        custom = [config for config, problem in stale
+                  if problem == 'no_root' and config.ca_file != gcloud_bundle]
+        everything = [config for config, _ in stale]
+        if not custom:
+            return everything
+        labels = ", ".join(self._gcloud_config_label(config) for config in custom)
         if not self.is_install_mode():
-            self.print_action(f"Would create directory: {gcloud_cert_dir}")
+            self.print_action(f"Would ask before replacing the custom CA file of {labels}")
+            return everything
+        response = self._prompt(f"Replace the custom CA file of {labels}? (y/N) ")
+        if response.lower() == 'y':
+            return everything
+        return [config for config in everything if config not in custom]
+
+    @staticmethod
+    def _gcloud_set_ca_command(config, ca_bundle):
+        command = ['gcloud']
+        if config.name is not None:
+            command += ['--configuration', config.name]
+        return command + ['config', 'set', 'core/custom_ca_certs_file', ca_bundle]
+
+    def _build_gcloud_bundle(self, gcloud_bundle):
+        """Rebuild the managed gcloud bundle with the system roots and every proxy root.
+
+        The bundle is assembled beside its final path and moved into place only
+        when every root was appended, so a failure never leaves configurations
+        that already point at it with a bundle missing the proxy root.
+
+        Returns:
+            bool: True when the bundle at gcloud_bundle holds every proxy root.
+        """
+        self._safe_makedirs(os.path.dirname(gcloud_bundle))
+        self.print_info(f"Creating gcloud CA bundle at {gcloud_bundle}")
+        staging = gcloud_bundle + '.fumitm-new'
+        try:
+            if not self.create_bundle_with_system_certs(staging):
+                self.print_error(f"Could not copy system roots to {gcloud_bundle}; left it unchanged")
+                return False
+            if not self._append_all_proxy_roots(staging):
+                self.print_error(f"Could not add the proxy roots to {gcloud_bundle}; left it unchanged")
+                return False
+            os.replace(staging, gcloud_bundle)
+            return True
+        except OSError as e:
+            self.print_error(f"Could not build {gcloud_bundle}; left it unchanged: {e}")
+            return False
+        finally:
+            if os.path.exists(staging):
+                os.remove(staging)
+
+    def _set_gcloud_ca(self, config, gcloud_bundle):
+        """Point one configuration at gcloud_bundle; return an error string or None."""
+        try:
+            result = subprocess.run(
+                self._gcloud_set_ca_command(config, gcloud_bundle),
+                capture_output=True, text=True, timeout=30, check=False,
+                env=self._gcloud_subprocess_env(),
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return str(e)
+        if result.returncode != 0:
+            return result.stderr.strip() or f"exit code {result.returncode}"
+        return None
+
+    def _repair_gcloud_configurations(self, configs, gcloud_bundle, prior_change):
+        """Rebuild the managed gcloud bundle and point each configuration at it.
+
+        Every configuration is attempted even after one fails, so that a single
+        unwritable file does not leave the others stale.
+
+        Args:
+            configs: The GcloudConfig entries to repoint.
+            gcloud_bundle: The managed bundle path.
+            prior_change: True when this run already changed something for
+                gcloud, so a failure still reports that a change was made.
+        """
+        if not self.is_install_mode():
             self.print_action(f"Would create gcloud CA bundle at {gcloud_bundle}")
             self.print_action("Would copy system certificates and append proxy certificate")
-            self.print_action(f"Would run: gcloud config set core/custom_ca_certs_file {gcloud_bundle}")
+            for config in configs:
+                command = self._gcloud_set_ca_command(config, gcloud_bundle)
+                self.print_action(f"Would run: {' '.join(command)}")
             return ToolResult('gcloud', 'skipped', 'Dry run')
-        else:
-            self.print_info(f"Creating gcloud CA bundle at {gcloud_bundle}")
-            self.create_bundle_with_system_certs(gcloud_bundle)
-            self._append_all_proxy_roots(gcloud_bundle)
 
-            result = subprocess.run(
-                ['gcloud', 'config', 'set', 'core/custom_ca_certs_file', gcloud_bundle],
-                capture_output=True,
-                timeout=30,  # Add timeout to prevent hanging
-                check=False
-            )
-            if result.returncode == 0:
-                self.print_info("gcloud configured successfully")
-                # Skip diagnostics in devcontainers as they can hang
-                if needs_setup and not self.is_devcontainer():
-                    self.print_info("Running gcloud diagnostics...")
-                    try:
-                        subprocess.run(['gcloud', 'info', '--run-diagnostics'], timeout=10, check=False)
-                    except subprocess.TimeoutExpired:
-                        self.print_warn("gcloud diagnostics timed out, skipping")
-                return ToolResult('gcloud', 'configured', 'Configured gcloud certificate')
+        if not self._build_gcloud_bundle(gcloud_bundle):
+            return ToolResult('gcloud', 'failed', 'Could not build the gcloud CA bundle',
+                              prior_change)
+
+        failed = []
+        for config in configs:
+            label = self._gcloud_config_label(config)
+            error = self._set_gcloud_ca(config, gcloud_bundle)
+            if error is None:
+                self.print_info(f"Pointed {label} at {gcloud_bundle}")
             else:
-                self.print_error("Failed to configure gcloud")
-                return ToolResult('gcloud', 'failed', 'Failed to configure gcloud')
+                self.print_error(f"Failed to configure {label}: {error}")
+                failed.append(label)
+
+        if failed:
+            changed = prior_change or len(failed) < len(configs)
+            return ToolResult('gcloud', 'failed',
+                              f"Failed to configure {', '.join(failed)}", changed)
+        if not self.is_devcontainer():
+            self.print_info("Running gcloud diagnostics...")
+            try:
+                subprocess.run(['gcloud', 'info', '--run-diagnostics'], timeout=10, check=False)
+            except subprocess.TimeoutExpired:
+                self.print_warn("gcloud diagnostics timed out, skipping")
+        return ToolResult('gcloud', 'configured', 'Configured gcloud certificate')
 
     def setup_git_cert(self):
         """Setup Git sslCAInfo to a managed full bundle."""
@@ -7088,88 +7256,48 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
 
     def check_gcloud_status(self, temp_warp_cert):
         """Check gcloud configuration status."""
-        has_issues = False
-        if self.command_exists('gcloud'):
-            verify_result = self.verify_connection("gcloud")
-
-            if verify_result == "WORKING":
-                self.print_info("  ✓ gcloud can connect through proxy")
-
-                # The IAP tunnel WebSocket path needs
-                # core/custom_ca_certs_file, also when HTTPS already works.
-                # Thus a missing or old value is an issue.
-                try:
-                    result = subprocess.run(
-                        ['gcloud', 'config', 'get-value', 'core/custom_ca_certs_file'],
-                        capture_output=True, text=True, check=False
-                    )
-                    gcloud_ca = result.stdout.strip() if result.returncode == 0 else ""
-
-                    if gcloud_ca and os.path.exists(gcloud_ca):
-                        self.print_info(f"  - Custom CA configured at: {gcloud_ca}")
-                        if self._status_roots_present(temp_warp_cert, gcloud_ca):
-                            self.print_info("  ✓ Custom CA contains current certificate")
-                        else:
-                            self.print_warn("  ✗ gcloud CA file doesn't contain current certificate")
-                            self.print_action("    Run with --fix to update the CA configuration (required for IAP tunneling)")
-                            has_issues = True
-                    else:
-                        self.print_warn("  ✗ core/custom_ca_certs_file is not set")
-                        self.print_action("    Run with --fix to configure (required for `gcloud compute ssh --tunnel-through-iap`)")
-                        has_issues = True
-                except Exception:
-                    self.print_warn("  ✗ Failed to check gcloud configuration")
-                    has_issues = True
-            elif verify_result == "SKIPPED":
-                # Verification is not possible. Examine the configuration.
-                try:
-                    result = subprocess.run(
-                        ['gcloud', 'config', 'get-value', 'core/custom_ca_certs_file'],
-                        capture_output=True, text=True, check=False
-                    )
-                    gcloud_ca = result.stdout.strip() if result.returncode == 0 else ""
-
-                    if gcloud_ca and os.path.exists(gcloud_ca):
-                        if self._status_roots_present(temp_warp_cert, gcloud_ca):
-                            self.print_info("  ✓ gcloud configured with current certificate")
-                            suspicious, reason = self.is_suspicious_full_bundle(gcloud_ca, None)
-                            if suspicious:
-                                self.print_warn(f"  ⚠ gcloud custom CA file looks suspiciously small ({reason})")
-                                self.print_action("    Run with --fix to repoint to a full CA bundle")
-                                has_issues = True
-                        else:
-                            self.print_warn("  ✗ gcloud CA file doesn't contain current certificate")
-                            has_issues = True
-                    else:
-                        self.print_info("  - gcloud custom CA not configured (verification skipped)")
-                except Exception:
-                    self.print_warn("  ✗ Failed to check gcloud configuration")
-                    has_issues = True
-            else:
-                self.print_warn("  ✗ gcloud connection test failed")
-                try:
-                    result = subprocess.run(
-                        ['gcloud', 'config', 'get-value', 'core/custom_ca_certs_file'],
-                        capture_output=True, text=True, check=False
-                    )
-                    gcloud_ca = result.stdout.strip() if result.returncode == 0 else ""
-
-                    if gcloud_ca and os.path.exists(gcloud_ca):
-                        if self._status_roots_present(temp_warp_cert, gcloud_ca):
-                            self.print_warn("  - Custom CA is configured with WARP cert but connection still fails")
-                            self.print_action("    Check gcloud and Python configuration")
-                        else:
-                            self.print_warn("  ✗ gcloud CA file doesn't contain current certificate")
-                            self.print_action("    Run with --fix to update the CA configuration")
-                    else:
-                        self.print_warn("  ✗ gcloud not configured with custom CA")
-                        self.print_action("    Run with --fix to configure gcloud CA")
-                    has_issues = True
-                except Exception:
-                    self.print_warn("  ✗ Failed to check gcloud configuration")
-                    has_issues = True
-        else:
+        if not self.command_exists('gcloud'):
             self.print_info("  - gcloud not installed (would configure if present)")
+            return False
+
+        verify_result = self.verify_connection("gcloud")
+        if verify_result == "WORKING":
+            self.print_info("  ✓ gcloud can connect through proxy")
+        elif verify_result != "SKIPPED":
+            self.print_warn("  ✗ gcloud connection test failed")
+
+        # The IAP tunnel WebSocket path needs core/custom_ca_certs_file, also
+        # when HTTPS already works. Thus a missing or old value is an issue,
+        # judged exactly as setup_gcloud_cert judges it.
+        config_issues = self._report_gcloud_configurations(temp_warp_cert)
+        return config_issues or verify_result not in ("WORKING", "SKIPPED")
+
+    def _report_gcloud_configurations(self, temp_warp_cert):
+        """Report the CA file of each gcloud configuration; True on any issue."""
+        configs = self._gcloud_configurations()
+        if configs is None:
+            self.print_warn("  ✗ Failed to list gcloud configurations")
+            return True
+
+        has_issues = False
+        for config in configs:
+            problem = self._gcloud_ca_problem(
+                config.ca_file,
+                lambda path: self._status_roots_present(temp_warp_cert, path),
+            )
+            label = self._gcloud_config_label(config)
+            if problem is None:
+                self.print_info(f"  ✓ {label} uses {config.ca_file}")
+            else:
+                self.print_warn(f"  ✗ {self._gcloud_problem_message(config, problem)}")
+                has_issues = True
+
+        if has_issues:
+            if os.environ.get('CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE'):
+                self.print_info("    Shells with CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE exported "
+                                "override these files; apps started outside a shell read them")
+            self.print_action("    Run with --fix to repair (required for "
+                              "`gcloud compute ssh --tunnel-through-iap`)")
         return has_issues
 
     def check_java_status(self, temp_warp_cert):

@@ -60,7 +60,7 @@ The project has a pytest-based test suite in `test_suite/`:
 cd test_suite
 uvx pytest test_fumitm_integration.py test_netskope_provider.py \
   test_suspicious_bundles.py test_headless_mdm.py test_curlrc.py \
-  test_aikido_root.py -v
+  test_aikido_root.py test_gcloud_config.py -v
 
 # Run specific test files or classes
 uvx pytest test_fumitm_integration.py::TestStatusFunctionContracts -v
@@ -83,7 +83,7 @@ Key test categories in `test_fumitm_integration.py`:
 - **TestPerformance**: Ensures subprocess call limits aren't exceeded
 - **TestCertificateContentMatching**: Tests for pure-Python certificate matching
 - **TestUpdateCheck**: Tests for the auto-update check functionality
-- **TestGcloudVerification**: Tests for gcloud connectivity verification
+- **TestGcloudVerification**: Tests for gcloud connectivity verification (per-configuration CA checks live in `test_gcloud_config.py`)
 - **TestOwnershipProtection**: Tests for sudo detection and file ownership correction
 
 Key test categories in `test_netskope_provider.py`:
@@ -150,6 +150,7 @@ The script follows a modular architecture with these key components:
    - Tools can be selectively processed using `--tools` option with keys or tags
    - Java-family keystore setup compares SHA-256 certificate identities from `keytool -list -rfc`; an existing vendor alias therefore satisfies idempotency. Alias checks are used only when the RFC listing is unavailable. When one of **fumitm's own** aliases holds a different certificate — the shape a provider root rotation takes, since the alias is stable across rotations and the certificate under it is not — the alias is **deleted and re-imported**, because keytool refuses to import over an occupied alias (`Certificate not imported, alias <name> already exists`, exit 1) and would otherwise report the same failure on every scheduled run with nothing able to clear it. A root another product installed is matched by fingerprint and never reaches this branch, so the deletion only ever touches fumitm's own entries. A failed delete prints the manual `keytool -delete` remedy in the same shape as the import-failure branch. Any failed root fails the whole keystore rather than only a keystore where nothing imported: a collision means the store actively holds the wrong certificate, which a sibling root importing cleanly must not mask.
    - Gradle honors `org.gradle.java.home` and otherwise uses the active JDK. Without Aikido it uses a fumitm-managed PKCS12 snapshot. When Aikido is active, setup verifies by certificate fingerprint that Gradle's JDK contains every available proxy root before removing fumitm's matching `custom-cacerts` settings and exact TLS 1.2 pin outside vendor blocks. Aikido maintains its root while fumitm maintains the provider root; other user truststores and TLS choices stay untouched. An unreadable `gradle.properties`, or a pinned Java home without a cacerts file, fails closed instead of falling back to the active JDK or reporting healthy status. A dangling properties symlink is treated as absent, matching Gradle, and property comparisons ignore whitespace around `=` so repeated fixes converge.
+   - gcloud trust is judged per **named configuration file**, never through `gcloud config get-value`. fumitm exports `CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE`, which overrides every configuration file, so `get-value` reported the export and a configuration pointing at a stale bundle went unnoticed, while anything started without the export (Dock-launched apps, launchd jobs, Homebrew's sanitised environment) read the file and failed TLS. `_gcloud_configurations` instead parses `gcloud config configurations list --format=json(...)`, which reads each file with `only_file_contents=True` and so is immune to the environment, and runs with the export removed. Every configuration that is unset, missing, suspicious, or lacks a proxy root is repointed with `gcloud --configuration <name> config set` at the managed `~/.config/gcloud/certs/combined-ca-bundle.pem`, rebuilt once per run. One prompt covers configurations pointing at a user-chosen bundle that lacks the root; declining keeps those and still repairs the rest. A failed `config set` does not stop the others, and the result is `failed` with `changed` reflecting whether any succeeded. When the listing itself fails, the active configuration is repaired as before rather than failing the run.
    - Docker resolves its effective endpoint with `DOCKER_HOST` taking precedence over the current context. A matching Colima socket uses bounded native `colima ssh`; unknown backends use the generic nsenter path. The explicit Colima tool uses that selected profile, or the sole running named profile when Docker does not select one.
 
 5. **Certificate Helpers**:
