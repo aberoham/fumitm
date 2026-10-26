@@ -714,6 +714,38 @@ class TestChainInstallWindows:
         imported = [cmd[cmd.index("-alias") + 1] for cmd in calls if "-import" in cmd]
         assert imported == ["netskope-zerotrust", "netskope-zerotrust-2"]
 
+    def test_java_status_requires_every_alias(self, tmp_path):
+        cert = tmp_path / "current.pem"
+        cert.write_text(ROOT_PEM + INTERMEDIATE_PEM)
+        instance = _windows_instance(mode="status")
+        installed = {"netskope-zerotrust"}
+
+        def fake_run(cmd, **kwargs):
+            alias = cmd[cmd.index("-alias") + 1]
+            found = alias in installed
+            return type('R', (), {'returncode': 0 if found else 1,
+                                  'stdout': alias.encode() if found else b'', 'stderr': b''})()
+
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch('subprocess.run', side_effect=fake_run):
+            assert instance.check_java_status(str(cert)) is True
+            installed.add("netskope-zerotrust-2")
+            assert instance.check_java_status(str(cert)) is False
+
+    def test_git_missing_ca_file_with_empty_export_creates_nothing(self, tmp_path):
+        cert_path = tmp_path / "netskope-ca.pem"
+        cert_path.write_text(ROOT_PEM)
+        missing = tmp_path / "newdir" / "git-ca.pem"
+        instance = _windows_instance()
+        result = type('R', (), {'returncode': 0, 'stdout': str(missing) + "\n", 'stderr': ''})()
+        with patch.object(fumitm_windows, 'CERT_PATH', str(cert_path)), \
+             patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(instance, 'get_system_ca_bundle', return_value=""), \
+             patch.object(instance, 'setup_consistent_bundle', return_value=None), \
+             patch('subprocess.run', return_value=result):
+            instance.setup_git_cert()
+        assert not missing.parent.exists()
+
     def test_store_install_splits_the_chain(self, tmp_path):
         cert_path = tmp_path / "netskope-ca.pem"
         cert_path.write_text(ROOT_PEM + INTERMEDIATE_PEM)

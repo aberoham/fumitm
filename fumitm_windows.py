@@ -922,7 +922,6 @@ class FumitmWindows:
         return None
 
     def setup_consistent_bundle(self, tool_name, env_vars=None):
-        """Setup consistent certificate bundle for a tool."""
         """Setup consistent certificate bundle for a tool.
 
         In order: our own bundle at the tool's standard path is kept when it
@@ -1872,7 +1871,7 @@ class FumitmWindows:
                 if not self.is_install_mode():
                     self.print_action(f"Would import certificate to Java keystore: {cacerts}")
                     self.print_action(
-                        f"Would run: keytool -import -trustcacerts -alias {alias} -file {CERT_PATH} -cacerts -storepass changeit -noprompt"
+                        f"Would run: keytool -import -trustcacerts -alias {alias} -file <certificate {alias} from {CERT_PATH}> -cacerts -storepass changeit -noprompt"
                     )
                     continue
                 result = subprocess.run(
@@ -2141,22 +2140,14 @@ class FumitmWindows:
                         f"Would create directory structure for {os.path.dirname(current_ca_info)}"
                     )
                 else:
-                    try:
-                        # Create the directory structure
-                        os.makedirs(os.path.dirname(current_ca_info), exist_ok=True)
+                    # System roots plus the provider certificate. Nothing,
+                    # not even the directory, is created when the system
+                    # export is empty; the writer creates the directory.
+                    if self._build_bundle_from_system(current_ca_info, CERT_PATH):
                         self.print_info(
-                            f"Created directory structure for {current_ca_info}"
+                            f"Created Git CA bundle with {self.get_provider_short_name()} certificate at {current_ca_info}"
                         )
-
-                        # System roots plus the provider certificate; nothing
-                        # is written when the system export is empty.
-                        if self._build_bundle_from_system(current_ca_info, CERT_PATH):
-                            self.print_info(
-                                f"Created Git CA bundle with {self.get_provider_short_name()} certificate at {current_ca_info}"
-                            )
-
-                    except Exception as e:
-                        self.print_error(f"Failed to create Git CA bundle: {e}")
+                    else:
                         self.print_info("Falling back to creating new bundle...")
 
                         # Fallback: Use consistent bundle management
@@ -2656,22 +2647,21 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         if self.command_exists("java") or self.command_exists("keytool"):
             if self.command_exists("keytool"):
                 try:
-                    result = subprocess.run(
-                        [
-                            "keytool",
-                            "-list",
-                            "-alias",
-                            self.get_keytool_alias(),
-                            "-cacerts",
-                            "-storepass",
-                            "changeit",
-                        ],
-                        capture_output=True,
-                    check=False)
-                    if (
-                        result.returncode == 0
-                        and self.get_keytool_alias() in result.stdout.decode()
-                    ):
+                    # One alias per certificate of the chain, as setup_java_cert
+                    # imports them: <alias>, then <alias>-2, <alias>-3.
+                    base_alias = self.get_keytool_alias()
+                    count = max(1, len(self._pem_blocks(self._read_text_or_none(temp_warp_cert) or "")))
+                    aliases = [base_alias] + [f"{base_alias}-{idx}" for idx in range(2, count + 1)]
+                    present = True
+                    for alias in aliases:
+                        result = subprocess.run(
+                            ["keytool", "-list", "-alias", alias, "-cacerts", "-storepass", "changeit"],
+                            capture_output=True,
+                        check=False)
+                        if result.returncode != 0 or alias not in result.stdout.decode():
+                            present = False
+                            break
+                    if present:
                         self.print_info(
                             f"  ✓ Java keystore contains {self.get_provider_short_name()} certificate"
                         )
