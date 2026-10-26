@@ -11,7 +11,6 @@ import tempfile
 import urllib.error
 import urllib.request
 import winreg
-from pathlib import Path
 
 # Version and metadata
 __description__ = "MITM Certificate Fixer Upper for Windows"
@@ -192,6 +191,9 @@ PROVIDERS = {
     },
 }
 
+# Netskope client process names on Windows: the service, then the older agent name
+NETSKOPE_PROCESS_NAMES = ("stAgentSvc.exe", "STAgent.exe")
+
 # Base directory for tool-specific certificate bundles (defaults to WARP, updated by set_active_provider)
 CLOUDFLARE_WARP_DIR = os.path.expanduser(PROVIDERS["warp"]["bundle_dir"])
 CERT_PATH = os.path.join(CLOUDFLARE_WARP_DIR, PROVIDERS["warp"]["cert_filename"])
@@ -328,17 +330,26 @@ class FumitmWindows:
             # Check for encrypted variant
             if os.path.exists(f"{path}.enc"):
                 return True
-        # Check for running STAgent process
-        try:
-            result = subprocess.run(
-                ["tasklist", "/FI", "IMAGENAME eq STAgent.exe"],
-                capture_output=True,
-                text=True,
-            check=False)
-            if result.returncode == 0 and "STAgent.exe" in result.stdout:
+        return self._netskope_process_running()
+
+    def _netskope_process_running(self):
+        """True when a Netskope client process is running.
+
+        The Windows client runs as the stAgentSvc.exe service; STAgent.exe is
+        checked as well for older clients.
+        """
+        for image in NETSKOPE_PROCESS_NAMES:
+            try:
+                result = subprocess.run(
+                    ["tasklist", "/FI", f"IMAGENAME eq {image}"],
+                    capture_output=True,
+                    text=True,
+                check=False)
+            except Exception as e:
+                self.print_debug(f"Failed to query Netskope process status: {e}")
+                continue
+            if result.returncode == 0 and image.lower() in result.stdout.lower():
                 return True
-        except Exception:
-            pass
         return False
 
     def _resolve_provider(self):
@@ -512,13 +523,22 @@ class FumitmWindows:
 
     @staticmethod
     def _pem_blocks(pem_text):
-        """Split PEM text into individual certificate blocks."""
+        """Split PEM text into complete certificate blocks.
+
+        Only BEGIN/END pairs count. Text after the last END marker is dropped,
+        so a truncated final certificate is never mistaken for a whole one,
+        and a stray BEGIN before a real one is skipped by taking the last
+        BEGIN in each chunk. Blocks with an empty body are ignored.
+        """
         marker = "-----END CERTIFICATE-----"
         begin = "-----BEGIN CERTIFICATE-----"
         blocks = []
-        for chunk in pem_text.split(marker):
-            if begin in chunk:
-                blocks.append(chunk[chunk.index(begin):] + marker + "\n")
+        for chunk in pem_text.split(marker)[:-1]:
+            if begin not in chunk:
+                continue
+            body = chunk[chunk.rindex(begin) + len(begin):]
+            if "".join(body.split()):
+                blocks.append(begin + body + marker + "\n")
         return blocks
 
     @classmethod
@@ -526,7 +546,7 @@ class FumitmWindows:
         """Return the whitespace-free base64 body of each certificate in PEM text."""
         bodies = []
         for block in cls._pem_blocks(pem_text):
-            body = block.split("-----BEGIN CERTIFICATE-----")[1]
+            body = block.rsplit("-----BEGIN CERTIFICATE-----", 1)[-1]
             body = body.split("-----END CERTIFICATE-----")[0]
             bodies.append("".join(body.split()))
         return bodies
@@ -540,43 +560,67 @@ class FumitmWindows:
         encrypted the PEM files on disk. This is the Windows counterpart of the
         macOS keychain fallback.
 
+        Only certificates valid now are considered, and the common names are
+        matched exactly. The newest root is used. Every matching intermediate
+        issued by that root is returned, so a tenant CA rotation, where old
+        and new intermediates overlap, leaves both trusted. When none of them
+        names the root as issuer, every matching intermediate is returned.
+
         Returns:
-            tuple: (root_pem or None, intermediate_pem or None)
+            tuple: (root_pem or None, intermediates_pem or None). The second
+            element may hold several PEM blocks. (None, None) also means the
+            store could not be read; the reason is printed.
         """
-        ps_command = """
-        function Export-Pem($store, $pattern) {
-            $cert = Get-ChildItem "Cert:\\LocalMachine\\$store" |
-                Where-Object { $_.Subject -match $pattern } |
-                Sort-Object NotAfter -Descending | Select-Object -First 1
-            if ($cert) {
+        ps_command = r"""
+        $ErrorActionPreference = 'Stop'
+        try {
+            $now = Get-Date
+            function Get-Valid($store, $pattern) {
+                @(Get-ChildItem "Cert:\LocalMachine\$store" | Where-Object {
+                    $_.Subject -match $pattern -and $_.NotBefore -le $now -and $_.NotAfter -gt $now
+                })
+            }
+            function Write-Pem($cert) {
                 "-----BEGIN CERTIFICATE-----"
                 [System.Convert]::ToBase64String($cert.RawData, 'InsertLineBreaks')
                 "-----END CERTIFICATE-----"
             }
+            $root = Get-Valid 'Root' '(^|,\s*)CN=certadmin(\s*,|$)' |
+                Sort-Object NotAfter -Descending | Select-Object -First 1
+            $intermediates = Get-Valid 'CA' '(^|,\s*)CN=ca\.[^,]+\.goskope\.com(\s*,|$)'
+            if ($root) {
+                $linked = @($intermediates | Where-Object { $_.Issuer -eq $root.Subject })
+                if ($linked.Count -gt 0) { $intermediates = $linked }
+                Write-Pem $root
+            }
+            "=====INTERMEDIATE====="
+            foreach ($cert in $intermediates) { Write-Pem $cert }
+        } catch {
+            [Console]::Error.WriteLine($_.Exception.Message)
+            exit 1
         }
-        Export-Pem 'Root' 'CN=certadmin'
-        "=====INTERMEDIATE====="
-        Export-Pem 'CA' 'CN=[^,]*goskope'
         """
         try:
             result = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", ps_command],
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_command],
                 capture_output=True,
                 text=True,
                 check=False,
             )
         except Exception as e:
-            self.print_debug(f"Could not query the Windows certificate store: {e}")
+            self.print_warn(f"Could not query the Windows certificate store: {e}")
             return None, None
-        if result.returncode != 0:
-            self.print_debug(f"Certificate store query failed: {result.stderr.strip()}")
+        if result.returncode != 0 or "=====INTERMEDIATE=====" not in result.stdout:
+            self.print_warn(
+                f"Could not read the Windows certificate store: {result.stderr.strip() or 'no output'}"
+            )
             return None, None
         root_text, _, intermediate_text = result.stdout.partition("=====INTERMEDIATE=====")
         root = self._pem_blocks(root_text)
-        intermediate = self._pem_blocks(intermediate_text)
+        intermediates = self._pem_blocks(intermediate_text)
         return (
             root[0].strip() if root else None,
-            intermediate[0].strip() if intermediate else None,
+            "".join(intermediates).strip() if intermediates else None,
         )
 
     def _get_warp_cert(self):
@@ -616,24 +660,26 @@ class FumitmWindows:
         store, then the manual copy at CERT_PATH. Vendor-managed sources come
         first so that CA rotations are picked up immediately.
 
-        The tenant intermediate is always included when the store has it.
-        Python 3.13+ verifies chains strictly (VERIFY_X509_STRICT) and rejects
-        the Netskope root, which carries no Key Usage extension, with
-        "CA cert does not include key usage extension". With the intermediate
-        (which has one) in the bundle, chain building stops there and the
-        root is never examined.
+        The store is always queried, and every tenant intermediate it holds
+        that the source lacks is added. Whether a file already carries the
+        intermediate cannot be told from its certificate count: a file can
+        hold two copies of the root, or an old and a new root. Python 3.13+
+        verifies chains strictly (VERIFY_X509_STRICT) and rejects the Netskope
+        root, which carries no Key Usage extension, with "CA cert does not
+        include key usage extension". With the intermediate (which has one)
+        in the bundle, chain building stops there and the root is never
+        examined. When the store cannot supply an intermediate and the
+        source holds a single certificate, a warning says so.
         """
         content = None
         for path in self.get_netskope_cert_sources():
             text = self._read_text_or_none(path)
-            if text and "-----BEGIN CERTIFICATE-----" in text:
+            if text and self._pem_blocks(text):
                 self.print_info(f"Using Netskope certificate from {path}")
-                content = text.strip()
+                content = text
                 break
 
-        root, intermediate = None, None
-        if content is None or len(self._pem_blocks(content)) < 2:
-            root, intermediate = self._get_netskope_certs_from_store()
+        root, intermediates = self._get_netskope_certs_from_store()
 
         if content is None and root:
             self.print_info("Using Netskope certificate from the Windows certificate store")
@@ -641,9 +687,9 @@ class FumitmWindows:
 
         if content is None:
             text = self._read_text_or_none(CERT_PATH)
-            if text and "-----BEGIN CERTIFICATE-----" in text:
+            if text and self._pem_blocks(text):
                 self.print_info(f"Using Netskope certificate from {CERT_PATH}")
-                content = text.strip()
+                content = text
 
         if content is None:
             found_encrypted = [
@@ -675,15 +721,28 @@ class FumitmWindows:
             )
             return None
 
-        if intermediate and self._pem_bodies(intermediate)[0] not in self._pem_bodies(content):
+        # Rebuild from unique blocks: a source holding the same certificate
+        # twice would otherwise carry the duplicate into every bundle.
+        blocks, seen = [], set()
+        for block, body in zip(self._pem_blocks(content), self._pem_bodies(content)):
+            if body not in seen:
+                seen.add(body)
+                blocks.append(block)
+        added = False
+        for block, body in zip(self._pem_blocks(intermediates or ""),
+                               self._pem_bodies(intermediates or "")):
+            if body not in seen:
+                seen.add(body)
+                blocks.append(block)
+                added = True
+        if added:
             self.print_info("Adding Netskope intermediate CA from the Windows certificate store")
-            content = content.rstrip() + "\n" + intermediate
-        elif len(self._pem_bodies(content)) < 2:
+        elif not intermediates and len(blocks) < 2:
             self.print_warn(
                 "Netskope intermediate CA not found; Python 3.13+ rejects the root CA alone "
                 "(no Key Usage extension)"
             )
-        return content
+        return "".join(blocks).strip()
 
     def get_provider_cert(self):
         """Retrieve the current provider certificate as PEM text."""
@@ -731,19 +790,14 @@ class FumitmWindows:
             self.print_action(f"  Install {provider_name} client")
             return True
 
-        try:
-            result = subprocess.run(
-                ["tasklist", "/FI", "IMAGENAME eq STAgent.exe"],
-                capture_output=True,
-                text=True,
-            check=False)
-            if result.returncode == 0 and "STAgent.exe" in result.stdout:
-                self.print_info("  ✓ STAgent is running")
-                return False
-        except Exception as e:
-            self.print_debug(f"Failed to query Netskope process status: {e}")
+        if self._netskope_process_running():
+            self.print_info("  ✓ Netskope client is running")
+            return False
 
-        if any(os.path.exists(path) for path in self.get_netskope_cert_sources()):
+        if any(
+            os.path.exists(path) or os.path.exists(f"{path}.enc")
+            for path in self.get_netskope_cert_sources()
+        ):
             self.print_info("  ✓ Netskope certificate file found")
             return False
 
@@ -869,108 +923,101 @@ class FumitmWindows:
 
     def setup_consistent_bundle(self, tool_name, env_vars=None):
         """Setup consistent certificate bundle for a tool."""
+        """Setup consistent certificate bundle for a tool.
+
+        In order: our own bundle at the tool's standard path is kept when it
+        has every provider certificate, and topped up in place when it lacks
+        some (a provider chain that gained its intermediate); a bundle found
+        elsewhere seeds a new one; otherwise the bundle is built from the
+        Windows root store. A bundle holding only the provider certificate
+        is never kept or used as a seed. Every write goes through a
+        temporary file, and environment variables are set only after it
+        succeeds. Returns the bundle path, or None when nothing usable was
+        written.
+        """
         bundle_path = self.get_tool_bundle_path(tool_name)
         existing_bundle = self.find_existing_bundle(tool_name)
         short_name = self.get_provider_short_name()
+        same_file = existing_bundle and (
+            os.path.normpath(os.path.abspath(existing_bundle))
+            == os.path.normpath(os.path.abspath(bundle_path))
+        )
 
         # A bundle holding only the proxy certificate breaks every site the
         # proxy does not intercept. Never seed from one, and rebuild our own.
-        if existing_bundle and self._bundle_is_provider_only(existing_bundle):
+        if existing_bundle and not same_file and self._bundle_is_provider_only(existing_bundle):
             self.print_warn(
                 f"Ignoring {existing_bundle}: it holds only the {short_name} certificate(s)"
             )
             existing_bundle = None
-        if os.path.exists(bundle_path) and self._bundle_is_provider_only(bundle_path):
-            self.print_warn(
-                f"{tool_name} bundle at {bundle_path} holds only the {short_name} "
-                "certificate(s) and no system roots; it needs rebuilding"
-            )
-            existing_bundle = None
-        # Check if bundle already exists and is current
-        elif os.path.exists(bundle_path) and self.certificate_exists_in_file(CERT_PATH, bundle_path):
-            self.print_debug(
-                f"{tool_name} bundle already contains current certificate"
-            )
-            # Bundle is healthy — still ensure all env vars are set in the registry,
-            # since they may have been missed on a previous run.
-            if env_vars:
-                for env_var in env_vars:
+
+        if os.path.exists(bundle_path):
+            if self._bundle_is_provider_only(bundle_path):
+                self.print_warn(
+                    f"{tool_name} bundle at {bundle_path} holds only the {short_name} "
+                    "certificate(s) and no system roots; it needs rebuilding"
+                )
+                existing_bundle = None
+            else:
+                missing = self._missing_certificates(CERT_PATH, bundle_path)
+                if missing is None:
+                    self.print_error(f"Could not read {bundle_path} or {CERT_PATH}")
+                    return None
+                if missing:
+                    # Keep the system roots already there and add only what
+                    # is absent, rather than rebuilding from the store.
+                    if not self.is_install_mode():
+                        self.print_action(
+                            f"Would append the missing {short_name} certificate(s) to {bundle_path}"
+                        )
+                    elif not self.append_certificate_if_missing(CERT_PATH, bundle_path):
+                        return None
+                else:
+                    self.print_debug(
+                        f"{tool_name} bundle already contains current certificate"
+                    )
+                # The bundle is healthy; still ensure every env var is set,
+                # since a previous run may have missed one.
+                for env_var in env_vars or []:
                     if not self.get_environment_variable(env_var):
                         if not self.is_install_mode():
-                            self.print_action(
-                                f"Would set {env_var} to {bundle_path}"
-                            )
+                            self.print_action(f"Would set {env_var} to {bundle_path}")
                         else:
                             self.set_environment_variable(env_var, bundle_path)
-            return bundle_path
+                return bundle_path
 
-        # Handle existing bundle
-        if existing_bundle:
+        if existing_bundle and not same_file:
             if not self.is_install_mode():
                 self.print_action(
                     f"Found existing {tool_name} certificate bundle at {existing_bundle}"
                 )
                 self.print_action(
-                    f"Would copy to {bundle_path} and append {self.get_provider_short_name()} cert"
+                    f"Would copy to {bundle_path} and append {short_name} cert"
                 )
-            else:
-                response = input(
-                    f"Found existing {tool_name} certificate bundle at {existing_bundle}. Copy to {bundle_path} and append {self.get_provider_short_name()} cert? (Y/n) "
-                )
-                if response.lower() != "n":
-                    # Create directory
-                    os.makedirs(os.path.dirname(bundle_path), exist_ok=True)
-
-                    # Normalize paths for comparison
-                    existing_bundle_normalized = os.path.normpath(os.path.abspath(existing_bundle))
-                    bundle_path_normalized = os.path.normpath(os.path.abspath(bundle_path))
-
-                    # Copy existing bundle (only if it's not already at the target location)
-                    if existing_bundle_normalized != bundle_path_normalized:
-                        shutil.copy(existing_bundle, bundle_path)
-                        self.print_info(f"Copied existing bundle to {bundle_path}")
-                    else:
-                        self.print_info(f"Using existing bundle at {bundle_path}")
-
-                    # Check if the copied bundle already contains the certificate
-                    if not self.certificate_exists_in_file(CERT_PATH, bundle_path):
-                        # Append provider cert if not already present
-                        self.append_certificate_if_missing(CERT_PATH, bundle_path)
-                    else:
-                        self.print_debug(
-                            "Copied bundle already contains current certificate, skipping append"
-                        )
-                else:
-                    return None
+                return bundle_path
+            response = input(
+                f"Found existing {tool_name} certificate bundle at {existing_bundle}. Copy to {bundle_path} and append {short_name} cert? (Y/n) "
+            )
+            if response.lower() == "n":
+                return None
+            seed = self._read_text_or_none(existing_bundle)
+            if seed is None:
+                self.print_error(f"Could not read {existing_bundle}")
+                return None
+            if not self._write_bundle(bundle_path, seed, CERT_PATH):
+                return None
+            self.print_info(f"Copied existing bundle to {bundle_path} with {short_name} certificate")
         else:
-            # No existing bundle, create new one
             if not self.is_install_mode():
                 self.print_action(f"Would create new bundle at {bundle_path}")
-            else:
-                self.print_info(f"Creating new {tool_name} CA bundle at {bundle_path}")
-                os.makedirs(os.path.dirname(bundle_path), exist_ok=True)
+                return bundle_path
+            self.print_info(f"Creating new {tool_name} CA bundle at {bundle_path}")
+            if not self._build_bundle_from_system(bundle_path, CERT_PATH):
+                return None
+            self.print_info(f"Created {tool_name} CA bundle with {short_name} certificate")
 
-                # Get system certificates
-                system_certs = self.get_system_ca_bundle()
-                if not system_certs:
-                    self.print_warn(
-                        "Could not export system certificates from the Windows certificate "
-                        "store; the bundle will trust only the proxy certificate"
-                    )
-                with open(bundle_path, "w") as f:
-                    f.write(system_certs)
-
-                # Append provider certificate (with duplicate detection)
-                self.append_certificate_if_missing(CERT_PATH, bundle_path)
-
-                self.print_info(
-                    f"Created {tool_name} CA bundle with {self.get_provider_short_name()} certificate"
-                )
-
-        # Set environment variables if provided
-        if env_vars and self.is_install_mode():
-            for env_var in env_vars:
-                self.set_environment_variable(env_var, bundle_path)
+        for env_var in env_vars or []:
+            self.set_environment_variable(env_var, bundle_path)
 
         return bundle_path
 
@@ -989,29 +1036,112 @@ class FumitmWindows:
         if not os.path.exists(target_file) or not os.path.exists(cert_file):
             return False
         missing = self._missing_certificates(cert_file, target_file)
-        if not missing:
+        if missing == []:
             self.print_debug(f"Certificate already exists in {target_file}")
-        return not missing
+        return missing == []
 
     def _missing_certificates(self, cert_file, target_file):
-        """Return the PEM blocks of cert_file that target_file does not contain."""
-        cert_text = self._read_text_or_none(cert_file) or ""
-        present = set(self._pem_bodies(self._read_text_or_none(target_file) or ""))
-        return [
-            block
-            for block, body in zip(self._pem_blocks(cert_text), self._pem_bodies(cert_text))
-            if body not in present
-        ]
+        """Return the PEM blocks of cert_file that target_file does not contain.
 
-    def _bundle_is_provider_only(self, bundle_path):
+        Returns None when the answer is unknown: cert_file is unreadable or
+        holds no certificate, or target_file exists but cannot be read. A
+        missing target_file lacks everything. Each certificate is returned
+        once, even when cert_file repeats it.
+        """
+        cert_text = self._read_text_or_none(cert_file)
+        if cert_text is None or not self._pem_blocks(cert_text):
+            return None
+        if os.path.exists(target_file):
+            target_text = self._read_text_or_none(target_file)
+            if target_text is None:
+                return None
+        else:
+            target_text = ""
+        present = set(self._pem_bodies(target_text))
+        missing = []
+        for block, body in zip(self._pem_blocks(cert_text), self._pem_bodies(cert_text)):
+            if body not in present:
+                present.add(body)
+                missing.append(block)
+        return missing
+
+    def _bundle_is_provider_only(self, bundle_path, cert_file=None):
         """True when bundle_path holds nothing but the provider certificate(s).
 
         Such a bundle breaks every site the proxy does not intercept. It is
-        what a bundle seeded from a hand-exported root looks like.
+        what a bundle seeded from a hand-exported root looks like. An empty
+        bundle counts. An unreadable bundle, or a missing or unreadable
+        provider certificate, answers False: a failed read is never a reason
+        to rebuild a file.
+
+        Args:
+            cert_file: the provider certificate to compare against; defaults
+                to CERT_PATH. Status mode passes its temporary copy.
         """
-        bodies = self._pem_bodies(self._read_text_or_none(bundle_path) or "")
-        provider = set(self._pem_bodies(self._read_text_or_none(CERT_PATH) or ""))
+        text = self._read_text_or_none(bundle_path)
+        provider_text = self._read_text_or_none(cert_file or CERT_PATH)
+        if text is None or provider_text is None:
+            return False
+        provider = set(self._pem_bodies(provider_text))
+        if not provider:
+            return False
+        bodies = self._pem_bodies(text)
         return not bodies or set(bodies) <= provider
+
+    def _write_bundle(self, bundle_path, system_certs, cert_file):
+        """Write system_certs plus the certificates of cert_file to bundle_path.
+
+        The bundle is assembled in a temporary file beside bundle_path and
+        moved into place only when it is complete, so a failure at any step
+        leaves the previous file untouched. Returns True on success.
+        """
+        cert_text = self._read_text_or_none(cert_file)
+        if cert_text is None or not self._pem_blocks(cert_text):
+            self.print_error(f"Failed to read certificate file {cert_file}")
+            return False
+        present = set(self._pem_bodies(system_certs))
+        provider_blocks = []
+        for block, body in zip(self._pem_blocks(cert_text), self._pem_bodies(cert_text)):
+            if body not in present:
+                present.add(body)
+                provider_blocks.append(block)
+        content = system_certs.rstrip() + "\n" + "".join(provider_blocks)
+
+        bundle_dir = os.path.dirname(bundle_path) or "."
+        temp_path = None
+        try:
+            os.makedirs(bundle_dir, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w", dir=bundle_dir, suffix=".tmp", delete=False
+            ) as tf:
+                temp_path = tf.name
+                tf.write(content)
+            os.replace(temp_path, bundle_path)
+            return True
+        except Exception as e:
+            self.print_error(f"Failed to write {bundle_path}: {e}")
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except Exception:
+                    pass
+            return False
+
+    def _build_bundle_from_system(self, bundle_path, cert_file):
+        """Rebuild bundle_path from the Windows root store plus cert_file.
+
+        Refuses, and writes nothing, when the system export is empty: a
+        bundle holding only the proxy certificate breaks every site the
+        proxy does not intercept.
+        """
+        system_certs = self.get_system_ca_bundle()
+        if not self._pem_blocks(system_certs):
+            self.print_error(
+                "Could not export system certificates from the Windows certificate store; "
+                f"not writing {bundle_path}, which would then trust only the proxy certificate"
+            )
+            return False
+        return self._write_bundle(bundle_path, system_certs, cert_file)
 
     def append_certificate_if_missing(self, cert_file, target_file):
         """Append the certificates from cert_file that target_file lacks."""
@@ -1024,11 +1154,12 @@ class FumitmWindows:
             self.print_debug(f"Skipping append: source and target are the same file ({cert_file})")
             return True
 
-        if self._read_text_or_none(cert_file) is None:
-            self.print_error(f"Failed to read certificate file {cert_file}")
-            return False
-
         missing = self._missing_certificates(cert_file, target_file)
+        if missing is None:
+            self.print_error(
+                f"Failed to read certificates from {cert_file} or {target_file}"
+            )
+            return False
         if not missing:
             self.print_debug(
                 f"Certificate already exists in {target_file}, skipping append"
@@ -1142,8 +1273,36 @@ class FumitmWindows:
             self.print_debug(f"Error reading environment variable {var_name}: {e}")
             return None
 
-    def install_certificate_to_store(self, cert_path, store_name="Root"):
-        """Install certificate to Windows certificate store."""
+    def _split_certificate_file(self, cert_path):
+        """Write each certificate in cert_path to its own temporary PEM file.
+
+        X509Certificate2 and keytool read only the first certificate of a
+        file, so a chain (the Netskope root plus its intermediate) must be
+        handed to them one certificate at a time. The caller deletes the
+        returned files.
+        """
+        paths = []
+        for block in self._pem_blocks(self._read_text_or_none(cert_path) or ""):
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".pem", delete=False) as tf:
+                tf.write(block)
+                paths.append(tf.name)
+        return paths
+
+    @staticmethod
+    def _remove_files(paths):
+        for path in paths:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def install_certificate_to_store(self, cert_path, store_name="Root", location="CurrentUser"):
+        """Install every certificate in cert_path into the Windows certificate store.
+
+        Self-signed certificates go to store_name; any other certificate, such
+        as the Netskope tenant intermediate, goes to the CA store, where
+        Windows looks for intermediates.
+        """
         if not os.path.exists(cert_path):
             self.print_error(f"Certificate file not found: {cert_path}")
             return False
@@ -1154,31 +1313,38 @@ class FumitmWindows:
             )
             return True
 
+        parts = self._split_certificate_file(cert_path)
+        if not parts:
+            self.print_error(f"No certificate found in {cert_path}")
+            return False
         try:
-            # Use PowerShell to install certificate
-            ps_command = f"""
-            $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('{self._ps_escape(cert_path)}')
-            $store = New-Object System.Security.Cryptography.X509Certificates.X509Store('{store_name}', 'CurrentUser')
-            $store.Open('ReadWrite')
-            $store.Add($cert)
-            $store.Close()
-            Write-Host "Certificate installed successfully"
-            """
-
-            result = subprocess.run(
-                ["powershell", "-Command", ps_command], capture_output=True, text=True, check=False
-            )
-
-            if result.returncode == 0:
-                self.print_info(f"Certificate installed to Windows {store_name} store")
-                return True
-            else:
-                self.print_error(f"Failed to install certificate: {result.stderr}")
-                return False
-
+            for part in parts:
+                ps_command = f"""
+                $ErrorActionPreference = 'Stop'
+                $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('{self._ps_escape(part)}')
+                $name = if ($cert.Subject -eq $cert.Issuer) {{ '{store_name}' }} else {{ 'CA' }}
+                $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($name, '{location}')
+                $store.Open('ReadWrite')
+                $store.Add($cert)
+                $store.Close()
+                Write-Output $name
+                """
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", ps_command],
+                    capture_output=True, text=True, check=False
+                )
+                if result.returncode != 0:
+                    self.print_error(f"Failed to install certificate: {result.stderr}")
+                    return False
+                self.print_info(
+                    f"Certificate installed to Windows {location} {result.stdout.strip() or store_name} store"
+                )
+            return True
         except Exception as e:
             self.print_error(f"Error installing certificate to store: {e}")
             return False
+        finally:
+            self._remove_files(parts)
 
     def check_certificate_in_store(self, cert_path, store_name="Root"):
         """Check if certificate exists in Windows certificate store."""
@@ -1330,30 +1496,44 @@ class FumitmWindows:
         return True
 
     def get_system_ca_bundle(self):
-        """Get system CA bundle content."""
-        try:
-            # Try to export certificates from Windows certificate store
-            ps_command = """
-            $certs = Get-ChildItem -Path Cert:\\CurrentUser\\Root
-            $output = ""
-            foreach ($cert in $certs) {
-                $output += "-----BEGIN CERTIFICATE-----`n"
-                $output += [System.Convert]::ToBase64String($cert.RawData, 'InsertLineBreaks')
-                $output += "`n-----END CERTIFICATE-----`n"
+        """Export the trusted roots of the Windows certificate store as PEM.
+
+        Reads the LocalMachine and CurrentUser Root stores, one copy of each
+        certificate. Returns "" when the store cannot be read; a read error
+        stops the export rather than returning a partial list.
+        """
+        ps_command = r"""
+        $ErrorActionPreference = 'Stop'
+        try {
+            $seen = @{}
+            foreach ($store in 'Cert:\LocalMachine\Root', 'Cert:\CurrentUser\Root') {
+                foreach ($cert in Get-ChildItem -Path $store) {
+                    if ($seen.ContainsKey($cert.Thumbprint)) { continue }
+                    $seen[$cert.Thumbprint] = $true
+                    "-----BEGIN CERTIFICATE-----"
+                    [System.Convert]::ToBase64String($cert.RawData, 'InsertLineBreaks')
+                    "-----END CERTIFICATE-----"
+                }
             }
-            Write-Output $output
-            """
-
+        } catch {
+            [Console]::Error.WriteLine($_.Exception.Message)
+            exit 1
+        }
+        """
+        try:
             result = subprocess.run(
-                ["powershell", "-Command", ps_command], capture_output=True, text=True, check=False
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_command],
+                capture_output=True,
+                text=True,
+                check=False,
             )
-
-            if result.returncode == 0 and result.stdout.strip():
-                return result.stdout.strip()
         except Exception as e:
             self.print_debug(f"Error getting system CA bundle: {e}")
-
-        return ""
+            return ""
+        if result.returncode != 0:
+            self.print_debug(f"Error getting system CA bundle: {result.stderr.strip()}")
+            return ""
+        return result.stdout.strip()
 
     def setup_system_cert(self):
         """Setup Windows system certificate store."""
@@ -1377,33 +1557,9 @@ class FumitmWindows:
                 response = input(
                     "Install to system certificate store for all users? (y/N) "
                 )
-                if response.lower() == "y":
-                    try:
-                        ps_command = f"""
-                        $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('{self._ps_escape(CERT_PATH)}')
-                        $store = New-Object System.Security.Cryptography.X509Certificates.X509Store('Root', 'LocalMachine')
-                        $store.Open('ReadWrite')
-                        $store.Add($cert)
-                        $store.Close()
-                        Write-Host "Certificate installed to system store"
-                        """
-
-                        result = subprocess.run(
-                            ["powershell", "-Command", ps_command],
-                            capture_output=True,
-                            text=True,
-                        check=False)
-
-                        if result.returncode == 0:
-                            self.print_info(
-                                "Certificate installed to system Root store"
-                            )
-                        else:
-                            self.print_error(
-                                f"Failed to install to system store: {result.stderr}"
-                            )
-                    except Exception as e:
-                        self.print_error(f"Error installing to system store: {e}")
+                if response.lower() == "y" and not self.install_certificate_to_store(
+                        CERT_PATH, "Root", location="LocalMachine"):
+                    self.print_error("Failed to install to system store")
         else:
             self.print_info(
                 "Administrator privileges required for system-wide installation"
@@ -1454,6 +1610,17 @@ class FumitmWindows:
             check=False)
             current_cafile = result.stdout.strip() if result.returncode == 0 else ""
         except Exception:
+            current_cafile = ""
+
+        # npm's cafile replaces its built-in roots, so a file holding only
+        # the proxy certificate breaks every other registry. Replace it.
+        if (current_cafile not in ["", "null", "undefined"]
+                and os.path.exists(current_cafile)
+                and self._bundle_is_provider_only(current_cafile)):
+            self.print_warn(
+                f"npm cafile {current_cafile} holds only the {self.get_provider_short_name()} "
+                "certificate(s) and no system roots; replacing it"
+            )
             current_cafile = ""
 
         if current_cafile and current_cafile not in ["null", "undefined"]:
@@ -1596,7 +1763,13 @@ class FumitmWindows:
         if not current_ca_file:
             needs_setup = True
         elif os.path.exists(current_ca_file):
-            if not self.certificate_exists_in_file(CERT_PATH, current_ca_file):
+            if self._bundle_is_provider_only(current_ca_file):
+                self.print_warn(
+                    f"gcloud CA file {current_ca_file} holds only the "
+                    f"{self.get_provider_short_name()} certificate(s) and no system roots"
+                )
+                needs_setup = True
+            elif not self.certificate_exists_in_file(CERT_PATH, current_ca_file):
                 needs_setup = True
         else:
             needs_setup = True
@@ -1663,60 +1836,69 @@ class FumitmWindows:
             self.print_error("Could not find Java cacerts file")
             return
 
-        # Check if certificate already exists
-        try:
-            result = subprocess.run(
-                [
-                    "keytool",
-                    "-list",
-                    "-alias",
-                    self.get_keytool_alias(),
-                    "-cacerts",
-                    "-storepass",
-                    "changeit",
-                ],
-                capture_output=True,
-            check=False)
-            if (
-                result.returncode == 0
-                and self.get_keytool_alias() in result.stdout.decode()
-            ):
-                # Certificate already exists, nothing to do
-                return
-        except Exception:
-            pass
-
-        self.print_info("Setting up Java certificate...")
-        self.print_info(f"Adding certificate to Java keystore: {cacerts}")
-
-        if not self.is_install_mode():
-            self.print_action(f"Would import certificate to Java keystore: {cacerts}")
-            self.print_action(
-                f"Would run: keytool -import -trustcacerts -alias {self.get_keytool_alias()} -file {CERT_PATH} -cacerts -storepass changeit -noprompt"
-            )
-        else:
-            result = subprocess.run(
-                [
-                    "keytool",
-                    "-import",
-                    "-trustcacerts",
-                    "-alias",
-                    self.get_keytool_alias(),
-                    "-file",
-                    CERT_PATH,
-                    "-cacerts",
-                    "-storepass",
-                    "changeit",
-                    "-noprompt",
-                ],
-                capture_output=True,
-            check=False)
-            if result.returncode == 0:
-                self.print_info("Certificate added to Java keystore successfully")
+        # keytool imports only the first certificate of a file, so each
+        # certificate of a chain goes in under its own alias: the primary
+        # alias, then <alias>-2, <alias>-3 (matching fumitm.py).
+        parts = self._split_certificate_file(CERT_PATH)
+        if not parts:
+            if self.is_install_mode():
+                self.print_error(f"No certificate found in {CERT_PATH}")
             else:
-                self.print_warn(
-                    "Failed to add certificate to Java keystore (may require admin)"
-                )
+                self.print_action(f"Would import certificate to Java keystore: {cacerts}")
+            return
+        try:
+            base_alias = self.get_keytool_alias()
+            pending = []
+            for idx, part in enumerate(parts, start=1):
+                alias = base_alias if idx == 1 else f"{base_alias}-{idx}"
+                try:
+                    result = subprocess.run(
+                        ["keytool", "-list", "-alias", alias, "-cacerts", "-storepass", "changeit"],
+                        capture_output=True,
+                    check=False)
+                    if result.returncode == 0 and alias in result.stdout.decode():
+                        continue
+                except Exception:
+                    pass
+                pending.append((alias, part))
+
+            if not pending:
+                return
+
+            self.print_info("Setting up Java certificate...")
+            self.print_info(f"Adding certificate to Java keystore: {cacerts}")
+
+            for alias, part in pending:
+                if not self.is_install_mode():
+                    self.print_action(f"Would import certificate to Java keystore: {cacerts}")
+                    self.print_action(
+                        f"Would run: keytool -import -trustcacerts -alias {alias} -file {CERT_PATH} -cacerts -storepass changeit -noprompt"
+                    )
+                    continue
+                result = subprocess.run(
+                    [
+                        "keytool",
+                        "-import",
+                        "-trustcacerts",
+                        "-alias",
+                        alias,
+                        "-file",
+                        part,
+                        "-cacerts",
+                        "-storepass",
+                        "changeit",
+                        "-noprompt",
+                    ],
+                    capture_output=True,
+                check=False)
+                if result.returncode == 0:
+                    self.print_info(f"Certificate {alias} added to Java keystore successfully")
+                else:
+                    self.print_warn(
+                        f"Failed to add certificate {alias} to Java keystore (may require admin)"
+                    )
+        finally:
+            self._remove_files(parts)
 
     def setup_wget_cert(self):
         """Setup wget certificate."""
@@ -1913,7 +2095,25 @@ class FumitmWindows:
 
         if current_ca_info:
             # Custom CA file is already configured
-            if os.path.exists(current_ca_info):
+            if os.path.exists(current_ca_info) and self._bundle_is_provider_only(current_ca_info):
+                # http.sslCAInfo replaces Git's roots, so this file breaks
+                # every host the proxy does not intercept.
+                self.print_warn(
+                    f"Git CA file {current_ca_info} holds only the {self.get_provider_short_name()} "
+                    "certificate(s) and no system roots"
+                )
+                if not self.is_install_mode():
+                    self.print_action(
+                        f"Would rebuild {current_ca_info} from the Windows root store"
+                    )
+                else:
+                    response = input(
+                        f"Rebuild {current_ca_info} with the Windows root certificates? (Y/n) "
+                    )
+                    if response.lower() != "n" and self._build_bundle_from_system(
+                            current_ca_info, CERT_PATH):
+                        self.print_info(f"Rebuilt Git CA bundle at {current_ca_info}")
+            elif os.path.exists(current_ca_info):
                 if not self.certificate_exists_in_file(CERT_PATH, current_ca_info):
                     if not self.is_install_mode():
                         self.print_action(
@@ -1948,21 +2148,12 @@ class FumitmWindows:
                             f"Created directory structure for {current_ca_info}"
                         )
 
-                        # Get system certificates
-                        system_certs = self.get_system_ca_bundle()
-                        if system_certs:
-                            with open(current_ca_info, "w") as f:
-                                f.write(system_certs)
-                        else:
-                            # Create empty file if no system certs available
-                            Path(current_ca_info).touch()
-
-                        # Append provider certificate (with duplicate detection)
-                        self.append_certificate_if_missing(CERT_PATH, current_ca_info)
-
-                        self.print_info(
-                            f"Created Git CA bundle with {self.get_provider_short_name()} certificate at {current_ca_info}"
-                        )
+                        # System roots plus the provider certificate; nothing
+                        # is written when the system export is empty.
+                        if self._build_bundle_from_system(current_ca_info, CERT_PATH):
+                            self.print_info(
+                                f"Created Git CA bundle with {self.get_provider_short_name()} certificate at {current_ca_info}"
+                            )
 
                     except Exception as e:
                         self.print_error(f"Failed to create Git CA bundle: {e}")
@@ -2178,6 +2369,23 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         return result
 
     # Status checking functions
+    def _report_provider_only(self, bundle, temp_warp_cert, label):
+        """Report a bundle that replaces a tool's roots but holds only the proxy certificate.
+
+        Such a file contains the provider certificate, so the content check
+        alone would pass it, yet every host the proxy does not intercept
+        fails. Not for NODE_EXTRA_CA_CERTS, which adds to Node's built-in
+        roots rather than replacing them. Returns True when reported.
+        """
+        if not self._bundle_is_provider_only(bundle, temp_warp_cert):
+            return False
+        self.print_warn(
+            f"  ✗ {label} holds only the {self.get_provider_short_name()} certificate(s) "
+            "and no system roots"
+        )
+        self.print_action("    Run with --fix to rebuild it with the Windows root certificates")
+        return True
+
     def check_system_status(self, temp_warp_cert):
         """Check Windows certificate store status."""
         has_issues = False
@@ -2249,7 +2457,9 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
 
                     if npm_cafile and npm_cafile not in ["null", "undefined"]:
                         if os.path.exists(npm_cafile):
-                            if self.certificate_exists_in_file(
+                            if self._report_provider_only(npm_cafile, temp_warp_cert, "npm cafile"):
+                                has_issues = True
+                            elif self.certificate_exists_in_file(
                                 temp_warp_cert, npm_cafile
                             ):
                                 self.print_info(
@@ -2297,7 +2507,9 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                     if env_value:
                         env_vars_set = True
                         if os.path.exists(env_value):
-                            if not self.certificate_exists_in_file(
+                            if self._report_provider_only(env_value, temp_warp_cert, env_var):
+                                has_issues = True
+                            elif not self.certificate_exists_in_file(
                                 temp_warp_cert, env_value
                             ):
                                 self.print_warn(
@@ -2326,7 +2538,10 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                         f"  REQUESTS_CA_BUNDLE is set to: {requests_ca_bundle}"
                     )
                     if os.path.exists(requests_ca_bundle):
-                        if self.certificate_exists_in_file(
+                        if self._report_provider_only(
+                                requests_ca_bundle, temp_warp_cert, "REQUESTS_CA_BUNDLE"):
+                            has_issues = True
+                        elif self.certificate_exists_in_file(
                             temp_warp_cert, requests_ca_bundle
                         ):
                             self.print_info(
@@ -2352,7 +2567,10 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 if ssl_cert_file:
                     self.print_info(f"  SSL_CERT_FILE is set to: {ssl_cert_file}")
                     if os.path.exists(ssl_cert_file):
-                        if self.certificate_exists_in_file(
+                        if self._report_provider_only(
+                                ssl_cert_file, temp_warp_cert, "SSL_CERT_FILE"):
+                            has_issues = True
+                        elif self.certificate_exists_in_file(
                             temp_warp_cert, ssl_cert_file
                         ):
                             self.print_info(
@@ -2399,7 +2617,9 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
 
                 if gcloud_ca and os.path.exists(gcloud_ca):
                     # Custom CA file is configured
-                    if self.certificate_exists_in_file(temp_warp_cert, gcloud_ca):
+                    if self._report_provider_only(gcloud_ca, temp_warp_cert, "gcloud CA file"):
+                        has_issues = True
+                    elif self.certificate_exists_in_file(temp_warp_cert, gcloud_ca):
                         self.print_info(
                             f"  ✓ gcloud configured with current {self.get_provider_short_name()} certificate (custom bundle)"
                         )
@@ -2581,7 +2801,9 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
 
                 if git_ca_info and os.path.exists(git_ca_info):
                     # Custom CA file is configured
-                    if self.certificate_exists_in_file(temp_warp_cert, git_ca_info):
+                    if self._report_provider_only(git_ca_info, temp_warp_cert, "Git CA file"):
+                        has_issues = True
+                    elif self.certificate_exists_in_file(temp_warp_cert, git_ca_info):
                         self.print_info(
                             f"  ✓ Git configured with current {self.get_provider_short_name()} certificate (custom bundle)"
                         )
@@ -2614,10 +2836,7 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
 
     def check_all_status(self):
         """Check status of all configurations."""
-        has_issues = False
-        temp_warp_cert = None
         provider_name = self.get_provider_name()
-        short_name = self.get_provider_short_name()
 
         self.print_info(f"Checking {provider_name} Certificate Status")
         self.print_info("=" * len(f"Checking {provider_name} Certificate Status"))
@@ -2626,6 +2845,20 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         temp_warp_cert = self.get_status_cert_file()
         if not temp_warp_cert:
             return
+
+        try:
+            self._report_all_status(temp_warp_cert)
+        finally:
+            try:
+                os.unlink(temp_warp_cert)
+            except OSError:
+                pass
+
+    def _report_all_status(self, temp_warp_cert):
+        """The body of check_all_status, given the current provider certificate."""
+        has_issues = False
+        provider_name = self.get_provider_name()
+        short_name = self.get_provider_short_name()
 
         self.print_debug(f"Retrieved {short_name} certificate for comparison")
         self.cert_fingerprint = self.get_cert_fingerprint(temp_warp_cert)
@@ -2724,8 +2957,12 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
             "SSL_CERT_FILE",
         ]:
             env_value = self.get_environment_variable(env_var)
+            # A provider-only file is a working location only for
+            # NODE_EXTRA_CA_CERTS, which adds to Node's built-in roots.
             if (env_value and os.path.exists(env_value)
-                    and self.certificate_exists_in_file(temp_warp_cert, env_value)):
+                    and self.certificate_exists_in_file(temp_warp_cert, env_value)
+                    and (env_var == "NODE_EXTRA_CA_CERTS"
+                         or not self._bundle_is_provider_only(env_value, temp_warp_cert))):
                 cert_locations.append(f"    - {env_value} ({env_var})")
                 cert_found = True
 
@@ -2795,9 +3032,6 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
         else:
             self.print_info(f"✓ All configured tools are properly set up for {provider_name}")
         print()
-
-        if temp_warp_cert:
-            os.unlink(temp_warp_cert)
 
     def main(self):
         """Main function."""

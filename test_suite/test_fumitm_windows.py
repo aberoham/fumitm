@@ -4,15 +4,25 @@ Integration tests for fumitm_windows.py
 These tests verify the Windows port's functionality, particularly the
 certificate appending logic and newline handling fix for issue #13.
 """
+import os
 import re
 import sys
-from unittest.mock import patch
+import types
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-# Skip entire module on non-Windows platforms
-if sys.platform != 'win32':
-    pytest.skip("Windows-only tests", allow_module_level=True)
+# fumitm_windows imports winreg at module level. Elsewhere a stub stands in
+# so the logic can be tested on macOS and Linux too; every registry call in
+# these tests is patched out. CI also runs this file on windows-latest.
+if sys.platform != 'win32' and 'winreg' not in sys.modules:
+    _winreg = types.ModuleType('winreg')
+    for _name in ('HKEY_CURRENT_USER', 'HKEY_LOCAL_MACHINE', 'KEY_READ',
+                  'KEY_SET_VALUE', 'REG_EXPAND_SZ'):
+        setattr(_winreg, _name, 0)
+    for _name in ('OpenKey', 'SetValueEx', 'QueryValueEx', 'CloseKey'):
+        setattr(_winreg, _name, MagicMock(side_effect=OSError('winreg stub')))
+    sys.modules['winreg'] = _winreg
 
 # Import test utilities
 import mock_data
@@ -150,12 +160,9 @@ class TestCertificateAppendingWindows:
 
         original_size = bundle_file.stat().st_size
 
-        # Create instance and mock certificate_exists_in_file to return True
-        # (since mock certificates don't work with openssl fingerprint check)
         with patch('platform.system', return_value='Windows'):
             instance = fumitm_windows.FumitmWindows(mode='install', debug=True)
-            with patch.object(instance, 'certificate_exists_in_file', return_value=True):
-                result = instance.append_certificate_if_missing(str(cert_file), str(bundle_file))
+            result = instance.append_certificate_if_missing(str(cert_file), str(bundle_file))
 
         # Should return True (success, even though skipped)
         assert result is True
@@ -330,10 +337,6 @@ class TestStatusFunctionContractsWindows:
                 assert result is False, f"{method_name} should return False when tool not installed, got {result}"
 
 
-if __name__ == '__main__':
-    pytest.main([__file__, '-v'])
-
-
 # Two distinct, syntactically valid PEM blocks. The Windows helpers compare
 # base64 bodies as text, so the DER inside does not need to parse.
 ROOT_PEM = (
@@ -419,15 +422,57 @@ class TestNetskopeChainWindows:
         # Root stays first: downstream loaders read the first certificate.
         assert content.startswith("-----BEGIN CERTIFICATE-----\nROOT")
 
-    def test_combined_file_does_not_query_store(self, tmp_path):
+    def test_combined_file_does_not_duplicate_intermediate(self, tmp_path):
         source = tmp_path / "nscacert_combined.pem"
         source.write_text(ROOT_PEM + INTERMEDIATE_PEM)
         instance = _windows_instance()
         with patch.object(instance, 'get_netskope_cert_sources', return_value=[str(source)]), \
-             patch.object(instance, '_get_netskope_certs_from_store') as store:
+             patch.object(instance, '_get_netskope_certs_from_store',
+                          return_value=(ROOT_PEM.strip(), INTERMEDIATE_PEM.strip())):
             content = instance._get_netskope_cert()
-        store.assert_not_called()
         assert len(fumitm_windows.FumitmWindows._pem_blocks(content)) == 2
+
+    def test_two_copies_of_root_still_gain_intermediate(self, tmp_path):
+        """Two blocks in a file do not mean root plus intermediate."""
+        source = tmp_path / "nscacert_combined.pem"
+        source.write_text(ROOT_PEM + ROOT_PEM)
+        instance = _windows_instance()
+        with patch.object(instance, 'get_netskope_cert_sources', return_value=[str(source)]), \
+             patch.object(instance, '_get_netskope_certs_from_store',
+                          return_value=(ROOT_PEM.strip(), INTERMEDIATE_PEM.strip())):
+            content = instance._get_netskope_cert()
+        bodies = fumitm_windows.FumitmWindows._pem_bodies(content)
+        assert bodies == fumitm_windows.FumitmWindows._pem_bodies(ROOT_PEM + INTERMEDIATE_PEM)
+
+    def test_every_store_intermediate_is_added(self, tmp_path):
+        """During a tenant CA rotation the store holds two intermediates; both are kept."""
+        second = INTERMEDIATE_PEM.replace("INTER", "OTHER")
+        source = tmp_path / "nscacert.pem"
+        source.write_text(ROOT_PEM)
+        instance = _windows_instance()
+        with patch.object(instance, 'get_netskope_cert_sources', return_value=[str(source)]), \
+             patch.object(instance, '_get_netskope_certs_from_store',
+                          return_value=(ROOT_PEM.strip(), (INTERMEDIATE_PEM + second).strip())):
+            content = instance._get_netskope_cert()
+        assert len(fumitm_windows.FumitmWindows._pem_blocks(content)) == 3
+
+    def test_store_query_failure_returns_nothing(self):
+        instance = _windows_instance()
+        with patch('subprocess.run', return_value=type('R', (), {
+                'returncode': 1, 'stdout': ROOT_PEM, 'stderr': 'Access is denied'})()):
+            assert instance._get_netskope_certs_from_store() == (None, None)
+
+    def test_store_query_uses_exact_names_and_stops_on_error(self):
+        """The PowerShell must anchor the common names and stop on store errors."""
+        instance = _windows_instance()
+        with patch('subprocess.run', return_value=type('R', (), {
+                'returncode': 0, 'stdout': "=====INTERMEDIATE=====\n", 'stderr': ''})()) as run:
+            instance._get_netskope_certs_from_store()
+        script = run.call_args[0][0][-1]
+        assert "$ErrorActionPreference = 'Stop'" in script
+        assert r"CN=certadmin(\s*,|$)" in script
+        assert r"CN=ca\.[^,]+\.goskope\.com(\s*,|$)" in script
+        assert "Issuer -eq $root.Subject" in script
 
     def test_manual_cert_path_still_works_when_store_empty(self, tmp_path):
         manual = tmp_path / "netskope-ca.pem"
@@ -531,3 +576,159 @@ class TestBundleContentsWindows:
             instance.setup_consistent_bundle("python")
         bodies = fumitm_windows.FumitmWindows._pem_bodies(bundle.read_text())
         assert bodies == fumitm_windows.FumitmWindows._pem_bodies(SYSTEM_PEM + ROOT_PEM + INTERMEDIATE_PEM)
+
+    def test_pem_blocks_reject_truncated_and_stray_markers(self):
+        truncated = ROOT_PEM + "-----BEGIN CERTIFICATE-----\nINTERINTER\n"
+        blocks = fumitm_windows.FumitmWindows._pem_blocks(truncated)
+        assert len(blocks) == 1
+        stray = "-----BEGIN CERTIFICATE-----\ngarbage\n" + ROOT_PEM
+        assert fumitm_windows.FumitmWindows._pem_bodies(stray) == \
+            fumitm_windows.FumitmWindows._pem_bodies(ROOT_PEM)
+        empty = "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n"
+        assert fumitm_windows.FumitmWindows._pem_blocks(empty) == []
+
+    def test_certificate_file_without_certificates_is_not_present(self, tmp_path):
+        """An empty or non-PEM source must not read as 'already present'."""
+        bundle = tmp_path / "bundle.pem"
+        bundle.write_text(SYSTEM_PEM)
+        instance = _windows_instance()
+        for text in ("", "not a certificate\n"):
+            cert = tmp_path / "cert.pem"
+            cert.write_text(text)
+            assert instance.certificate_exists_in_file(str(cert), str(bundle)) is False
+            assert instance.append_certificate_if_missing(str(cert), str(bundle)) is False
+        assert bundle.read_text() == SYSTEM_PEM
+
+    def test_duplicate_source_blocks_are_appended_once(self, tmp_path):
+        cert = tmp_path / "cert.pem"
+        cert.write_text(ROOT_PEM + ROOT_PEM)
+        bundle = tmp_path / "bundle.pem"
+        bundle.write_text(SYSTEM_PEM)
+        instance = _windows_instance()
+        assert instance.append_certificate_if_missing(str(cert), str(bundle)) is True
+        assert bundle.read_text().count("BEGIN CERTIFICATE") == 2
+
+    def test_unreadable_bundle_is_not_provider_only(self, tmp_path):
+        """A failed read must never trigger a rebuild."""
+        cert_path = tmp_path / "netskope-ca.pem"
+        cert_path.write_text(ROOT_PEM)
+        unreadable = tmp_path / "bundle-dir"
+        unreadable.mkdir()
+        instance = _windows_instance()
+        with patch.object(fumitm_windows, 'CERT_PATH', str(cert_path)):
+            assert instance._bundle_is_provider_only(str(unreadable)) is False
+            assert instance._bundle_is_provider_only(
+                str(cert_path), str(tmp_path / "missing.pem")) is False
+
+    def test_own_bundle_missing_intermediate_is_topped_up_not_rebuilt(self, tmp_path):
+        """An earlier bundle with the root gains the intermediate and keeps its system roots."""
+        cert_path = tmp_path / "netskope-ca.pem"
+        cert_path.write_text(ROOT_PEM + INTERMEDIATE_PEM)
+        bundle = tmp_path / "npm" / "ca-bundle.pem"
+        bundle.parent.mkdir()
+        bundle.write_text(SYSTEM_PEM + ROOT_PEM)
+        instance = _windows_instance()
+        with patch.object(fumitm_windows, 'CERT_PATH', str(cert_path)), \
+             patch.object(instance, 'get_tool_bundle_path', return_value=str(bundle)), \
+             patch.object(instance, 'find_existing_bundle', return_value=None), \
+             patch.object(instance, 'get_system_ca_bundle',
+                          side_effect=AssertionError("must not rebuild from the store")):
+            assert instance.setup_consistent_bundle("npm") == str(bundle)
+        bodies = fumitm_windows.FumitmWindows._pem_bodies(bundle.read_text())
+        assert bodies == fumitm_windows.FumitmWindows._pem_bodies(SYSTEM_PEM + ROOT_PEM + INTERMEDIATE_PEM)
+
+    def test_empty_system_export_writes_nothing(self, tmp_path):
+        """No system roots: refuse rather than leave a provider-only bundle."""
+        cert_path = tmp_path / "netskope-ca.pem"
+        cert_path.write_text(ROOT_PEM + INTERMEDIATE_PEM)
+        bundle = tmp_path / "python" / "ca-bundle.pem"
+        bundle.parent.mkdir()
+        bundle.write_text(ROOT_PEM)
+        instance = _windows_instance()
+        with patch.object(fumitm_windows, 'CERT_PATH', str(cert_path)), \
+             patch.object(instance, 'get_tool_bundle_path', return_value=str(bundle)), \
+             patch.object(instance, 'find_existing_bundle', return_value=None), \
+             patch.object(instance, 'get_system_ca_bundle', return_value=""), \
+             patch.object(instance, 'set_environment_variable') as set_env:
+            assert instance.setup_consistent_bundle("python", env_vars=["REQUESTS_CA_BUNDLE"]) is None
+        assert bundle.read_text() == ROOT_PEM
+        set_env.assert_not_called()
+
+    def test_failed_replace_keeps_previous_bundle(self, tmp_path):
+        cert_path = tmp_path / "netskope-ca.pem"
+        cert_path.write_text(ROOT_PEM + INTERMEDIATE_PEM)
+        bundle = tmp_path / "python" / "ca-bundle.pem"
+        bundle.parent.mkdir()
+        bundle.write_text(ROOT_PEM)
+        instance = _windows_instance()
+        with patch.object(fumitm_windows, 'CERT_PATH', str(cert_path)), \
+             patch.object(instance, 'get_tool_bundle_path', return_value=str(bundle)), \
+             patch.object(instance, 'find_existing_bundle', return_value=None), \
+             patch.object(instance, 'get_system_ca_bundle', return_value=SYSTEM_PEM.strip()), \
+             patch.object(fumitm_windows.os, 'replace', side_effect=OSError("locked")), \
+             patch.object(instance, 'set_environment_variable') as set_env:
+            assert instance.setup_consistent_bundle("python", env_vars=["REQUESTS_CA_BUNDLE"]) is None
+        assert bundle.read_text() == ROOT_PEM
+        assert os.listdir(bundle.parent) == ["ca-bundle.pem"]
+        set_env.assert_not_called()
+
+    def test_git_status_flags_provider_only_ca_file(self, tmp_path):
+        cert = tmp_path / "current.pem"
+        cert.write_text(ROOT_PEM + INTERMEDIATE_PEM)
+        git_ca = tmp_path / "git-ca.pem"
+        git_ca.write_text(ROOT_PEM + INTERMEDIATE_PEM)
+        instance = _windows_instance(mode="status")
+        result = type('R', (), {'returncode': 0, 'stdout': str(git_ca) + "\n", 'stderr': ''})()
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch('subprocess.run', return_value=result):
+            assert instance.check_git_status(str(cert)) is True
+            git_ca.write_text(SYSTEM_PEM + ROOT_PEM + INTERMEDIATE_PEM)
+            assert instance.check_git_status(str(cert)) is False
+
+
+class TestChainInstallWindows:
+    """keytool and X509Certificate2 read only the first certificate of a file."""
+
+    def test_java_imports_each_certificate_under_its_own_alias(self, tmp_path):
+        cert_path = tmp_path / "netskope-ca.pem"
+        cert_path.write_text(ROOT_PEM + INTERMEDIATE_PEM)
+        java_home = tmp_path / "jdk"
+        (java_home / "lib" / "security").mkdir(parents=True)
+        (java_home / "lib" / "security" / "cacerts").write_bytes(b"")
+        instance = _windows_instance()
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if "-import" in cmd:
+                part = cmd[cmd.index("-file") + 1]
+                with open(part) as f:
+                    assert len(fumitm_windows.FumitmWindows._pem_blocks(f.read())) == 1
+            return type('R', (), {'returncode': 0 if "-import" in cmd else 1, 'stdout': b'', 'stderr': b''})()
+
+        with patch.object(fumitm_windows, 'CERT_PATH', str(cert_path)), \
+             patch.object(instance, 'command_exists', return_value=True), \
+             patch.dict(os.environ, {"JAVA_HOME": str(java_home)}), \
+             patch('subprocess.run', side_effect=fake_run):
+            instance.setup_java_cert()
+        imported = [cmd[cmd.index("-alias") + 1] for cmd in calls if "-import" in cmd]
+        assert imported == ["netskope-zerotrust", "netskope-zerotrust-2"]
+
+    def test_store_install_splits_the_chain(self, tmp_path):
+        cert_path = tmp_path / "netskope-ca.pem"
+        cert_path.write_text(ROOT_PEM + INTERMEDIATE_PEM)
+        instance = _windows_instance()
+        scripts = []
+
+        def fake_run(cmd, **kwargs):
+            scripts.append(cmd[-1])
+            return type('R', (), {'returncode': 0, 'stdout': 'Root', 'stderr': ''})()
+
+        with patch('subprocess.run', side_effect=fake_run):
+            assert instance.install_certificate_to_store(str(cert_path), "Root") is True
+        assert len(scripts) == 2
+        assert all("$cert.Subject -eq $cert.Issuer" in s for s in scripts)
+
+
+if __name__ == '__main__':
+    pytest.main([__file__, '-v'])
