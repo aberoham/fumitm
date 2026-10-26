@@ -501,6 +501,84 @@ class FumitmWindows:
         """Return known Windows Netskope certificate locations."""
         return self.provider.get("cert_sources", [])
 
+    @staticmethod
+    def _read_text_or_none(path):
+        """Read a text file, or return None when it cannot be read."""
+        try:
+            with open(path, "r") as f:
+                return f.read()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _pem_blocks(pem_text):
+        """Split PEM text into individual certificate blocks."""
+        marker = "-----END CERTIFICATE-----"
+        begin = "-----BEGIN CERTIFICATE-----"
+        blocks = []
+        for chunk in pem_text.split(marker):
+            if begin in chunk:
+                blocks.append(chunk[chunk.index(begin):] + marker + "\n")
+        return blocks
+
+    @classmethod
+    def _pem_bodies(cls, pem_text):
+        """Return the whitespace-free base64 body of each certificate in PEM text."""
+        bodies = []
+        for block in cls._pem_blocks(pem_text):
+            body = block.split("-----BEGIN CERTIFICATE-----")[1]
+            body = body.split("-----END CERTIFICATE-----")[0]
+            bodies.append("".join(body.split()))
+        return bodies
+
+    def _get_netskope_certs_from_store(self):
+        """Export the Netskope root and tenant intermediate from the Windows certificate store.
+
+        The Netskope client installs its root (CN "certadmin") into
+        LocalMachine\\Root and the per-tenant intermediate (CN "ca.<tenant>.goskope.com")
+        into LocalMachine\\CA regardless of whether encryptClientConfig has
+        encrypted the PEM files on disk. This is the Windows counterpart of the
+        macOS keychain fallback.
+
+        Returns:
+            tuple: (root_pem or None, intermediate_pem or None)
+        """
+        ps_command = """
+        function Export-Pem($store, $pattern) {
+            $cert = Get-ChildItem "Cert:\\LocalMachine\\$store" |
+                Where-Object { $_.Subject -match $pattern } |
+                Sort-Object NotAfter -Descending | Select-Object -First 1
+            if ($cert) {
+                "-----BEGIN CERTIFICATE-----"
+                [System.Convert]::ToBase64String($cert.RawData, 'InsertLineBreaks')
+                "-----END CERTIFICATE-----"
+            }
+        }
+        Export-Pem 'Root' 'CN=certadmin'
+        "=====INTERMEDIATE====="
+        Export-Pem 'CA' 'CN=[^,]*goskope'
+        """
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_command],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception as e:
+            self.print_debug(f"Could not query the Windows certificate store: {e}")
+            return None, None
+        if result.returncode != 0:
+            self.print_debug(f"Certificate store query failed: {result.stderr.strip()}")
+            return None, None
+        root_text, _, intermediate_text = result.stdout.partition("=====INTERMEDIATE=====")
+        root = self._pem_blocks(root_text)
+        intermediate = self._pem_blocks(intermediate_text)
+        return (
+            root[0].strip() if root else None,
+            intermediate[0].strip() if intermediate else None,
+        )
+
     def _get_warp_cert(self):
         """Retrieve the active WARP certificate from warp-cli."""
         if not self.command_exists("warp-cli"):
@@ -532,53 +610,62 @@ class FumitmWindows:
             return None
 
     def _get_netskope_cert(self):
-        """Retrieve the Netskope CA certificate from known Windows locations.
+        """Retrieve the Netskope CA chain (root plus tenant intermediate) as PEM.
 
-        Vendor-managed cert sources are checked first so that CA rotations
-        are picked up immediately. The manual override at CERT_PATH is only
-        used as a fallback when no vendor-managed file is available.
+        Sources, in order: the vendor-managed PEM files, the Windows certificate
+        store, then the manual copy at CERT_PATH. Vendor-managed sources come
+        first so that CA rotations are picked up immediately.
+
+        The tenant intermediate is always included when the store has it.
+        Python 3.13+ verifies chains strictly (VERIFY_X509_STRICT) and rejects
+        the Netskope root, which carries no Key Usage extension, with
+        "CA cert does not include key usage extension". With the intermediate
+        (which has one) in the bundle, chain building stops there and the
+        root is never examined.
         """
-        found_encrypted = []
-
+        content = None
         for path in self.get_netskope_cert_sources():
-            if not os.path.exists(path):
-                continue
+            text = self._read_text_or_none(path)
+            if text and "-----BEGIN CERTIFICATE-----" in text:
+                self.print_info(f"Using Netskope certificate from {path}")
+                content = text.strip()
+                break
 
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    cert_content = f.read().strip()
+        root, intermediate = None, None
+        if content is None or len(self._pem_blocks(content)) < 2:
+            root, intermediate = self._get_netskope_certs_from_store()
 
-                if "-----BEGIN CERTIFICATE-----" in cert_content:
-                    self.print_info(f"Using Netskope certificate from {path}")
-                    return cert_content
-            except Exception as e:
-                self.print_debug(f"Could not read Netskope certificate at {path}: {e}")
+        if content is None and root:
+            self.print_info("Using Netskope certificate from the Windows certificate store")
+            content = root
 
-        if os.path.exists(CERT_PATH):
-            try:
-                with open(CERT_PATH, "r", encoding="utf-8") as f:
-                    cert_content = f.read().strip()
+        if content is None:
+            text = self._read_text_or_none(CERT_PATH)
+            if text and "-----BEGIN CERTIFICATE-----" in text:
+                self.print_info(f"Using Netskope certificate from {CERT_PATH}")
+                content = text.strip()
 
-                if "-----BEGIN CERTIFICATE-----" in cert_content:
-                    self.print_info(f"Using Netskope certificate from {CERT_PATH}")
-                    return cert_content
-            except Exception as e:
-                self.print_debug(
-                    f"Could not read manual Netskope certificate at {CERT_PATH}: {e}"
+        if content is None:
+            found_encrypted = [
+                f"{path}.enc"
+                for path in self.get_netskope_cert_sources()
+                if os.path.exists(f"{path}.enc")
+            ]
+            if found_encrypted:
+                self.print_error("Found encrypted Netskope certificate file(s):")
+                for enc_path in found_encrypted:
+                    self.print_error(f"  {enc_path}")
+                self.print_error(
+                    "Netskope is storing the certificate in encrypted form, and its root CA"
                 )
-
-        for path in self.get_netskope_cert_sources():
-            enc_path = f"{path}.enc"
-            if os.path.exists(enc_path):
-                found_encrypted.append(enc_path)
-
-        if found_encrypted:
-            self.print_error("Found encrypted Netskope certificate file(s):")
-            for enc_path in found_encrypted:
-                self.print_error(f"  {enc_path}")
-            self.print_error(
-                "Netskope appears to be storing the certificate in encrypted form."
-            )
+                self.print_error(
+                    "was not found in the Windows certificate store (Cert:\\LocalMachine\\Root)."
+                )
+            else:
+                self.print_error("Could not find Netskope certificate")
+                self.print_error("Checked:")
+                for path in self.get_netskope_cert_sources():
+                    self.print_error(f"  {path}")
             self.print_error(
                 "Export the Netskope root certificate as PEM and place it at:"
             )
@@ -588,11 +675,15 @@ class FumitmWindows:
             )
             return None
 
-        self.print_error("Could not find Netskope certificate")
-        self.print_error("Checked:")
-        for path in self.get_netskope_cert_sources():
-            self.print_error(f"  {path}")
-        return None
+        if intermediate and self._pem_bodies(intermediate)[0] not in self._pem_bodies(content):
+            self.print_info("Adding Netskope intermediate CA from the Windows certificate store")
+            content = content.rstrip() + "\n" + intermediate
+        elif len(self._pem_bodies(content)) < 2:
+            self.print_warn(
+                "Netskope intermediate CA not found; Python 3.13+ rejects the root CA alone "
+                "(no Key Usage extension)"
+            )
+        return content
 
     def get_provider_cert(self):
         """Retrieve the current provider certificate as PEM text."""
@@ -780,9 +871,23 @@ class FumitmWindows:
         """Setup consistent certificate bundle for a tool."""
         bundle_path = self.get_tool_bundle_path(tool_name)
         existing_bundle = self.find_existing_bundle(tool_name)
+        short_name = self.get_provider_short_name()
 
+        # A bundle holding only the proxy certificate breaks every site the
+        # proxy does not intercept. Never seed from one, and rebuild our own.
+        if existing_bundle and self._bundle_is_provider_only(existing_bundle):
+            self.print_warn(
+                f"Ignoring {existing_bundle}: it holds only the {short_name} certificate(s)"
+            )
+            existing_bundle = None
+        if os.path.exists(bundle_path) and self._bundle_is_provider_only(bundle_path):
+            self.print_warn(
+                f"{tool_name} bundle at {bundle_path} holds only the {short_name} "
+                "certificate(s) and no system roots; it needs rebuilding"
+            )
+            existing_bundle = None
         # Check if bundle already exists and is current
-        if os.path.exists(bundle_path) and self.certificate_exists_in_file(CERT_PATH, bundle_path):
+        elif os.path.exists(bundle_path) and self.certificate_exists_in_file(CERT_PATH, bundle_path):
             self.print_debug(
                 f"{tool_name} bundle already contains current certificate"
             )
@@ -847,11 +952,13 @@ class FumitmWindows:
 
                 # Get system certificates
                 system_certs = self.get_system_ca_bundle()
-                if system_certs:
-                    with open(bundle_path, "w") as f:
-                        f.write(system_certs)
-                else:
-                    Path(bundle_path).touch()
+                if not system_certs:
+                    self.print_warn(
+                        "Could not export system certificates from the Windows certificate "
+                        "store; the bundle will trust only the proxy certificate"
+                    )
+                with open(bundle_path, "w") as f:
+                    f.write(system_certs)
 
                 # Append provider certificate (with duplicate detection)
                 self.append_certificate_if_missing(CERT_PATH, bundle_path)
@@ -868,63 +975,46 @@ class FumitmWindows:
         return bundle_path
 
     def certificate_exists_in_file(self, cert_file, target_file):
-        """Check if a certificate already exists in a file."""
+        """Check that every certificate in cert_file is present in target_file."""
+        return self.certificate_likely_exists_in_file(cert_file, target_file)
+
+    def certificate_likely_exists_in_file(self, cert_file, target_file):
+        """Pure-Python check that every certificate in cert_file is in target_file.
+
+        Content matching needs no subprocess and no temporary files. The
+        previous fingerprint check unlinked a temporary file while it was
+        still open, which Windows refuses, so it reported "missing" on every
+        run and appended a fresh copy of the certificate each time.
+        """
         if not os.path.exists(target_file) or not os.path.exists(cert_file):
             return False
+        missing = self._missing_certificates(cert_file, target_file)
+        if not missing:
+            self.print_debug(f"Certificate already exists in {target_file}")
+        return not missing
 
-        # In status mode, use the fast check
-        if not self.is_install_mode():
-            return self.certificate_likely_exists_in_file(cert_file, target_file)
+    def _missing_certificates(self, cert_file, target_file):
+        """Return the PEM blocks of cert_file that target_file does not contain."""
+        cert_text = self._read_text_or_none(cert_file) or ""
+        present = set(self._pem_bodies(self._read_text_or_none(target_file) or ""))
+        return [
+            block
+            for block, body in zip(self._pem_blocks(cert_text), self._pem_bodies(cert_text))
+            if body not in present
+        ]
 
-        # Get cached fingerprint
-        cert_fingerprint = self.get_cert_fingerprint(cert_file)
-        if not cert_fingerprint:
-            return False
+    def _bundle_is_provider_only(self, bundle_path):
+        """True when bundle_path holds nothing but the provider certificate(s).
 
-        # For install mode, do the thorough check
-        try:
-            with open(target_file, "r") as f:
-                content = f.read()
-
-            # Split content into certificates
-            certs = []
-            current_cert = []
-            in_cert = False
-
-            for line in content.splitlines():
-                if "-----BEGIN CERTIFICATE-----" in line:
-                    in_cert = True
-                    current_cert = [line]
-                elif "-----END CERTIFICATE-----" in line:
-                    current_cert.append(line)
-                    if in_cert:
-                        certs.append("\n".join(current_cert))
-                    in_cert = False
-                    current_cert = []
-                elif in_cert:
-                    current_cert.append(line)
-
-            # Check each certificate
-            for cert in certs:
-                with tempfile.NamedTemporaryFile(
-                    mode="w", suffix=".pem", delete=False
-                ) as tf:
-                    tf.write(cert)
-                    tf.flush()
-
-                    file_fingerprint = self.get_cert_fingerprint(tf.name)
-                    os.unlink(tf.name)
-
-                    if file_fingerprint == cert_fingerprint:
-                        self.print_debug(f"Certificate already exists in {target_file}")
-                        return True
-        except Exception as e:
-            self.print_debug(f"Error checking certificate existence: {e}")
-
-        return False
+        Such a bundle breaks every site the proxy does not intercept. It is
+        what a bundle seeded from a hand-exported root looks like.
+        """
+        bodies = self._pem_bodies(self._read_text_or_none(bundle_path) or "")
+        provider = set(self._pem_bodies(self._read_text_or_none(CERT_PATH) or ""))
+        return not bodies or set(bodies) <= provider
 
     def append_certificate_if_missing(self, cert_file, target_file):
-        """Append certificate to target file only if it doesn't already exist."""
+        """Append the certificates from cert_file that target_file lacks."""
         # Normalize paths for comparison
         cert_file_normalized = os.path.normpath(os.path.abspath(cert_file))
         target_file_normalized = os.path.normpath(os.path.abspath(target_file))
@@ -934,20 +1024,18 @@ class FumitmWindows:
             self.print_debug(f"Skipping append: source and target are the same file ({cert_file})")
             return True
 
-        if self.certificate_exists_in_file(cert_file, target_file):
+        if self._read_text_or_none(cert_file) is None:
+            self.print_error(f"Failed to read certificate file {cert_file}")
+            return False
+
+        missing = self._missing_certificates(cert_file, target_file)
+        if not missing:
             self.print_debug(
                 f"Certificate already exists in {target_file}, skipping append"
             )
             return True
 
         try:
-            with open(cert_file, "r") as cf:
-                cert_content = cf.read()
-
-            # Ensure certificate content ends with newline
-            if not cert_content.endswith('\n'):
-                cert_content = cert_content + '\n'
-
             # Check if target file ends with a newline
             needs_leading_newline = False
             if os.path.exists(target_file):
@@ -963,50 +1051,12 @@ class FumitmWindows:
             with open(target_file, "a") as f:
                 if needs_leading_newline:
                     f.write("\n")
-                f.write(cert_content)
+                f.write("".join(missing))
             self.print_info(f"Appended {self.get_provider_short_name()} certificate to {target_file}")
             return True
         except Exception as e:
             self.print_error(f"Failed to append certificate to {target_file}: {e}")
             return False
-
-    def certificate_likely_exists_in_file(self, cert_file, target_file):
-        """Fast certificate check using content matching (for status mode)."""
-        if not os.path.exists(target_file) or not os.path.exists(cert_file):
-            return False
-
-        try:
-            with open(cert_file, "r") as f:
-                cert_lines = []
-                in_cert = False
-                for line in f:
-                    if "-----BEGIN CERTIFICATE-----" in line:
-                        in_cert = True
-                    elif "-----END CERTIFICATE-----" in line:
-                        in_cert = False
-                    elif in_cert:
-                        cert_lines.append(line.strip())
-
-                if cert_lines:
-                    # Get first 100 chars of cert content
-                    cert_content = "".join(cert_lines)[:100]
-
-                    with open(target_file, "r") as tf:
-                        target_content = tf.read()
-                        # Remove all whitespace for comparison
-                        target_normalized = "".join(target_content.split())
-                        if (
-                            cert_content.replace("\n", "").replace(" ", "")
-                            in target_normalized
-                        ):
-                            self.print_debug(
-                                f"Certificate likely exists in {target_file} (found matching content)"
-                            )
-                            return True
-        except Exception as e:
-            self.print_debug(f"Error checking content: {e}")
-
-        return False
 
     def set_environment_variable(self, var_name, var_value, user_scope=True):
         """Set environment variable in Windows registry."""

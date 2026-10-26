@@ -332,3 +332,202 @@ class TestStatusFunctionContractsWindows:
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
+
+
+# Two distinct, syntactically valid PEM blocks. The Windows helpers compare
+# base64 bodies as text, so the DER inside does not need to parse.
+ROOT_PEM = (
+    "-----BEGIN CERTIFICATE-----\n"
+    "ROOTROOTROOTROOTROOTROOTROOTROOTROOTROOTROOTROOTROOTROOTROOTROOT\n"
+    "ROOTROOTROOTROOTROOTROOTROOTROOTROOTROOTROOT\n"
+    "-----END CERTIFICATE-----\n"
+)
+INTERMEDIATE_PEM = (
+    "-----BEGIN CERTIFICATE-----\n"
+    "INTERINTERINTERINTERINTERINTERINTERINTERINTERINTERINTERINTERINTE\n"
+    "INTERINTERINTERINTERINTERINTERINTERINTERINTER\n"
+    "-----END CERTIFICATE-----\n"
+)
+SYSTEM_PEM = (
+    "-----BEGIN CERTIFICATE-----\n"
+    "SYSTEMSYSTEMSYSTEMSYSTEMSYSTEMSYSTEMSYSTEMSYSTEMSYSTEMSYSTEMSYST\n"
+    "-----END CERTIFICATE-----\n"
+)
+
+
+def _windows_instance(mode="install"):
+    with patch('platform.system', return_value='Windows'):
+        return fumitm_windows.FumitmWindows(mode=mode, debug=True, provider="netskope")
+
+
+class TestNetskopeChainWindows:
+    """Netskope root plus tenant intermediate on Windows.
+
+    The Netskope root CA has no Key Usage extension. Python 3.13+ verifies
+    chains strictly and fails with "CA cert does not include key usage
+    extension" unless the tenant intermediate (which has one) is in the
+    bundle, so chain building stops there. The encrypted-config Netskope
+    client leaves only .enc files on disk, so the chain comes from the
+    Windows certificate store.
+    """
+
+    def test_pem_bodies_ignore_line_endings(self):
+        crlf = ROOT_PEM.replace("\n", "\r\n")
+        assert fumitm_windows.FumitmWindows._pem_bodies(crlf) == \
+            fumitm_windows.FumitmWindows._pem_bodies(ROOT_PEM)
+        assert len(fumitm_windows.FumitmWindows._pem_blocks(ROOT_PEM + INTERMEDIATE_PEM)) == 2
+
+    def test_store_export_parsing(self):
+        instance = _windows_instance()
+        stdout = ROOT_PEM + "=====INTERMEDIATE=====\n" + INTERMEDIATE_PEM
+        with patch('subprocess.run', return_value=type('R', (), {
+                'returncode': 0, 'stdout': stdout, 'stderr': ''})()):
+            root, intermediate = instance._get_netskope_certs_from_store()
+        assert root == ROOT_PEM.strip()
+        assert intermediate == INTERMEDIATE_PEM.strip()
+
+    def test_store_export_handles_missing_intermediate(self):
+        instance = _windows_instance()
+        with patch('subprocess.run', return_value=type('R', (), {
+                'returncode': 0, 'stdout': ROOT_PEM + "=====INTERMEDIATE=====\n", 'stderr': ''})()):
+            assert instance._get_netskope_certs_from_store() == (ROOT_PEM.strip(), None)
+
+    def test_encrypted_files_fall_back_to_store(self, tmp_path):
+        """Only nscacert.pem.enc on disk: the chain comes from the store."""
+        source = tmp_path / "nscacert.pem"
+        (tmp_path / "nscacert.pem.enc").write_bytes(b"\x00encrypted")
+        instance = _windows_instance()
+        with patch.object(instance, 'get_netskope_cert_sources', return_value=[str(source)]), \
+             patch.object(instance, '_get_netskope_certs_from_store',
+                          return_value=(ROOT_PEM.strip(), INTERMEDIATE_PEM.strip())), \
+             patch.object(fumitm_windows, 'CERT_PATH', str(tmp_path / "netskope-ca.pem")):
+            content = instance._get_netskope_cert()
+        bodies = fumitm_windows.FumitmWindows._pem_bodies(content)
+        assert bodies == fumitm_windows.FumitmWindows._pem_bodies(ROOT_PEM + INTERMEDIATE_PEM)
+
+    def test_root_only_file_gains_intermediate_from_store(self, tmp_path):
+        """A root-only nscacert.pem (or hand export) still ends up with the intermediate."""
+        source = tmp_path / "nscacert.pem"
+        source.write_text(ROOT_PEM)
+        instance = _windows_instance()
+        with patch.object(instance, 'get_netskope_cert_sources', return_value=[str(source)]), \
+             patch.object(instance, '_get_netskope_certs_from_store',
+                          return_value=(ROOT_PEM.strip(), INTERMEDIATE_PEM.strip())):
+            content = instance._get_netskope_cert()
+        bodies = fumitm_windows.FumitmWindows._pem_bodies(content)
+        assert bodies == fumitm_windows.FumitmWindows._pem_bodies(ROOT_PEM + INTERMEDIATE_PEM)
+        # Root stays first: downstream loaders read the first certificate.
+        assert content.startswith("-----BEGIN CERTIFICATE-----\nROOT")
+
+    def test_combined_file_does_not_query_store(self, tmp_path):
+        source = tmp_path / "nscacert_combined.pem"
+        source.write_text(ROOT_PEM + INTERMEDIATE_PEM)
+        instance = _windows_instance()
+        with patch.object(instance, 'get_netskope_cert_sources', return_value=[str(source)]), \
+             patch.object(instance, '_get_netskope_certs_from_store') as store:
+            content = instance._get_netskope_cert()
+        store.assert_not_called()
+        assert len(fumitm_windows.FumitmWindows._pem_blocks(content)) == 2
+
+    def test_manual_cert_path_still_works_when_store_empty(self, tmp_path):
+        manual = tmp_path / "netskope-ca.pem"
+        manual.write_text(ROOT_PEM)
+        instance = _windows_instance()
+        with patch.object(instance, 'get_netskope_cert_sources', return_value=[str(tmp_path / "missing.pem")]), \
+             patch.object(instance, '_get_netskope_certs_from_store', return_value=(None, None)), \
+             patch.object(fumitm_windows, 'CERT_PATH', str(manual)):
+            content = instance._get_netskope_cert()
+        assert content == ROOT_PEM.strip()
+
+    def test_nothing_found_returns_none(self, tmp_path):
+        instance = _windows_instance()
+        with patch.object(instance, 'get_netskope_cert_sources', return_value=[str(tmp_path / "missing.pem")]), \
+             patch.object(instance, '_get_netskope_certs_from_store', return_value=(None, None)), \
+             patch.object(fumitm_windows, 'CERT_PATH', str(tmp_path / "netskope-ca.pem")):
+            assert instance._get_netskope_cert() is None
+
+
+class TestBundleContentsWindows:
+    """Duplicate detection and provider-only bundle repair."""
+
+    def test_exists_requires_every_block(self, tmp_path):
+        cert = tmp_path / "chain.pem"
+        cert.write_text(ROOT_PEM + INTERMEDIATE_PEM)
+        bundle = tmp_path / "bundle.pem"
+        bundle.write_text(SYSTEM_PEM + ROOT_PEM)
+        instance = _windows_instance()
+        assert instance.certificate_exists_in_file(str(cert), str(bundle)) is False
+        bundle.write_text(SYSTEM_PEM + ROOT_PEM + INTERMEDIATE_PEM)
+        assert instance.certificate_exists_in_file(str(cert), str(bundle)) is True
+
+    def test_append_adds_only_missing_blocks(self, tmp_path):
+        """Root already present: only the intermediate is appended, once."""
+        cert = tmp_path / "chain.pem"
+        cert.write_text(ROOT_PEM + INTERMEDIATE_PEM)
+        bundle = tmp_path / "bundle.pem"
+        bundle.write_text(SYSTEM_PEM + ROOT_PEM.replace("\n", "\r\n"))
+        instance = _windows_instance()
+        assert instance.append_certificate_if_missing(str(cert), str(bundle)) is True
+        assert instance.append_certificate_if_missing(str(cert), str(bundle)) is True
+        bodies = fumitm_windows.FumitmWindows._pem_bodies(bundle.read_text())
+        assert bodies == fumitm_windows.FumitmWindows._pem_bodies(SYSTEM_PEM + ROOT_PEM + INTERMEDIATE_PEM)
+
+    def test_repeated_append_does_not_duplicate(self, tmp_path):
+        """Three --fix runs once produced three copies of the root on Windows."""
+        cert = tmp_path / "cert.pem"
+        cert.write_text(ROOT_PEM)
+        bundle = tmp_path / "bundle.pem"
+        instance = _windows_instance()
+        for _ in range(3):
+            instance.append_certificate_if_missing(str(cert), str(bundle))
+        assert bundle.read_text().count("BEGIN CERTIFICATE") == 1
+
+    def test_provider_only_bundle_detection(self, tmp_path):
+        cert_path = tmp_path / "netskope-ca.pem"
+        cert_path.write_text(ROOT_PEM + INTERMEDIATE_PEM)
+        bundle = tmp_path / "bundle.pem"
+        instance = _windows_instance()
+        with patch.object(fumitm_windows, 'CERT_PATH', str(cert_path)):
+            bundle.write_text(ROOT_PEM * 3)
+            assert instance._bundle_is_provider_only(str(bundle)) is True
+            bundle.write_text("")
+            assert instance._bundle_is_provider_only(str(bundle)) is True
+            bundle.write_text(SYSTEM_PEM + ROOT_PEM)
+            assert instance._bundle_is_provider_only(str(bundle)) is False
+
+    def test_provider_only_bundle_is_rebuilt_with_system_certs(self, tmp_path):
+        cert_path = tmp_path / "netskope-ca.pem"
+        cert_path.write_text(ROOT_PEM + INTERMEDIATE_PEM)
+        bundle_dir = tmp_path / "python"
+        bundle_dir.mkdir()
+        bundle = bundle_dir / "ca-bundle.pem"
+        bundle.write_text(ROOT_PEM * 3)
+        instance = _windows_instance()
+        with patch.object(fumitm_windows, 'CERT_PATH', str(cert_path)), \
+             patch.object(instance, 'get_tool_bundle_path', return_value=str(bundle)), \
+             patch.object(instance, 'find_existing_bundle', return_value=str(bundle)), \
+             patch.object(instance, 'get_system_ca_bundle', return_value=SYSTEM_PEM.strip()), \
+             patch.object(instance, 'set_environment_variable') as set_env:
+            result = instance.setup_consistent_bundle("python", env_vars=["REQUESTS_CA_BUNDLE"])
+        assert result == str(bundle)
+        bodies = fumitm_windows.FumitmWindows._pem_bodies(bundle.read_text())
+        assert bodies == fumitm_windows.FumitmWindows._pem_bodies(SYSTEM_PEM + ROOT_PEM + INTERMEDIATE_PEM)
+        set_env.assert_called_with("REQUESTS_CA_BUNDLE", str(bundle))
+
+    def test_foreign_provider_only_bundle_is_not_used_as_seed(self, tmp_path):
+        """A hand-made REQUESTS_CA_BUNDLE holding only the root is not copied."""
+        cert_path = tmp_path / "netskope-ca.pem"
+        cert_path.write_text(ROOT_PEM + INTERMEDIATE_PEM)
+        foreign = tmp_path / "ca-bundle.crt"
+        foreign.write_text(ROOT_PEM)
+        bundle = tmp_path / "python" / "ca-bundle.pem"
+        instance = _windows_instance()
+        with patch.object(fumitm_windows, 'CERT_PATH', str(cert_path)), \
+             patch.object(instance, 'get_tool_bundle_path', return_value=str(bundle)), \
+             patch.object(instance, 'find_existing_bundle', return_value=str(foreign)), \
+             patch.object(instance, 'get_system_ca_bundle', return_value=SYSTEM_PEM.strip()), \
+             patch.object(instance, 'set_environment_variable'), \
+             patch('builtins.input', side_effect=AssertionError("must not prompt to copy a provider-only bundle")):
+            instance.setup_consistent_bundle("python")
+        bodies = fumitm_windows.FumitmWindows._pem_bodies(bundle.read_text())
+        assert bodies == fumitm_windows.FumitmWindows._pem_bodies(SYSTEM_PEM + ROOT_PEM + INTERMEDIATE_PEM)

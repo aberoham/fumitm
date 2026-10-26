@@ -42,16 +42,15 @@ The `create_bundle_with_system_certs()` helper was implemented in fumitm.py:
 - Apply same pattern to fumitm_windows.py
 - Check with: `grep -n "except:" fumitm_windows.py | grep -v "Exception"`
 
-### 5. Performance: Pure Python Certificate Matching (PR #30)
-The `certificate_likely_exists_in_file()` function was refactored to use no subprocess calls:
-- **Before**: Used `openssl x509 -subject` to extract CN, then string search (1 subprocess call)
-- **After**: Pure Python extraction of first 100 chars of base64 content (0 subprocess calls)
-- Apply same pattern to fumitm_windows.py
-
-The `certificate_exists_in_file()` function was simplified:
-- **Before**: In install mode, iterated through all certs in bundle and compared fingerprints via openssl (O(N) subprocess calls)
-- **After**: Delegates to `certificate_likely_exists_in_file()` for all modes (O(1), no subprocess)
-- Rationale: Fast string matching is sufficient; false negatives (duplicate appended) are harmless
+### 5. Performance: Pure Python Certificate Matching (PR #30) — APPLIED
+`certificate_exists_in_file()` now delegates to `certificate_likely_exists_in_file()`,
+which compares whitespace-free base64 bodies with no subprocess calls. The old
+install-mode fingerprint loop unlinked a `NamedTemporaryFile` while it was still
+open, which Windows refuses (WinError 32), so it reported "missing" on every run
+and appended another copy of the certificate each time (observed: three copies of
+the Netskope root in one `python\ca-bundle.pem`). `append_certificate_if_missing()`
+appends only the blocks the target lacks, so a root-only bundle gains the
+intermediate without duplicating the root.
 
 New regression tests added:
 - `test_certificate_likely_exists_uses_no_subprocess`
