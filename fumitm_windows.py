@@ -15,7 +15,7 @@ import winreg
 # Version and metadata
 __description__ = "MITM Certificate Fixer Upper for Windows"
 __author__ = "Ingersoll & Claude"
-__version__ = "2026.10.10"  # CalVer: YYYY.MM.DD (auto-updated on release)
+__version__ = "2026.10.26"  # CalVer: YYYY.MM.DD (auto-updated on release)
 
 
 def parse_calver(version_str):
