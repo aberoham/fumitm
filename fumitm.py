@@ -6445,7 +6445,7 @@ class FumitmPython:
                 ))
         return profiles
 
-    def _colima_profile_for_tool(self):
+    def _colima_profile_for_tool(self, profiles=None):
         """Choose one Colima profile when the profile list gives none.
 
         Prefer the profile selected by Docker. If Docker does not identify one,
@@ -6455,13 +6455,16 @@ class FumitmPython:
         The Colima tool repairs every running profile that
         ``_colima_profiles_for_tool`` lists, so it never has to pick one of
         several. This single choice applies only when ``colima list`` fails or
-        lists no profiles.
+        lists no profiles. ``profiles`` takes a listing already made, so the
+        caller does not list a second time.
         """
         profile = self._active_colima_profile_for_docker()
         if profile:
             return profile
 
-        profiles = self._list_colima_profiles() or []
+        if profiles is None:
+            profiles = self._list_colima_profiles()
+        profiles = profiles or []
         running = [p.name for p in profiles if p.running]
         if len(running) == 1:
             self.print_debug(f"Using the only running Colima profile: {running[0]}")
@@ -6488,7 +6491,7 @@ class FumitmPython:
         if profiles:
             return profiles
 
-        profile = self._colima_profile_for_tool()
+        profile = self._colima_profile_for_tool(profiles=[])
         try:
             status_result = subprocess.run(
                 self._colima_cmd(profile, 'status'),

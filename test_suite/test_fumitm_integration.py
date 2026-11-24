@@ -3048,6 +3048,27 @@ class TestToolResultAccuracy(FumitmTestCase):
             capture_output=True, timeout=10, check=False,
         ) in mock_run.call_args_list
 
+    def test_colima_fallback_lists_profiles_only_once(self):
+        """A failed listing is not retried, so a later answer cannot be discarded."""
+        instance = self.create_fumitm_instance()
+
+        def fake_run(cmd, **kwargs):
+            if cmd == ['colima', 'list', '--json']:
+                return MagicMock(returncode=1, stdout='')
+            return MagicMock(returncode=0)
+
+        with patch.object(
+            instance, '_active_colima_profile_for_docker', return_value=None
+        ), patch('subprocess.run', side_effect=fake_run) as mock_run:
+            targets = instance._colima_profiles_for_tool()
+
+        assert targets == [fumitm.ColimaProfile('default', True, 'Running')]
+        list_calls = [
+            c for c in mock_run.call_args_list
+            if c.args[0] == ['colima', 'list', '--json']
+        ]
+        assert len(list_calls) == 1
+
     def test_colima_fallback_status_error_is_unknown_not_stopped(self, capsys):
         """A status probe that errors is reported as an issue, not as stopped."""
         instance = self.create_fumitm_instance()
