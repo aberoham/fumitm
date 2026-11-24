@@ -250,6 +250,14 @@ ToolResult = namedtuple(
     'ToolResult', ['tool', 'status', 'message', 'changed'], defaults=[None]
 )
 
+# One Colima profile covered by the Colima tool. `status` is the state Colima
+# reports ('Running', 'Stopped', ...) or 'Unknown' when it could not be read;
+# `runtime` is Colima's container runtime ('docker', 'containerd', ...) or ''
+# when not reported.
+ColimaProfile = namedtuple(
+    'ColimaProfile', ['name', 'running', 'status', 'runtime'], defaults=['']
+)
+
 # One gcloud named configuration and the core/custom_ca_certs_file written in
 # its own file. A name of None stands for the active configuration when gcloud
 # could not list them.
@@ -6235,9 +6243,12 @@ class FumitmPython:
         """Configure the certificate for Colima.
 
         fumitm keeps persistent copies in ~/.docker/certs.d/ and installs the roots
-        into the selected VM with colima ssh. The native route is authoritative:
-        falling back to Docker nsenter could target a different installed runtime
-        and could require the registry access that this repair is meant to restore.
+        into every running Colima profile with colima ssh. Docker is restarted only
+        in Docker-runtime profiles it changed; other runtimes are told to restart.
+        Stopped profiles are reported and left stopped. The native route is
+        authoritative: falling back to Docker nsenter could target a different
+        installed runtime and could require the registry access that this repair
+        is meant to restore.
         """
         if not self.command_exists('colima'):
             return ToolResult('colima', 'skipped', 'Colima not installed')
@@ -6247,21 +6258,22 @@ class FumitmPython:
 
         persistent_installed = self._container_certs_present(docker_certs_dir)
 
-        profile = self._colima_profile_for_tool()
-        vm_is_running = False
-        vm_needs_cert = False
-        try:
-            status_result = subprocess.run(
-                self._colima_cmd(profile, 'status'),
-                capture_output=True, timeout=10, check=False
-            )
-            vm_is_running = (status_result.returncode == 0)
-            if vm_is_running:
-                vm_needs_cert = not self._check_cert_in_colima_vm(profile)
-        except Exception:
-            pass
+        profiles = self._colima_profiles_for_tool()
+        running = [p for p in profiles if p.running]
+        needs_cert = {p.name for p in running if not self._check_cert_in_colima_vm(p.name)}
 
-        if persistent_installed and (not vm_is_running or not vm_needs_cert):
+        for p in profiles:
+            if p.running:
+                continue
+            if p.status == 'Unknown':
+                self.print_warn(f"Could not read the state of Colima profile {p.name}")
+            else:
+                self.print_info(
+                    f"Colima profile {p.name} is {p.status.lower()} - run fumitm --fix "
+                    "after it starts to install the certificate"
+                )
+
+        if persistent_installed and not needs_cert:
             self.print_debug("Colima certificate already installed, skipping")
             return ToolResult('colima', 'already_ok', 'Certificate already installed')
 
@@ -6270,49 +6282,54 @@ class FumitmPython:
         if not self.is_install_mode():
             if not persistent_installed:
                 self.print_action(f"Would copy certificate to {cert_dest} (persistent)")
-            if vm_is_running and vm_needs_cert:
-                self.print_action("Would install certificate into Colima VM")
-        else:
-            persistent_changed = False
-            vm_changed = False
-            vm_failed = False
-            vm_failure_message = None
+            for p in running:
+                if p.name in needs_cert:
+                    self.print_action(f"Would install certificate into Colima profile {p.name}")
+            return None
 
-            if not persistent_installed:
-                self._install_container_certs(docker_certs_dir)
-                persistent_changed = True
+        persistent_changed = False
+        vm_changed = False
+        vm_failures = []
 
-            if vm_is_running and vm_needs_cert:
-                self.print_info("Installing certificate into Colima VM...")
-                success, msg = self._install_cert_via_colima_ssh(profile)
-                if success:
-                    self.print_info(msg)
-                    vm_changed = True
-                    if not self._restart_docker_in_colima(profile):
-                        vm_failed = True
-                        vm_failure_message = (
-                            'VM certificate installed but Docker engine restart failed'
-                        )
-                else:
-                    self.print_warn(f"Failed to install certificate into VM: {msg}")
-                    vm_failed = True
-                    vm_failure_message = f'VM install failed: {msg}'
-            elif vm_is_running and not vm_needs_cert:
-                self.print_info("Certificate already installed in VM")
-            elif not vm_is_running:
-                self.print_info("Colima is not running - certificate will be applied on next start")
+        if not persistent_installed:
+            self._install_container_certs(docker_certs_dir)
+            persistent_changed = True
 
-            if vm_failed:
-                if persistent_changed:
-                    message = f'Persistent cert installed; {vm_failure_message}'
-                else:
-                    message = vm_failure_message
-                return ToolResult(
-                    'colima', 'failed', message, persistent_changed or vm_changed
+        for p in running:
+            if p.name not in needs_cert:
+                self.print_info(f"Certificate already installed in Colima profile {p.name}")
+                continue
+            self.print_info(f"Installing certificate into Colima profile {p.name}...")
+            success, msg = self._install_cert_via_colima_ssh(p.name)
+            if not success:
+                self.print_warn(
+                    f"Failed to install certificate into Colima profile {p.name}: {msg}"
                 )
-            if persistent_changed or vm_changed:
-                return ToolResult('colima', 'configured', 'Certificate installed')
-            return ToolResult('colima', 'already_ok', 'Certificate already installed')
+                vm_failures.append(f'VM install failed in profile {p.name}: {msg}')
+                continue
+            self.print_info(f"{msg} ({p.name})")
+            vm_changed = True
+            if p.runtime and not p.runtime.startswith('docker'):
+                self.print_info(
+                    f"Restart the {p.runtime} runtime in Colima profile {p.name} for "
+                    f"the certificate to take effect: colima restart --profile {p.name}"
+                )
+            elif not self._restart_docker_in_colima(p.name):
+                vm_failures.append(
+                    f'VM certificate installed in profile {p.name} but '
+                    'Docker engine restart failed'
+                )
+
+        if vm_failures:
+            message = '; '.join(vm_failures)
+            if persistent_changed:
+                message = f'Persistent cert installed; {message}'
+            return ToolResult(
+                'colima', 'failed', message, persistent_changed or vm_changed
+            )
+        if persistent_changed or vm_changed:
+            return ToolResult('colima', 'configured', 'Certificate installed')
+        return ToolResult('colima', 'already_ok', 'Certificate already installed')
 
     def _docker_is_running(self):
         """Check whether a Docker daemon is running (any backend)."""
@@ -6363,7 +6380,7 @@ class FumitmPython:
         if not match:
             return None
         profile = match.group(1)
-        if not re.fullmatch(r'[A-Za-z0-9._-]+', profile):
+        if not FumitmPython._is_safe_colima_profile_name(profile):
             return None
         return profile
 
@@ -6373,59 +6390,118 @@ class FumitmPython:
             return None
         return self._colima_profile_from_endpoint(self._effective_docker_endpoint())
 
-    def _colima_profile_for_tool(self):
-        """Choose the Colima profile used by the explicit Colima tool.
+    @staticmethod
+    def _is_safe_colima_profile_name(name):
+        """Return True when a Colima profile name is safe to pass to colima.
+
+        Colima uses the name as a directory component, so ``.`` and ``..`` are
+        rejected along with anything outside letters, digits, ``.``, ``_``, ``-``.
+        """
+        return (
+            isinstance(name, str)
+            and name not in ('.', '..')
+            and re.fullmatch(r'[A-Za-z0-9._-]+', name) is not None
+        )
+
+    def _list_colima_profiles(self):
+        """Return every Colima profile from ``colima list --json``.
+
+        ``COLIMA_PROFILE`` is removed from the listing's environment because
+        Colima limits ``list`` to that one profile when it is set.
+
+        Returns:
+            list or None: ``ColimaProfile`` entries in Colima's order, or None
+            when the listing fails. Names that are not safe profile names are
+            dropped.
+        """
+        env = {k: v for k, v in os.environ.items() if k != 'COLIMA_PROFILE'}
+        try:
+            result = subprocess.run(
+                ['colima', 'list', '--json'],
+                capture_output=True, text=True, timeout=10, check=False, env=env
+            )
+        except Exception as e:
+            self.print_debug(f"Could not list Colima profiles: {e}")
+            return None
+        if result.returncode != 0 or not isinstance(result.stdout, str):
+            self.print_debug("Could not list Colima profiles")
+            return None
+
+        profiles = []
+        for line in result.stdout.splitlines():
+            try:
+                entry = json.loads(line)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get('name')
+            status = entry.get('status')
+            runtime = entry.get('runtime')
+            if self._is_safe_colima_profile_name(name) and isinstance(status, str):
+                profiles.append(ColimaProfile(
+                    name, status.lower() == 'running', status,
+                    runtime if isinstance(runtime, str) else ''
+                ))
+        return profiles
+
+    def _colima_profile_for_tool(self, profiles=None):
+        """Choose one Colima profile when the profile list gives none.
 
         Prefer the profile selected by Docker. If Docker does not identify one,
-        use the sole running profile from ``colima list``. Ambiguous or unavailable
-        state falls back to Colima's default profile.
+        use the sole running profile from ``colima list``. Otherwise fall back to
+        Colima's default profile.
 
-        Several running profiles with no Docker selection is a state fumitm cannot
-        resolve on its own, and picking one arbitrarily would repair the wrong VM.
-        It says so instead: without the warning the default profile is not running
-        either, and the run ends on "Colima is not running" while the VMs the user
-        cares about are up and untrusted.
+        The Colima tool repairs every running profile that
+        ``_colima_profiles_for_tool`` lists, so it never has to pick one of
+        several. This single choice applies only when ``colima list`` fails or
+        lists no profiles. ``profiles`` takes a listing already made, so the
+        caller does not list a second time.
         """
         profile = self._active_colima_profile_for_docker()
         if profile:
             return profile
 
-        try:
-            result = subprocess.run(
-                ['colima', 'list', '--json'],
-                capture_output=True, text=True, timeout=10, check=False
-            )
-            if result.returncode == 0:
-                running = []
-                for line in result.stdout.splitlines():
-                    try:
-                        entry = json.loads(line)
-                    except (TypeError, json.JSONDecodeError):
-                        continue
-                    name = entry.get('name')
-                    status = entry.get('status')
-                    if (
-                        isinstance(name, str)
-                        and re.fullmatch(r'[A-Za-z0-9._-]+', name)
-                        and isinstance(status, str)
-                        and status.lower() == 'running'
-                    ):
-                        running.append(name)
-                if len(running) == 1:
-                    self.print_debug(f"Using the only running Colima profile: {running[0]}")
-                    return running[0]
-                if len(running) > 1 and 'default' not in running:
-                    self.print_warn(
-                        "Several Colima profiles are running and Docker selects "
-                        f"none of them: {', '.join(sorted(running))}"
-                    )
-                    self.print_info(
-                        "Point DOCKER_HOST or the Docker context at the profile "
-                        "to repair, or run: colima --profile <name> start"
-                    )
-        except Exception as e:
-            self.print_debug(f"Could not list Colima profiles: {e}")
+        if profiles is None:
+            profiles = self._list_colima_profiles()
+        profiles = profiles or []
+        running = [p.name for p in profiles if p.running]
+        if len(running) == 1:
+            self.print_debug(f"Using the only running Colima profile: {running[0]}")
+            return running[0]
         return 'default'
+
+    def _colima_profiles_for_tool(self):
+        """Return every Colima profile the Colima tool covers, with its state.
+
+        Each Colima VM has its own CA store. A profile that Docker does not
+        select, such as a second VM started for one project, needs the roots as
+        much as the selected one, so the tool covers every profile that
+        ``colima list`` reports rather than only the Docker-selected one.
+
+        When ``colima list`` fails or lists nothing, the tool falls back to the
+        single profile from ``_colima_profile_for_tool`` and asks
+        ``colima status`` whether it runs. A status probe that errors gives the
+        state ``Unknown`` rather than ``Stopped``.
+
+        Returns:
+            list: ``ColimaProfile`` entries.
+        """
+        profiles = self._list_colima_profiles()
+        if profiles:
+            return profiles
+
+        profile = self._colima_profile_for_tool(profiles=[])
+        try:
+            status_result = subprocess.run(
+                self._colima_cmd(profile, 'status'),
+                capture_output=True, timeout=10, check=False
+            )
+        except Exception as e:
+            self.print_debug(f"Could not check Colima profile {profile}: {e}")
+            return [ColimaProfile(profile, False, 'Unknown')]
+        running = (status_result.returncode == 0)
+        return [ColimaProfile(profile, running, 'Running' if running else 'Stopped')]
 
     def _find_nsenter_image(self):
         """Find a local Docker image that has nsenter.
@@ -7669,11 +7745,12 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
     def check_colima_status(self, temp_warp_cert):
         """Report the status of the Colima configuration.
 
-        Examines the permanent ~/.docker/certs.d/ location and the VM.
+        Examines the permanent ~/.docker/certs.d/ location and the CA store of
+        every running Colima profile, and names each profile with its state.
         """
         has_issues = False
         if self.command_exists('colima'):
-            profile = self._colima_profile_for_tool()
+            profiles = self._colima_profiles_for_tool()
             # Check persistent certificate location first (primary)
             docker_certs_dir = os.path.expanduser("~/.docker/certs.d")
             cert_path = os.path.join(docker_certs_dir, f"{self.provider['container_cert_name']}.crt")
@@ -7688,20 +7765,27 @@ https.get('{test_url}', {{headers: {{'User-Agent': 'Mozilla/5.0'}}}}, (res) => {
                 self.print_warn("  ✗ Certificate not installed in ~/.docker/certs.d/")
                 has_issues = True
 
-            try:
-                status_result = subprocess.run(
-                    self._colima_cmd(profile, 'status'),
-                    capture_output=True, timeout=10, check=False
-                )
-                if status_result.returncode == 0:
-                    if self._check_cert_in_colima_vm(profile):
-                        self.print_info("  ✓ Certificate installed in running VM")
-                    else:
-                        self.print_info("  - Certificate not in VM (will be applied on restart)")
+            for p in profiles:
+                if p.status == 'Unknown':
+                    self.print_warn(
+                        f"  ✗ Colima profile {p.name}: state unknown (colima status failed)"
+                    )
+                    has_issues = True
+                elif not p.running:
+                    self.print_info(
+                        f"  - Colima profile {p.name}: {p.status.lower()} "
+                        "(run fumitm --fix after it starts)"
+                    )
+                elif self._check_cert_in_colima_vm(p.name):
+                    self.print_info(
+                        f"  ✓ Colima profile {p.name}: running, certificate installed in VM"
+                    )
                 else:
-                    self.print_info("  - Colima is stopped (certificate will be loaded on start)")
-            except Exception:
-                self.print_info("  - Could not check Colima VM status")
+                    self.print_warn(
+                        f"  ✗ Colima profile {p.name}: running, certificate not in VM "
+                        "(run fumitm --fix to install)"
+                    )
+                    has_issues = True
         else:
             self.print_info("  - Colima not installed")
         return has_issues
