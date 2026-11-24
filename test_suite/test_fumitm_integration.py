@@ -3002,24 +3002,180 @@ class TestToolResultAccuracy(FumitmTestCase):
             capture_output=True, text=True, timeout=10, check=False,
         )
 
-    def test_colima_names_the_profiles_it_cannot_choose_between(self, capsys):
-        """Silence here would end the run on a false "Colima is not running"."""
+    def test_colima_tool_covers_every_listed_profile(self):
+        """Every profile is covered, whichever one Docker selects."""
         instance = self.create_fumitm_instance()
         profiles = (
-            '{"name":"team-a","status":"Running"}\n'
-            '{"name":"team-b","status":"Running"}'
+            '{"name":"default","status":"Running"}\n'
+            '{"name":"cleanvm","status":"Stopped"}\n'
+            '{"name":"mssql","status":"Running"}\n'
+            '{"name":"bad name","status":"Running"}\n'
+            '["not", "a", "profile"]'
         )
-        with patch.object(
-            instance, '_active_colima_profile_for_docker', return_value=None
-        ), patch(
+        with patch(
             'subprocess.run',
             return_value=MagicMock(returncode=0, stdout=profiles),
-        ):
-            assert instance._colima_profile_for_tool() == 'default'
+        ) as mock_run:
+            targets = instance._colima_profiles_for_tool()
 
+        assert targets == [
+            ('default', True, 'Running'),
+            ('cleanvm', False, 'Stopped'),
+            ('mssql', True, 'Running'),
+        ]
+        mock_run.assert_called_once_with(
+            ['colima', 'list', '--json'],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+
+    def test_colima_tool_falls_back_to_one_profile_without_a_listing(self):
+        """A failed listing keeps the single-profile behaviour."""
+        instance = self.create_fumitm_instance()
+
+        def fake_run(cmd, **kwargs):
+            if cmd == ['colima', 'list', '--json']:
+                return MagicMock(returncode=1, stdout='')
+            return MagicMock(returncode=0)
+
+        with patch.object(
+            instance, '_colima_profile_for_tool', return_value='team-dev'
+        ), patch('subprocess.run', side_effect=fake_run) as mock_run:
+            targets = instance._colima_profiles_for_tool()
+
+        assert targets == [('team-dev', True, 'Running')]
+        assert call(
+            ['colima', '--profile', 'team-dev', 'status'],
+            capture_output=True, timeout=10, check=False,
+        ) in mock_run.call_args_list
+
+    def _colima_multi_profile_patches(self, instance, missing, install_results=None):
+        """Patch three running profiles and one stopped one.
+
+        ``missing`` names the running profiles whose VM lacks the roots;
+        ``install_results`` maps a profile to its installer's return value.
+        """
+        install_results = install_results or {}
+        return (
+            patch.object(instance, 'command_exists', return_value=True),
+            patch.object(instance, '_container_certs_present', return_value=True),
+            patch.object(instance, '_list_colima_profiles', return_value=[
+                ('cleanvm', 'Stopped'),
+                ('default', 'Running'),
+                ('dnsnet', 'Running'),
+                ('mssql', 'Running'),
+            ]),
+            patch.object(
+                instance, '_check_cert_in_colima_vm',
+                side_effect=lambda name: name not in missing,
+            ),
+            patch.object(
+                instance, '_install_cert_via_colima_ssh',
+                side_effect=lambda name: install_results.get(
+                    name, (True, 'Certificate installed in Colima VM')
+                ),
+            ),
+            patch.object(instance, '_restart_docker_in_colima', return_value=True),
+            patch.object(instance, '_install_cert_in_docker_vm'),
+        )
+
+    def test_colima_repairs_only_the_running_profile_that_lacks_the_cert(self, capsys):
+        """A profile Docker does not select is still repaired."""
+        instance = self.create_fumitm_instance(mode='install')
+        patches = self._colima_multi_profile_patches(instance, missing={'mssql'})
+        with patches[0], patches[1], patches[2], patches[3], \
+             patches[4] as mock_install, patches[5] as mock_restart, \
+             patches[6] as mock_nsenter:
+            result = instance.setup_colima_cert()
+
+        assert result.status == 'configured'
+        mock_install.assert_called_once_with('mssql')
+        mock_restart.assert_called_once_with('mssql')
+        mock_nsenter.assert_not_called()
         output = capsys.readouterr().out
-        assert 'team-a, team-b' in output
-        assert 'DOCKER_HOST' in output
+        assert 'Colima profile default' in output
+        assert 'Colima profile dnsnet' in output
+        assert 'Colima profile cleanvm is stopped' in output
+
+    def test_colima_all_running_profiles_ok(self):
+        """Nothing is installed or restarted when every running VM has the roots."""
+        instance = self.create_fumitm_instance(mode='install')
+        patches = self._colima_multi_profile_patches(instance, missing=set())
+        with patches[0], patches[1], patches[2], patches[3] as mock_check, \
+             patches[4] as mock_install, patches[5] as mock_restart, patches[6]:
+            result = instance.setup_colima_cert()
+
+        assert result.status == 'already_ok'
+        assert [c.args[0] for c in mock_check.call_args_list] == [
+            'default', 'dnsnet', 'mssql'
+        ]
+        mock_install.assert_not_called()
+        mock_restart.assert_not_called()
+
+    def test_colima_install_failure_names_the_profile(self):
+        """One failed profile fails the tool, names it, and the others still run."""
+        instance = self.create_fumitm_instance(mode='install')
+        patches = self._colima_multi_profile_patches(
+            instance,
+            missing={'dnsnet', 'mssql'},
+            install_results={'dnsnet': (False, 'colima ssh timed out')},
+        )
+        with patches[0], patches[1], patches[2], patches[3], \
+             patches[4] as mock_install, patches[5] as mock_restart, patches[6]:
+            result = instance.setup_colima_cert()
+
+        assert result.status == 'failed'
+        assert result.changed is True
+        assert 'dnsnet' in result.message
+        assert 'colima ssh timed out' in result.message
+        assert 'mssql' not in result.message
+        assert [c.args[0] for c in mock_install.call_args_list] == ['dnsnet', 'mssql']
+        mock_restart.assert_called_once_with('mssql')
+
+    def test_colima_status_mode_names_each_profile_to_repair(self, capsys):
+        """Without --fix, nothing is installed and each missing profile is named."""
+        instance = self.create_fumitm_instance(mode='status')
+        patches = self._colima_multi_profile_patches(instance, missing={'mssql'})
+        with patches[0], patches[1], patches[2], patches[3], \
+             patches[4] as mock_install, patches[5] as mock_restart, patches[6]:
+            instance.setup_colima_cert()
+
+        mock_install.assert_not_called()
+        mock_restart.assert_not_called()
+        output = capsys.readouterr().out
+        assert 'Would install certificate into Colima profile mssql' in output
+        assert 'profile dnsnet' not in output
+
+    def test_colima_status_names_each_profile_and_its_state(self, capsys):
+        """The status report flags the one running VM without the roots."""
+        instance = self.create_fumitm_instance()
+        patches = self._colima_multi_profile_patches(instance, missing={'mssql'})
+        with patches[0], patches[2], patches[3], \
+             patch('os.path.exists', return_value=True), \
+             patch.object(instance, '_status_container_certs_present', return_value=True):
+            has_issues = instance.check_colima_status('/tmp/fake-cert.pem')
+
+        assert has_issues is True
+        output = capsys.readouterr().out
+        assert 'Colima profile cleanvm: stopped' in output
+        assert 'Colima profile default: running, certificate installed' in output
+        assert 'Colima profile dnsnet: running, certificate installed' in output
+        assert 'Colima profile mssql: running, certificate not in VM' in output
+
+    def test_colima_status_single_profile_ok(self, capsys):
+        """With one healthy profile the report has no issues."""
+        instance = self.create_fumitm_instance()
+        with patch.object(instance, 'command_exists', return_value=True), \
+             patch.object(
+                 instance, '_list_colima_profiles', return_value=[('default', 'Running')]
+             ), \
+             patch.object(instance, '_check_cert_in_colima_vm', return_value=True), \
+             patch('os.path.exists', return_value=True), \
+             patch.object(instance, '_status_container_certs_present', return_value=True):
+            assert instance.check_colima_status('/tmp/fake-cert.pem') is False
+
+        assert 'Colima profile default: running, certificate installed' in (
+            capsys.readouterr().out
+        )
 
     def test_colima_stays_quiet_when_the_default_profile_is_running(self, capsys):
         """Choosing a running default is defensible and needs no warning."""
